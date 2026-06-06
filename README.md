@@ -9,8 +9,8 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/iptv-mac.git
-cd iptv-mac
+git clone https://github.com/YOUR_USERNAME/mac-tv.git
+cd mac-tv
 npm install
 npm run dev
 ```

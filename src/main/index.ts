@@ -8,7 +8,7 @@ import { is } from '@electron-toolkit/utils'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, appendFileSync } from 'fs'
 
 // 设置自定义 userData 路径，避免与 Chromium 冲突
-app.setPath('userData', join(app.getPath('appData'), 'iptv-mac'))
+app.setPath('userData', join(app.getPath('appData'), 'mac-tv'))
 
 // ==================== 文件日志（方便排查用户问题）====================
 const LOG_DIR = join(process.cwd(), 'logs')
