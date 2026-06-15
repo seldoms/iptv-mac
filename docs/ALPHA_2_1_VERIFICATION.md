@@ -26,8 +26,8 @@ This record tracks verification for the Alpha 2.1 playback-loop remediation from
 | Command | Result |
 | --- | --- |
 | `npm run typecheck` | Pass |
-| `npm test` | Pass: 5 test files, 21 tests |
-| `cargo test --manifest-path src-tauri/Cargo.toml` | Pass: 101 tests |
+| `npm test` | Pass: 5 test files, 22 tests |
+| `cargo test --manifest-path src-tauri/Cargo.toml` | Pass: 102 tests |
 | `npm run build:web` | Pass, with existing chunk-size warning |
 | `npm run build:check` | Pass: Tauri debug app built |
 | `npm run check` | Pass |

@@ -12,6 +12,7 @@ This update moves IPTV Mac from a basic TVBox-style desktop shell toward a more 
 - Added a product upgrade design covering positioning, customer journeys, opportunity-solution tree, priorities, and roadmap.
 - Reframed the product around successful viewing sessions, visible recovery, local-only diagnostics, source health, and reliable continuation.
 - Updated the roadmap to reflect the current implementation state and next priorities.
+- Made the GitHub repository public and folded stale local remediation notes into the maintained roadmap and verification records.
 
 ## Playback Reliability
 
