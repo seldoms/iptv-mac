@@ -76,6 +76,7 @@ pub struct PlayerResult {
     pub url: String,
     pub parse: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "playUrl")]
     pub play_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub click: Option<String>,
@@ -109,13 +110,19 @@ pub struct HttpSpider {
 impl HttpSpider {
     pub fn new(site: SiteConfig) -> Self {
         let api_url = site.api.clone();
-        Self { api_url, site_type: site.site_type, site }
+        Self {
+            api_url,
+            site_type: site.site_type,
+            site,
+        }
     }
 
     async fn fetch_json(&self, url: &str) -> HttpResult<Value> {
         let client = crate::network::create_client()?;
         let timeout = self.site.timeout.unwrap_or(15) as u64;
-        let mut req = client.get(url).timeout(std::time::Duration::from_secs(timeout));
+        let mut req = client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(timeout));
         if let Some(header) = &self.site.header {
             if let Some(obj) = header.as_object() {
                 for (k, v) in obj {
@@ -128,18 +135,20 @@ impl HttpSpider {
         let resp = req.send().await.map_err(|e| {
             AppError::network_error(format!("API 请求失败 [{}]: {}", self.site.key, e))
         })?;
-        let text = resp.text().await.map_err(|e| {
-            AppError::network_error(format!("读取响应失败: {}", e))
-        })?;
-        serde_json::from_str(&text).map_err(|e| {
-            AppError::parse_error(format!("API 返回非 JSON: {}", e))
-        })
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::network_error(format!("读取响应失败: {}", e)))?;
+        serde_json::from_str(&text)
+            .map_err(|e| AppError::parse_error(format!("API 返回非 JSON: {}", e)))
     }
 
     async fn fetch_xml(&self, url: &str) -> HttpResult<Value> {
         let client = crate::network::create_client()?;
         let timeout = self.site.timeout.unwrap_or(15) as u64;
-        let mut req = client.get(url).timeout(std::time::Duration::from_secs(timeout));
+        let mut req = client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(timeout));
         if let Some(header) = &self.site.header {
             if let Some(obj) = header.as_object() {
                 for (k, v) in obj {
@@ -152,9 +161,10 @@ impl HttpSpider {
         let resp = req.send().await.map_err(|e| {
             AppError::network_error(format!("XML API 请求失败 [{}]: {}", self.site.key, e))
         })?;
-        let text = resp.text().await.map_err(|e| {
-            AppError::network_error(format!("读取 XML 失败: {}", e))
-        })?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| AppError::network_error(format!("读取 XML 失败: {}", e)))?;
         parse_xml_api_response(&text)
     }
 
@@ -166,8 +176,12 @@ impl HttpSpider {
             for pair in qs.split('&') {
                 if let Some(eq_idx) = pair.find('=') {
                     if eq_idx > 0 {
-                        let k = urlencoding::decode(&pair[..eq_idx]).unwrap_or_default().into_owned();
-                        let v = urlencoding::decode(&pair[eq_idx + 1..]).unwrap_or_default().into_owned();
+                        let k = urlencoding::decode(&pair[..eq_idx])
+                            .unwrap_or_default()
+                            .into_owned();
+                        let v = urlencoding::decode(&pair[eq_idx + 1..])
+                            .unwrap_or_default()
+                            .into_owned();
                         existing.insert(k, v);
                     }
                 }
@@ -177,7 +191,8 @@ impl HttpSpider {
             api_url.clone()
         };
 
-        let merged: Vec<String> = existing.into_iter()
+        let merged: Vec<String> = existing
+            .into_iter()
             .chain(params.clone())
             .map(|(k, v)| format!("{}={}", urlencoding::encode(&k), urlencoding::encode(&v)))
             .collect();
@@ -187,18 +202,55 @@ impl HttpSpider {
     fn parse_vod_item(item: &Value) -> Vod {
         Vod {
             vod_id: value_to_string(item.get("vod_id")).unwrap_or_default(),
-            vod_name: item.get("vod_name").and_then(Value::as_str).unwrap_or("").to_string(),
-            vod_pic: item.get("vod_pic").and_then(Value::as_str).map(String::from),
-            vod_remarks: item.get("vod_remarks").and_then(Value::as_str).map(String::from),
-            type_name: item.get("type_name").and_then(Value::as_str).map(String::from),
-            vod_year: item.get("vod_year").and_then(Value::as_str).map(String::from),
-            vod_area: item.get("vod_area").and_then(Value::as_str).map(String::from),
-            vod_director: item.get("vod_director").and_then(Value::as_str).map(String::from),
-            vod_actor: item.get("vod_actor").and_then(Value::as_str).map(String::from),
-            vod_content: item.get("vod_content").and_then(Value::as_str).map(String::from),
-            vod_play_from: item.get("vod_play_from").and_then(Value::as_str).map(String::from),
-            vod_play_url: item.get("vod_play_url").and_then(Value::as_str).map(String::from),
-            vod_tag: item.get("vod_tag").and_then(Value::as_str).map(String::from),
+            vod_name: item
+                .get("vod_name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            vod_pic: item
+                .get("vod_pic")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_remarks: item
+                .get("vod_remarks")
+                .and_then(Value::as_str)
+                .map(String::from),
+            type_name: item
+                .get("type_name")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_year: item
+                .get("vod_year")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_area: item
+                .get("vod_area")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_director: item
+                .get("vod_director")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_actor: item
+                .get("vod_actor")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_content: item
+                .get("vod_content")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_play_from: item
+                .get("vod_play_from")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_play_url: item
+                .get("vod_play_url")
+                .and_then(Value::as_str)
+                .map(String::from),
+            vod_tag: item
+                .get("vod_tag")
+                .and_then(Value::as_str)
+                .map(String::from),
         }
     }
 
@@ -218,31 +270,74 @@ impl HttpSpider {
             Some(v) => vec![v.clone()],
             None => vec![],
         };
-        items.iter().map(|item| {
-            // XML parsed by quick-xml may have different structure, be flexible
-            let vod_id = item.get("vod_id").or_else(|| item.get("id"))
-                .and_then(|v| value_to_string(Some(v))).unwrap_or_default();
-            let vod_name = item.get("vod_name").or_else(|| item.get("name"))
-                .and_then(Value::as_str).unwrap_or("").to_string();
-            Vod {
-                vod_id,
-                vod_name,
-                vod_pic: item.get("vod_pic").or_else(|| item.get("pic"))
-                    .and_then(Value::as_str).map(String::from),
-                vod_remarks: item.get("vod_remarks").or_else(|| item.get("remarks"))
-                    .and_then(Value::as_str).map(String::from),
-                type_name: item.get("type_name").or_else(|| item.get("type"))
-                    .and_then(Value::as_str).map(String::from),
-                vod_year: item.get("vod_year").and_then(Value::as_str).map(String::from),
-                vod_area: item.get("vod_area").and_then(Value::as_str).map(String::from),
-                vod_director: item.get("vod_director").and_then(Value::as_str).map(String::from),
-                vod_actor: item.get("vod_actor").and_then(Value::as_str).map(String::from),
-                vod_content: item.get("vod_content").and_then(Value::as_str).map(String::from),
-                vod_play_from: item.get("vod_play_from").and_then(Value::as_str).map(String::from),
-                vod_play_url: item.get("vod_play_url").and_then(Value::as_str).map(String::from),
-                vod_tag: item.get("vod_tag").and_then(Value::as_str).map(String::from),
-            }
-        }).collect()
+        items
+            .iter()
+            .map(|item| {
+                // XML parsed by quick-xml may have different structure, be flexible
+                let vod_id = item
+                    .get("vod_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| value_to_string(Some(v)))
+                    .unwrap_or_default();
+                let vod_name = item
+                    .get("vod_name")
+                    .or_else(|| item.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Vod {
+                    vod_id,
+                    vod_name,
+                    vod_pic: item
+                        .get("vod_pic")
+                        .or_else(|| item.get("pic"))
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_remarks: item
+                        .get("vod_remarks")
+                        .or_else(|| item.get("remarks"))
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    type_name: item
+                        .get("type_name")
+                        .or_else(|| item.get("type"))
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_year: item
+                        .get("vod_year")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_area: item
+                        .get("vod_area")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_director: item
+                        .get("vod_director")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_actor: item
+                        .get("vod_actor")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_content: item
+                        .get("vod_content")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_play_from: item
+                        .get("vod_play_from")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_play_url: item
+                        .get("vod_play_url")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    vod_tag: item
+                        .get("vod_tag")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                }
+            })
+            .collect()
     }
 
     pub async fn home_content(&self, filter: bool) -> HttpResult<SpiderResult> {
@@ -256,13 +351,22 @@ impl HttpSpider {
         let url = self.build_url(&HashMap::from([("ac".to_string(), "detail".to_string())]));
         let data = self.fetch_json(&url).await?;
 
-        let mut classes: Vec<VodClass> = data.get("class").and_then(Value::as_array)
+        let mut classes: Vec<VodClass> = data
+            .get("class")
+            .and_then(Value::as_array)
             .map(|arr| {
-                arr.iter().map(|c| VodClass {
-                    type_id: value_to_string(c.get("type_id").or_else(|| c.get("id"))).unwrap_or_default(),
-                    type_name: c.get("type_name").or_else(|| c.get("name"))
-                        .and_then(Value::as_str).unwrap_or("").to_string(),
-                }).collect()
+                arr.iter()
+                    .map(|c| VodClass {
+                        type_id: value_to_string(c.get("type_id").or_else(|| c.get("id")))
+                            .unwrap_or_default(),
+                        type_name: c
+                            .get("type_name")
+                            .or_else(|| c.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -279,34 +383,63 @@ impl HttpSpider {
                     }
                 }
             }
-            classes = seen.into_iter().map(|(type_id, type_name)| VodClass { type_id, type_name }).collect();
+            classes = seen
+                .into_iter()
+                .map(|(type_id, type_name)| VodClass { type_id, type_name })
+                .collect();
         }
 
         let filters: Option<Value> = _filter.then(|| data.get("filters").cloned()).flatten();
 
-        Ok(SpiderResult { class: Some(classes), filters, list: Some(list), pagecount: None })
+        Ok(SpiderResult {
+            class: Some(classes),
+            filters,
+            list: Some(list),
+            pagecount: None,
+        })
     }
 
     async fn home_content_xml(&self, _filter: bool) -> HttpResult<SpiderResult> {
-        let url = self.build_url(&HashMap::from([("ac".to_string(), "videolist".to_string())]));
+        let url = self.build_url(&HashMap::from([(
+            "ac".to_string(),
+            "videolist".to_string(),
+        )]));
         let data = self.fetch_xml(&url).await?;
 
-        let classes: Vec<VodClass> = data.get("class").and_then(Value::as_array)
+        let classes: Vec<VodClass> = data
+            .get("class")
+            .and_then(Value::as_array)
             .map(|arr| {
-                arr.iter().map(|c| VodClass {
-                    type_id: value_to_string(c.get("type_id").or_else(|| c.get("id"))).unwrap_or_default(),
-                    type_name: c.get("type_name").or_else(|| c.get("name"))
-                        .and_then(Value::as_str).unwrap_or("").to_string(),
-                }).collect()
+                arr.iter()
+                    .map(|c| VodClass {
+                        type_id: value_to_string(c.get("type_id").or_else(|| c.get("id")))
+                            .unwrap_or_default(),
+                        type_name: c
+                            .get("type_name")
+                            .or_else(|| c.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
         let list = Self::parse_xml_vod_list(&data);
-        Ok(SpiderResult { class: Some(classes), filters: None, list: Some(list), pagecount: None })
+        Ok(SpiderResult {
+            class: Some(classes),
+            filters: None,
+            list: Some(list),
+            pagecount: None,
+        })
     }
 
     pub async fn category_content(
-        &self, tid: &str, pg: &str, filter: bool, extend: &HashMap<String, String>,
+        &self,
+        tid: &str,
+        pg: &str,
+        filter: bool,
+        extend: &HashMap<String, String>,
     ) -> HttpResult<SpiderResult> {
         let mut params = HashMap::new();
         match self.site_type {
@@ -317,7 +450,12 @@ impl HttpSpider {
                 let data = self.fetch_xml(&self.build_url(&params)).await?;
                 let list = Self::parse_xml_vod_list(&data);
                 let pagecount = data.get("pagecount").and_then(Value::as_i64);
-                Ok(SpiderResult { class: None, filters: None, list: Some(list), pagecount })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(list),
+                    pagecount,
+                })
             }
             _ => {
                 params.insert("ac".to_string(), "detail".to_string());
@@ -325,12 +463,20 @@ impl HttpSpider {
                 params.insert("pg".to_string(), pg.to_string());
 
                 if filter && !extend.is_empty() {
-                    params.insert("f".to_string(), serde_json::to_string(extend).unwrap_or_default());
+                    params.insert(
+                        "f".to_string(),
+                        serde_json::to_string(extend).unwrap_or_default(),
+                    );
                 }
                 let data = self.fetch_json(&self.build_url(&params)).await?;
                 let list = Self::parse_json_vod_list(&data);
                 let pagecount = data.get("pagecount").and_then(Value::as_i64);
-                Ok(SpiderResult { class: None, filters: None, list: Some(list), pagecount })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(list),
+                    pagecount,
+                })
             }
         }
     }
@@ -343,38 +489,72 @@ impl HttpSpider {
                 params.insert("ac".to_string(), "videolist".to_string());
                 params.insert("ids".to_string(), ids_str);
                 let data = self.fetch_xml(&self.build_url(&params)).await?;
-                Ok(SpiderResult { class: None, filters: None, list: Some(Self::parse_xml_vod_list(&data)), pagecount: None })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(Self::parse_xml_vod_list(&data)),
+                    pagecount: None,
+                })
             }
             _ => {
                 params.insert("ac".to_string(), "detail".to_string());
                 params.insert("ids".to_string(), ids_str);
                 let data = self.fetch_json(&self.build_url(&params)).await?;
-                Ok(SpiderResult { class: None, filters: None, list: Some(Self::parse_json_vod_list(&data)), pagecount: None })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(Self::parse_json_vod_list(&data)),
+                    pagecount: None,
+                })
             }
         }
     }
 
-    pub async fn search_content(&self, keyword: &str, _quick: bool, pg: Option<&str>) -> HttpResult<SpiderResult> {
+    pub async fn search_content(
+        &self,
+        keyword: &str,
+        _quick: bool,
+        pg: Option<&str>,
+    ) -> HttpResult<SpiderResult> {
         let mut params = HashMap::new();
         match self.site_type {
             0 => {
                 params.insert("ac".to_string(), "videolist".to_string());
                 params.insert("wd".to_string(), keyword.to_string());
-                if let Some(p) = pg { params.insert("pg".to_string(), p.to_string()); }
+                if let Some(p) = pg {
+                    params.insert("pg".to_string(), p.to_string());
+                }
                 let data = self.fetch_xml(&self.build_url(&params)).await?;
-                Ok(SpiderResult { class: None, filters: None, list: Some(Self::parse_xml_vod_list(&data)), pagecount: None })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(Self::parse_xml_vod_list(&data)),
+                    pagecount: None,
+                })
             }
             _ => {
                 params.insert("ac".to_string(), "detail".to_string());
                 params.insert("wd".to_string(), keyword.to_string());
-                if let Some(p) = pg { params.insert("pg".to_string(), p.to_string()); }
+                if let Some(p) = pg {
+                    params.insert("pg".to_string(), p.to_string());
+                }
                 let data = self.fetch_json(&self.build_url(&params)).await?;
-                Ok(SpiderResult { class: None, filters: None, list: Some(Self::parse_json_vod_list(&data)), pagecount: None })
+                Ok(SpiderResult {
+                    class: None,
+                    filters: None,
+                    list: Some(Self::parse_json_vod_list(&data)),
+                    pagecount: None,
+                })
             }
         }
     }
 
-    pub async fn player_content(&self, _flag: &str, id: &str, _vip_flags: &[String]) -> HttpResult<PlayerResult> {
+    pub async fn player_content(
+        &self,
+        _flag: &str,
+        id: &str,
+        _vip_flags: &[String],
+    ) -> HttpResult<PlayerResult> {
         let is_direct = is_video_format(id);
         let has_play_url = self.site.play_url.is_some();
         Ok(PlayerResult {
@@ -401,9 +581,15 @@ pub fn is_video_format(url: &str) -> bool {
         return false;
     }
     let re = Regex::new(r"(?i)https?://[^\s]{12,}\.(?:m3u8|m3u|mp4|flv|hlv|f4v|mkv|avi|wmv|mov|webm|ts|m4s|mpd|aac|mp3|m4a)(?:\?.*)?$").unwrap();
-    if re.is_match(url) { return true; }
-    if url.contains("video/tos") { return true; }
-    if url.starts_with("rtmp:") { return true; }
+    if re.is_match(url) {
+        return true;
+    }
+    if url.contains("video/tos") {
+        return true;
+    }
+    if url.starts_with("rtmp:") {
+        return true;
+    }
     false
 }
 
@@ -418,126 +604,151 @@ pub fn need_parse(url: &str, play_url: Option<&str>) -> bool {
 // ==================== XML API 解析 ====================
 
 /// 解析 XML API 响应
-    fn parse_xml_api_response(xml: &str) -> HttpResult<Value> {
-        // Simple XML to JSON conversion using recursive approach
-        // Only handles the TV API XML format (no backreferences needed)
-        let xml = xml.trim();
-        if xml.is_empty() {
-            return Ok(Value::Object(serde_json::Map::new()));
-        }
-
-        // Extract content within rss tag or use whole document
-        let content = if let Some(start) = xml.find("<rss") {
-            if let Some(end) = xml.rfind("</rss>") {
-                let inner_start = xml[start..].find('>').map(|i| start + i + 1).unwrap_or(start);
-                &xml[inner_start..end]
-            } else { xml }
-        } else { xml };
-
-        Ok(parse_xml_elements(content))
+fn parse_xml_api_response(xml: &str) -> HttpResult<Value> {
+    // Simple XML to JSON conversion using recursive approach
+    // Only handles the TV API XML format (no backreferences needed)
+    let xml = xml.trim();
+    if xml.is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
     }
 
-    fn parse_xml_elements(xml: &str) -> Value {
-        let xml = xml.trim();
-        if xml.is_empty() {
-            return Value::Null;
+    // Extract content within rss tag or use whole document
+    let content = if let Some(start) = xml.find("<rss") {
+        if let Some(end) = xml.rfind("</rss>") {
+            let inner_start = xml[start..]
+                .find('>')
+                .map(|i| start + i + 1)
+                .unwrap_or(start);
+            &xml[inner_start..end]
+        } else {
+            xml
         }
+    } else {
+        xml
+    };
 
-        let mut map = serde_json::Map::new();
-        let mut pos = 0;
-        let bytes = xml.as_bytes();
+    Ok(parse_xml_elements(content))
+}
 
-        while pos < xml.len() {
-            // Find next <tag>
-            let tag_start = match xml[pos..].find('<') {
-                Some(i) => pos + i,
-                None => break,
+fn parse_xml_elements(xml: &str) -> Value {
+    let xml = xml.trim();
+    if xml.is_empty() {
+        return Value::Null;
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut pos = 0;
+    let bytes = xml.as_bytes();
+
+    while pos < xml.len() {
+        // Find next <tag>
+        let tag_start = match xml[pos..].find('<') {
+            Some(i) => pos + i,
+            None => break,
+        };
+
+        // Skip comments and processing instructions
+        if tag_start + 1 < xml.len()
+            && (bytes[tag_start + 1] == b'?' || bytes[tag_start + 1] == b'!')
+        {
+            let close = if bytes[tag_start + 1] == b'?' {
+                b'?'
+            } else {
+                b'>'
             };
-
-            // Skip comments and processing instructions
-            if tag_start + 1 < xml.len() && (bytes[tag_start + 1] == b'?' || bytes[tag_start + 1] == b'!') {
-                let close = if bytes[tag_start + 1] == b'?' { b'?' } else { b'>' };
-                let end_tag = match xml[tag_start..].find(close as char) {
-                    Some(i) => tag_start + i + 1,
-                    None => break,
-                };
-                let end_close = xml[end_tag..].find('>').map(|i| end_tag + i + 1).unwrap_or(xml.len());
-                pos = end_close;
-                continue;
-            }
-
-            // Skip self-closing tags
-            if tag_start + 1 < xml.len() && bytes[tag_start + 1] == b'/' {
-                let end = xml[tag_start..].find('>').map(|i| tag_start + i + 1).unwrap_or(xml.len());
-                pos = end;
-                continue;
-            }
-
-            // Extract tag name
-            let tag_end = xml[tag_start..].find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                .map(|i| tag_start + i)
-                .unwrap_or(xml.len());
-
-            let tag_name = &xml[tag_start + 1..tag_end];
-
-            // Find end of opening tag
-            let open_end = match xml[tag_start..].find('>') {
+            let end_tag = match xml[tag_start..].find(close as char) {
                 Some(i) => tag_start + i + 1,
                 None => break,
             };
+            let end_close = xml[end_tag..]
+                .find('>')
+                .map(|i| end_tag + i + 1)
+                .unwrap_or(xml.len());
+            pos = end_close;
+            continue;
+        }
 
-            // Check if self-closing
-            if open_end > 1 && bytes[open_end - 2] == b'/' {
+        // Skip self-closing tags
+        if tag_start + 1 < xml.len() && bytes[tag_start + 1] == b'/' {
+            let end = xml[tag_start..]
+                .find('>')
+                .map(|i| tag_start + i + 1)
+                .unwrap_or(xml.len());
+            pos = end;
+            continue;
+        }
+
+        // Extract tag name
+        let tag_end = xml[tag_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .map(|i| tag_start + i)
+            .unwrap_or(xml.len());
+
+        let tag_name = &xml[tag_start + 1..tag_end];
+
+        // Find end of opening tag
+        let open_end = match xml[tag_start..].find('>') {
+            Some(i) => tag_start + i + 1,
+            None => break,
+        };
+
+        // Check if self-closing
+        if open_end > 1 && bytes[open_end - 2] == b'/' {
+            pos = open_end;
+            add_to_map(&mut map, tag_name, Value::Null);
+            continue;
+        }
+
+        // Find closing tag
+        let close_tag = format!("</{}>", tag_name);
+        let close_start = match xml[open_end..].find(&close_tag) {
+            Some(i) => open_end + i,
+            None => {
                 pos = open_end;
-                add_to_map(&mut map, tag_name, Value::Null);
                 continue;
             }
+        };
 
-            // Find closing tag
-            let close_tag = format!("</{}>", tag_name);
-            let close_start = match xml[open_end..].find(&close_tag) {
-                Some(i) => open_end + i,
-                None => {
-                    pos = open_end;
-                    continue;
-                }
-            };
+        let inner = &xml[open_end..close_start];
+        let child = parse_xml_elements(inner);
 
-            let inner = &xml[open_end..close_start];
-            let child = parse_xml_elements(inner);
+        // Check if inner text is just whitespace (no tags)
+        let inner_trimmed = inner.trim();
+        let is_leaf = !inner_trimmed.contains('<') && !inner_trimmed.contains('>');
 
-            // Check if inner text is just whitespace (no tags)
-            let inner_trimmed = inner.trim();
-            let is_leaf = !inner_trimmed.contains('<') && !inner_trimmed.contains('>');
+        let value = if is_leaf && !inner_trimmed.is_empty() {
+            Value::String(inner_trimmed.to_string())
+        } else if child.is_object()
+            && child.as_object().map(|m| m.is_empty()).unwrap_or(true)
+            && !inner_trimmed.is_empty()
+        {
+            Value::String(inner_trimmed.to_string())
+        } else {
+            child
+        };
 
-            let value = if is_leaf && !inner_trimmed.is_empty() {
-                Value::String(inner_trimmed.to_string())
-            } else if child.is_object() && child.as_object().map(|m| m.is_empty()).unwrap_or(true) && !inner_trimmed.is_empty() {
-                Value::String(inner_trimmed.to_string())
-            } else {
-                child
-            };
-
-            add_to_map(&mut map, tag_name, value);
-            pos = close_start + close_tag.len();
-        }
-
-        Value::Object(map)
+        add_to_map(&mut map, tag_name, value);
+        pos = close_start + close_tag.len();
     }
 
-    fn add_to_map(map: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
-        match map.get_mut(key) {
-            Some(Value::Array(ref mut arr)) => arr.push(value),
-            Some(existing) => {
-                let old = std::mem::replace(existing, Value::Array(vec![]));
-                if let Value::Array(ref mut arr) = existing {
-                    arr.push(old);
-                    arr.push(value);
-                }
+    Value::Object(map)
+}
+
+fn add_to_map(map: &mut serde_json::Map<String, Value>, key: &str, value: Value) {
+    match map.get_mut(key) {
+        Some(Value::Array(ref mut arr)) => arr.push(value),
+        Some(existing) => {
+            let old = std::mem::replace(existing, Value::Array(vec![]));
+            if let Value::Array(ref mut arr) = existing {
+                arr.push(old);
+                arr.push(value);
             }
-            None => { map.insert(key.to_string(), value); }
+        }
+        None => {
+            map.insert(key.to_string(), value);
         }
     }
+}
 
 #[cfg(test)]
 mod tests {
@@ -557,7 +768,10 @@ mod tests {
         assert!(!need_parse("https://example.com/v.mp4", None));
         assert!(need_parse("https://example.com/page.html", None));
         // With playUrl, needs parse even for direct video URLs
-        assert!(need_parse("https://example.com/v.mp4", Some("https://example.com/play.php")));
+        assert!(need_parse(
+            "https://example.com/v.mp4",
+            Some("https://example.com/play.php")
+        ));
     }
 
     #[test]
@@ -575,10 +789,20 @@ mod tests {
         let result = parse_xml_api_response(xml).unwrap();
         let list = result.get("list").and_then(|v| v.as_object());
         assert!(list.is_some(), "Should have 'list' key");
-        let video = list.and_then(|m| m.get("video")).and_then(|v| v.as_object());
+        let video = list
+            .and_then(|m| m.get("video"))
+            .and_then(|v| v.as_object());
         assert!(video.is_some(), "Should have 'video' key");
-        assert_eq!(video.and_then(|m| m.get("vod_id")).and_then(Value::as_str), Some("1"));
-        assert_eq!(video.and_then(|m| m.get("vod_name")).and_then(Value::as_str), Some("Test Movie"));
+        assert_eq!(
+            video.and_then(|m| m.get("vod_id")).and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            video
+                .and_then(|m| m.get("vod_name"))
+                .and_then(Value::as_str),
+            Some("Test Movie")
+        );
     }
 
     #[test]
@@ -589,15 +813,24 @@ mod tests {
         });
         let list = HttpSpider::parse_json_vod_list(&data);
         assert_eq!(list[0].vod_id, "75220");
-        assert_eq!(value_to_string(data["class"][0].get("type_id")), Some("22".to_string()));
+        assert_eq!(
+            value_to_string(data["class"][0].get("type_id")),
+            Some("22".to_string())
+        );
     }
 
     #[test]
     fn build_url_merges_params() {
         let spider = HttpSpider::new(SiteConfig {
-            key: "test".to_string(), name: "Test".to_string(),
-            site_type: 1, api: "https://api.example.com/api.php".to_string(),
-            ext: None, play_url: None, click: None, header: None, timeout: None,
+            key: "test".to_string(),
+            name: "Test".to_string(),
+            site_type: 1,
+            api: "https://api.example.com/api.php".to_string(),
+            ext: None,
+            play_url: None,
+            click: None,
+            header: None,
+            timeout: None,
         });
         let url = spider.build_url(&HashMap::from([
             ("ac".to_string(), "detail".to_string()),
@@ -611,9 +844,15 @@ mod tests {
     #[test]
     fn build_url_preserves_existing_params() {
         let spider = HttpSpider::new(SiteConfig {
-            key: "test".to_string(), name: "Test".to_string(),
-            site_type: 1, api: "https://api.example.com/api.php?existing=1".to_string(),
-            ext: None, play_url: None, click: None, header: None, timeout: None,
+            key: "test".to_string(),
+            name: "Test".to_string(),
+            site_type: 1,
+            api: "https://api.example.com/api.php?existing=1".to_string(),
+            ext: None,
+            play_url: None,
+            click: None,
+            header: None,
+            timeout: None,
         });
         let url = spider.build_url(&HashMap::from([("ac".to_string(), "detail".to_string())]));
         assert!(url.contains("existing=1"));

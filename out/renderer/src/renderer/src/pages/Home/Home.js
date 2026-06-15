@@ -1,10 +1,20 @@
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Search, ChevronDown, Loader2, ArrowLeft } from 'lucide-react';
+import { Search, ChevronDown, Loader2, ArrowLeft, Clock } from 'lucide-react';
 import { useConfigStore } from '@/stores/useConfigStore';
+import { historyApi } from '@/utils/ipc';
 import VodCard from '@/components/VodCard/VodCard';
 import EmptyState from '@/components/EmptyState/EmptyState';
+function formatResumeTime(seconds = 0) {
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(safeSeconds / 3600);
+    const m = Math.floor((safeSeconds % 3600) / 60);
+    const s = safeSeconds % 60;
+    if (h > 0)
+        return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
 export default function Home() {
     const navigate = useNavigate();
     const { currentConfig, sites, currentSiteKey, categories, filters, homeVideos, categoryVideos, currentPage, hasMore, isLoading, error, switchSite, fetchCategoryContent } = useConfigStore();
@@ -14,6 +24,7 @@ export default function Home() {
     const scrollContainerRef = useRef(null);
     const [showSiteSheet, setShowSiteSheet] = useState(false);
     const siteSheetRef = useRef(null);
+    const [continueItems, setContinueItems] = useState([]);
     // 只显示 HTTP API 类型的站点（type 0/1/4）
     const visibleSites = sites.filter((s) => s.type === 0 || s.type === 1 || s.type === 4);
     // 获取当前分类的可用筛选器
@@ -25,6 +36,20 @@ export default function Home() {
         setShowSiteSheet(false);
         scrollContainerRef.current?.scrollTo({ top: 0 });
     }, [currentSiteKey, sites]);
+    useEffect(() => {
+        if (!currentConfig) {
+            setContinueItems([]);
+            return;
+        }
+        historyApi.list()
+            .then((items) => {
+            setContinueItems(items
+                .filter((item) => !item.completed && (item.positionSeconds || item.progress || 0) > 0)
+                .sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0))
+                .slice(0, 8));
+        })
+            .catch(() => setContinueItems([]));
+    }, [currentConfig]);
     // 分类切换
     useEffect(() => {
         if (activeCategory && activeCategory !== '首页') {
@@ -87,5 +112,5 @@ export default function Home() {
                                     ? 'bg-accent/20 text-accent'
                                     : 'text-text-muted hover:text-text-secondary'}`, children: cat.type_name }, cat.type_id))), activeFilters.length > 0 && activeCategory && (_jsxs("button", { onClick: () => setShowFilterPanel(!showFilterPanel), className: `shrink-0 flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors ${showFilterPanel ? 'text-accent' : 'text-text-muted hover:text-text-secondary'}`, children: ["\u7B5B\u9009 ", _jsx(ChevronDown, { className: `w-3 h-3 transition-transform ${showFilterPanel ? 'rotate-180' : ''}` })] }))] })), showFilterPanel && activeFilters.length > 0 && (_jsx("div", { className: "px-4 py-2 border-t border-[#2a2a2a] space-y-2", children: activeFilters.map((filter) => (_jsxs("div", { className: "flex items-center gap-2 flex-wrap", children: [_jsxs("span", { className: "text-xs text-text-muted shrink-0 w-12", children: [filter.name, ":"] }), filter.value.map((v) => (_jsx("button", { onClick: () => handleFilterChange(filter.key, v.v), className: `px-2 py-0.5 text-xs rounded transition-colors ${selectedFilters[filter.key] === v.v
                                         ? 'bg-accent/20 text-accent'
-                                        : 'text-text-muted hover:text-text-secondary'}`, children: v.n }, v.v)))] }, filter.key))) }))] }), error && !isLoading && (_jsx("div", { className: "shrink-0 px-4 py-2 bg-red-500/10 text-red-400 text-xs text-center", children: error })), _jsxs("div", { ref: scrollContainerRef, onScroll: handleScroll, className: "flex-1 overflow-y-auto scrollbar-dark p-4", children: [isLoading && displayVideos.length === 0 ? (_jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4", children: Array.from({ length: 12 }).map((_, i) => (_jsx(VodCard, { vod: { vod_id: '', vod_name: '', vod_pic: '', vod_remarks: '' }, onClick: () => { }, loading: true }, i))) })) : displayVideos.length > 0 ? (_jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4", children: displayVideos.map((vod) => (_jsx(VodCard, { vod: vod, onClick: handleVodClick }, vod.vod_id))) })) : (_jsx("div", { className: "flex items-center justify-center h-64 text-text-muted text-sm", children: isLoading ? '加载中...' : '暂无内容，请尝试切换站点或配置源' })), isLoading && displayVideos.length > 0 && (_jsx("div", { className: "flex justify-center py-4", children: _jsx(Loader2, { className: "w-5 h-5 text-accent animate-spin" }) }))] })] }));
+                                        : 'text-text-muted hover:text-text-secondary'}`, children: v.n }, v.v)))] }, filter.key))) }))] }), error && !isLoading && (_jsx("div", { className: "shrink-0 px-4 py-2 bg-red-500/10 text-red-400 text-xs text-center", children: error })), _jsxs("div", { ref: scrollContainerRef, onScroll: handleScroll, className: "flex-1 overflow-y-auto scrollbar-dark p-4", children: [!activeCategory && continueItems.length > 0 && (_jsxs("section", { className: "mb-5", children: [_jsxs("div", { className: "mb-3 flex items-center gap-2", children: [_jsx(Clock, { className: "h-4 w-4 text-accent" }), _jsx("h2", { className: "text-sm font-medium text-text-primary", children: "\u7EE7\u7EED\u89C2\u770B" })] }), _jsx("div", { className: "grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4", children: continueItems.map((item) => (_jsxs("button", { onClick: () => navigate(`/vod/${item.siteKey}/${item.vodId}`), className: "flex min-w-0 items-center gap-3 rounded-lg bg-bg-secondary p-2 text-left transition-colors hover:bg-bg-hover", children: [_jsx("div", { className: "h-16 w-11 shrink-0 overflow-hidden rounded bg-bg-tertiary", children: _jsx("img", { src: item.vodPic, alt: item.vodName, className: "h-full w-full object-cover", onError: (event) => { event.target.style.display = 'none'; } }) }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "truncate text-sm font-medium text-text-primary", children: item.vodName }), _jsx("p", { className: "mt-1 truncate text-xs text-text-muted", children: item.episodeName || item.source || '上次观看' }), _jsxs("div", { className: "mt-2 flex items-center gap-2", children: [_jsx("div", { className: "h-1 flex-1 overflow-hidden rounded-full bg-bg-tertiary", children: _jsx("div", { className: "h-full rounded-full bg-accent", style: { width: `${Math.max(0, Math.min(100, item.progress || 0))}%` } }) }), _jsx("span", { className: "shrink-0 text-[10px] text-text-muted", children: (item.positionSeconds || 0) > 0 ? formatResumeTime(item.positionSeconds) : `${item.progress || 0}%` })] })] })] }, `${item.siteKey}:${item.vodId}`))) })] })), isLoading && displayVideos.length === 0 ? (_jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4", children: Array.from({ length: 12 }).map((_, i) => (_jsx(VodCard, { vod: { vod_id: '', vod_name: '', vod_pic: '', vod_remarks: '' }, onClick: () => { }, loading: true }, i))) })) : displayVideos.length > 0 ? (_jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4", children: displayVideos.map((vod) => (_jsx(VodCard, { vod: vod, onClick: handleVodClick }, vod.vod_id))) })) : (_jsx("div", { className: "flex items-center justify-center h-64 text-text-muted text-sm", children: isLoading ? '加载中...' : '暂无内容，请尝试切换站点或配置源' })), isLoading && displayVideos.length > 0 && (_jsx("div", { className: "flex justify-center py-4", children: _jsx(Loader2, { className: "w-5 h-5 text-accent animate-spin" }) }))] })] }));
 }

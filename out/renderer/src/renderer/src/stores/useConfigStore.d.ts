@@ -5,6 +5,7 @@ export interface Site {
     api: string;
     ext?: string;
     jar?: string;
+    hide?: number;
     searchable: number;
     changeable: number;
 }

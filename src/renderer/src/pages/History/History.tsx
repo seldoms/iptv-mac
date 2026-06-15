@@ -50,6 +50,23 @@ export default function History() {
     return d.toLocaleDateString('zh-CN')
   }
 
+  const formatDuration = (seconds = 0) => {
+    const safeSeconds = Math.max(0, Math.floor(seconds))
+    const h = Math.floor(safeSeconds / 3600)
+    const m = Math.floor((safeSeconds % 3600) / 60)
+    const s = safeSeconds % 60
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    return `${m}:${String(s).padStart(2, '0')}`
+  }
+
+  const progressText = (item: HistoryItem) => {
+    if (item.completed) return '已看完'
+    if ((item.positionSeconds || 0) > 0) {
+      return `${formatDuration(item.positionSeconds)}${item.duration ? ` / ${formatDuration(item.duration)}` : ''}`
+    }
+    return `${Math.max(0, Math.min(100, item.progress || 0)).toFixed(0)}%`
+  }
+
   return (
     <div className="h-full flex flex-col">
       {/* 标题栏 */}
@@ -105,8 +122,13 @@ export default function History() {
                     {item.vodName}
                   </h3>
                   <p className="text-xs text-text-muted mt-1">
-                    {item.source || '未知播放源'}
+                    {item.episodeName || item.source || '未知播放源'}
                   </p>
+                  {item.sourceName && (
+                    <p className="text-[11px] text-text-muted/80 mt-1 truncate">
+                      {item.sourceName}
+                    </p>
+                  )}
                   <div className="flex items-center gap-2 mt-2">
                     {/* 进度条 */}
                     <div className="flex-1 h-1 bg-bg-tertiary rounded-full overflow-hidden">
@@ -116,7 +138,7 @@ export default function History() {
                       />
                     </div>
                     <span className="text-[10px] text-text-muted shrink-0">
-                      {Math.max(0, Math.min(100, item.progress || 0)).toFixed(0)}%
+                      {progressText(item)}
                     </span>
                   </div>
                 </div>

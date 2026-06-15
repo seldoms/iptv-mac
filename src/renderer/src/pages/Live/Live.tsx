@@ -38,6 +38,7 @@ export default function Live() {
   const play = usePlayerStore((state) => state.play)
   const autoSwitchSource = usePlayerStore((state) => state.autoSwitchSource)
   const setPlaybackError = usePlayerStore((state) => state.setPlaybackError)
+  const setSourceSwitchState = usePlayerStore((state) => state.setSourceSwitchState)
   const currentConfig = useConfigStore((state) => state.currentConfig)
   const liveConfig = useConfigStore((state) => state.liveConfig)
 
@@ -250,17 +251,28 @@ export default function Live() {
       const headersQueue = channelHeadersQueueRef.current
       if (nextIndex < queue.length) {
         channelUrlIndexRef.current = nextIndex
+        setSourceSwitchState('switching', `正在切换直播线路 ${nextIndex + 1}/${queue.length}`)
         console.warn(
           `[Live] 当前线路失败，切换备用线路 ${nextIndex + 1}/${queue.length}:`,
           currentChannel.name
         )
         void playLiveUrl(queue[nextIndex], headersQueue[nextIndex])
+        window.setTimeout(() => setSourceSwitchState('idle', ''), 2500)
         return
       }
 
       console.error('[Live] 当前频道所有线路均不可用:', currentChannel.name)
-      setPlaybackError('当前频道所有线路均不可用')
-  }, [currentChannel, playLiveUrl, setPlaybackError])
+      setSourceSwitchState('idle', '当前频道所有线路均不可用')
+      setPlaybackError('当前频道所有线路均不可用', {
+        stage: 'connect',
+        errorKind: 'unknown',
+        protocol: 'unknown',
+        sourceId: currentChannel.name,
+        attempt: queue.length,
+        sourceCount: queue.length,
+        nextAction: '可重试当前频道或选择其他频道'
+      })
+  }, [currentChannel, playLiveUrl, setPlaybackError, setSourceSwitchState])
 
   useEffect(() => {
     const handlePlayFailed = () => {

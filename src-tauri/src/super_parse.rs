@@ -193,15 +193,6 @@ pub async fn super_parse(
     player_result: Option<&Value>,
     parses: Option<&Vec<Value>>,
 ) -> Result<Option<ParseResult>, AppError> {
-    // Level 0: 直链识别
-    if spider::is_video_format(url) {
-        return Ok(Some(ParseResult {
-            url: url.to_string(),
-            header: None,
-            from: "direct".to_string(),
-        }));
-    }
-
     let mut result_url = url.to_string();
     let mut parse_flag = 0i64;
     let mut result_header: Option<HashMap<String, String>> = None;
@@ -223,7 +214,11 @@ pub async fn super_parse(
             }
             result_header = Some(headers);
         }
-        play_url = pr.get("playUrl").and_then(Value::as_str).map(String::from);
+        play_url = pr
+            .get("playUrl")
+            .or_else(|| pr.get("play_url"))
+            .and_then(Value::as_str)
+            .map(String::from);
     }
 
     // Check if direct
@@ -231,7 +226,11 @@ pub async fn super_parse(
         return Ok(Some(ParseResult {
             url: result_url,
             header: result_header,
-            from: "playerContent".to_string(),
+            from: if player_result.is_some() {
+                "playerContent".to_string()
+            } else {
+                "direct".to_string()
+            },
         }));
     }
 

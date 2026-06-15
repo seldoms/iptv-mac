@@ -13,6 +13,7 @@ const initialState = {
     episodes: [],
     currentEpisodeIndex: 0,
     currentSourceIndex: 0,
+    currentSourceName: '',
     playHeader: null,
     currentSiteKey: '',
     playbackPhase: 'idle',
@@ -21,6 +22,7 @@ const initialState = {
     playbackStartedAt: 0,
     playbackFirstFrameAt: 0,
     playbackLastErrorAt: 0,
+    playbackDiagnostic: null,
     alternativeSources: [],
     brokenSources: new Set(),
     sourceSwitchState: 'idle',
@@ -42,6 +44,7 @@ export const usePlayerStore = create()((set, get) => ({
                 playbackPhase: 'connecting',
                 playbackMessage: '正在连接播放地址...',
                 playbackError: '',
+                playbackDiagnostic: null,
                 playbackStartedAt: Date.now(),
                 playbackFirstFrameAt: 0,
                 playbackLastErrorAt: 0,
@@ -54,6 +57,7 @@ export const usePlayerStore = create()((set, get) => ({
                 playbackPhase: s.currentUrl ? 'connecting' : s.playbackPhase,
                 playbackMessage: s.currentUrl ? '正在连接播放地址...' : s.playbackMessage,
                 playbackError: '',
+                playbackDiagnostic: null,
                 playbackLastErrorAt: 0,
                 playKey: s.playKey + 1
             }));
@@ -68,6 +72,7 @@ export const usePlayerStore = create()((set, get) => ({
         playbackPhase: 'idle',
         playbackMessage: '',
         playbackError: '',
+        playbackDiagnostic: null,
         playbackFirstFrameAt: 0,
         playbackLastErrorAt: 0
     }),
@@ -102,14 +107,15 @@ export const usePlayerStore = create()((set, get) => ({
             });
         }
     },
-    setVod: (vod, episodes, sourceIndex = 0, resolvedUrl, header, siteKey) => {
+    setVod: (vod, episodes, sourceIndex = 0, resolvedUrl, header, siteKey, sourceName = '', startPositionSeconds = 0) => {
         set({
             currentVod: vod,
             episodes,
             currentSourceIndex: sourceIndex,
             currentEpisodeIndex: 0,
+            currentSourceName: sourceName,
             currentUrl: resolvedUrl || (episodes.length > 0 ? episodes[0].url : ''),
-            currentTime: 0,
+            currentTime: Math.max(0, startPositionSeconds),
             duration: 0,
             isPlaying: episodes.length > 0,
             playHeader: header || null,
@@ -117,22 +123,24 @@ export const usePlayerStore = create()((set, get) => ({
             playbackPhase: resolvedUrl === '__resolving__' ? 'resolving' : episodes.length > 0 ? 'connecting' : 'idle',
             playbackMessage: resolvedUrl === '__resolving__' ? '解析播放地址中...' : episodes.length > 0 ? '正在连接播放地址...' : '',
             playbackError: '',
+            playbackDiagnostic: null,
             playbackStartedAt: episodes.length > 0 ? Date.now() : 0,
             playbackFirstFrameAt: 0,
             playbackLastErrorAt: 0
         });
     },
-    setCurrentEpisodeIndex: (index, resolvedUrl) => {
+    setCurrentEpisodeIndex: (index, resolvedUrl, startPositionSeconds = 0) => {
         const { episodes } = get();
         if (index >= 0 && index < episodes.length) {
             set({
                 currentEpisodeIndex: index,
                 currentUrl: resolvedUrl || episodes[index].url,
-                currentTime: 0,
+                currentTime: Math.max(0, startPositionSeconds),
                 isPlaying: true,
                 playbackPhase: resolvedUrl === '__resolving__' ? 'resolving' : 'connecting',
                 playbackMessage: resolvedUrl === '__resolving__' ? '解析播放地址中...' : '正在连接播放地址...',
                 playbackError: '',
+                playbackDiagnostic: null,
                 playbackStartedAt: Date.now(),
                 playbackFirstFrameAt: 0,
                 playbackLastErrorAt: 0
@@ -143,19 +151,32 @@ export const usePlayerStore = create()((set, get) => ({
     setPlaybackPhase: (phase, message = '') => set({
         playbackPhase: phase,
         playbackMessage: message,
-        playbackError: phase === 'failed' ? get().playbackError : ''
+        playbackError: phase === 'failed' ? get().playbackError : '',
+        playbackDiagnostic: phase === 'failed' ? get().playbackDiagnostic : null
     }),
-    setPlaybackError: (message) => set({
+    setPlaybackError: (message, diagnostic = {}) => set((state) => ({
         playbackPhase: 'failed',
-        playbackMessage: '播放失败',
+        playbackMessage: diagnostic.stage === 'parse' ? '解析失败' : '播放失败',
         playbackError: message,
-        playbackLastErrorAt: Date.now()
-    }),
+        playbackLastErrorAt: Date.now(),
+        playbackDiagnostic: {
+            stage: diagnostic.stage || 'unknown',
+            errorKind: diagnostic.errorKind || 'unknown',
+            protocol: diagnostic.protocol || 'unknown',
+            httpStatus: diagnostic.httpStatus,
+            elapsedMs: diagnostic.elapsedMs,
+            sourceId: diagnostic.sourceId || (state.currentSiteKey && state.currentVod ? `${state.currentSiteKey}::${state.currentVod.vod_id}` : undefined),
+            attempt: diagnostic.attempt ?? state.brokenSources.size + 1,
+            sourceCount: diagnostic.sourceCount ?? state.alternativeSources.length + state.brokenSources.size + 1,
+            nextAction: diagnostic.nextAction || (state.autoSwitchSource ? '自动尝试下一条可用线路' : '可手动重试或切换线路')
+        }
+    })),
     markPlaybackFirstFrame: () => set((state) => ({
         playbackPhase: 'playing',
         playbackMessage: '正在播放',
         playbackFirstFrameAt: state.playbackFirstFrameAt || Date.now(),
-        playbackError: ''
+        playbackError: '',
+        playbackDiagnostic: null
     })),
     // ==================== 换源 Actions ====================
     setAlternativeSources: (sources) => set({ alternativeSources: sources }),

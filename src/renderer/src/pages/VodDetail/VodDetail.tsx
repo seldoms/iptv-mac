@@ -11,6 +11,7 @@ import {
 import { historyApi, keepApi, siteApi } from '@/utils/ipc'
 import { getPlayableMediaUrl } from '@/utils/media'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
+import type { History as HistoryItem } from '@shared/types'
 
 /** 判断 URL 是否为视频流格式 */
 function isVideoFormat(url: string): boolean {
@@ -27,6 +28,19 @@ interface LineSource {
   vodId: string
   episodes: Episode[]
   isCurrent: boolean  // 是否为当前页面加载的源
+}
+
+function formatResumeTime(seconds = 0): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds))
+  const h = Math.floor(safeSeconds / 3600)
+  const m = Math.floor((safeSeconds % 3600) / 60)
+  const s = safeSeconds % 60
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  return `${m}:${String(s).padStart(2, '0')}`
+}
+
+function canResume(history: HistoryItem | null): history is HistoryItem {
+  return Boolean(history && !history.completed && (history.positionSeconds || 0) > 5)
 }
 
 export default function VodDetail() {
@@ -51,6 +65,7 @@ export default function VodDetail() {
   const [isResolving, setIsResolving] = useState(false)
   const [allSourcesExhausted, setAllSourcesExhausted] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [resumeHistory, setResumeHistory] = useState<HistoryItem | null>(null)
 
   // 当前正在播放的源信息
   const [currentPlaySource, setCurrentPlaySource] = useState<{ siteKey: string; vodId: string } | null>(null)
@@ -71,6 +86,7 @@ export default function VodDetail() {
     setIsLoading(true)
     setLoadError(null)
     setAllSourcesExhausted(false)
+    setResumeHistory(null)
     failureHandledRef.current = false
     resetSourceSwitch()
 
@@ -90,6 +106,14 @@ export default function VodDetail() {
         return
       }
       setDetail(vod)
+      let savedHistory: HistoryItem | null = null
+      try {
+        const historyList = (await historyApi.list()) as HistoryItem[]
+        savedHistory = historyList.find((item) => item.siteKey === sKey && item.vodId === vId) || null
+        setResumeHistory(savedHistory)
+      } catch {
+        setResumeHistory(null)
+      }
 
       // 解析播放源和集数
       const playFroms = (vod.vod_play_from || '').split('$$$').filter(Boolean)
@@ -143,7 +167,10 @@ export default function VodDetail() {
       const bestLineIdx = parsedLines.findIndex((l) =>
         /m3u8|mp4|mpd|flv|ts/i.test(l.name) && l.episodes.length > 0
       )
-      setActiveLineIndex(bestLineIdx >= 0 ? bestLineIdx : 0)
+      const resumeLineIdx = canResume(savedHistory)
+        ? Math.min(Math.max(savedHistory.sourceIndex || 0, 0), Math.max(0, parsedLines.length - 1))
+        : -1
+      setActiveLineIndex(resumeLineIdx >= 0 ? resumeLineIdx : bestLineIdx >= 0 ? bestLineIdx : 0)
       setIsLoading(false)
     } catch (err: any) {
       setLoadError(err?.message || '加载失败')
@@ -197,7 +224,6 @@ export default function VodDetail() {
     switchingRef.current = true
     try {
       setSourceSwitchState('switching', `正在加载「${source.siteName}」...`)
-      markCurrentSourceBroken(source.siteKey, source.vodId)
 
       // 在当前页面内加载新源的详情
       try {
@@ -205,6 +231,7 @@ export default function VodDetail() {
         const result = res.data || res
         const vod = result.list?.[0]
         if (!vod) {
+          markCurrentSourceBroken(source.siteKey, source.vodId)
           setSourceSwitchState('idle', '加载失败，尝试下一个...')
           setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
           // 尝试队列中的下一个
@@ -265,6 +292,7 @@ export default function VodDetail() {
         }
 
         if (newLines.length === 0) {
+          markCurrentSourceBroken(source.siteKey, source.vodId)
           setSourceSwitchState('idle', '该源无播放数据')
           setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
           return
@@ -279,6 +307,7 @@ export default function VodDetail() {
         setSourceSwitchState('idle', `已切换到「${source.siteName}」`)
         setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
       } catch (err) {
+        markCurrentSourceBroken(source.siteKey, source.vodId)
         setSourceSwitchState('idle', '加载失败')
         setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
       }
@@ -336,10 +365,11 @@ export default function VodDetail() {
   }, [activeLine, activeLineIndex, currentEpisodeIndex, switchToNextSource])
 
   // 播放集数
-  const handlePlay = async (lineIdx: number, epIdx: number) => {
+  const handlePlay = async (lineIdx: number, epIdx: number, startPositionSeconds = 0) => {
     const line = lineSources[lineIdx]
     if (!line || !line.episodes[epIdx]) return
 
+    window.dispatchEvent(new Event('player:flushHistory'))
     setIsResolving(true)
     setPlaybackPhase('resolving', '正在获取播放信息...')
     setCurrentSourceIndex(lineIdx)
@@ -378,15 +408,15 @@ export default function VodDetail() {
         setPlaybackPhase('connecting', '正在连接播放地址...')
         const playableUrl = await getPlayableMediaUrl(initialUrl, initialHeader)
         setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId })
-        setVod(targetDetail!, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey)
-        setCurrentEpisodeIndex(epIdx, playableUrl)
+        setVod(targetDetail!, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey, line.name, startPositionSeconds)
+        setCurrentEpisodeIndex(epIdx, playableUrl, startPositionSeconds)
         setShowPlayer(true)
       } else {
         // 需要解析，先展示播放器加载态
         setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId })
         setShowPlayer(true)
         setPlaybackPhase('resolving', '正在解析播放地址...')
-        setVod(targetDetail!, line.episodes, lineIdx, '__resolving__', initialHeader, targetSiteKey)
+        setVod(targetDetail!, line.episodes, lineIdx, '__resolving__', initialHeader, targetSiteKey, line.name, startPositionSeconds)
 
         // 异步解析
         try {
@@ -405,19 +435,32 @@ export default function VodDetail() {
             )
             const header = parseRes.data.header || initialHeader
             const store = usePlayerStore.getState()
-            setCurrentEpisodeIndex(epIdx, url)
+            setCurrentEpisodeIndex(epIdx, url, startPositionSeconds)
             store.play(url)
+            if (startPositionSeconds > 0) store.setCurrentTime(startPositionSeconds)
           } else {
             // 所有解析都失败
-            setPlaybackError('解析完全失败')
+            setPlaybackError(parseRes.error || '解析失败：未找到可播放地址', {
+              stage: 'parse',
+              errorKind: 'parse_failed',
+              protocol: 'unknown',
+              sourceId: `${targetSiteKey}::${targetVodId}`,
+              nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+            })
             window.dispatchEvent(new CustomEvent('vod:playFailed', {
-              detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析完全失败', autoSwitch: true }
+              detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析失败：未找到可播放地址', autoSwitch: true }
             }))
           }
         } catch {
-          setPlaybackError('解析异常')
+          setPlaybackError('解析异常：无法完成播放地址解析', {
+            stage: 'parse',
+            errorKind: 'parse_failed',
+            protocol: 'unknown',
+            sourceId: `${targetSiteKey}::${targetVodId}`,
+            nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+          })
           window.dispatchEvent(new CustomEvent('vod:playFailed', {
-            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常', autoSwitch: true }
+            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常：无法完成播放地址解析', autoSwitch: true }
           }))
         }
       }
@@ -432,13 +475,31 @@ export default function VodDetail() {
         siteKey: targetSiteKey,
         vodName: targetDetail?.vod_name || '',
         vodPic: targetDetail?.vod_pic,
+        vodRemarks: targetDetail?.vod_remarks,
         source: episode.name ? `${line.name} · ${episode.name}` : line.name,
-        progress: 0
+        progress: startPositionSeconds > 0 && resumeHistory?.duration
+          ? Math.max(0, Math.min(100, Math.round((startPositionSeconds / resumeHistory.duration) * 100)))
+          : 0,
+        episodeId: String(epIdx),
+        episodeName: episode.name || `第 ${epIdx + 1} 集`,
+        episodeIndex: epIdx,
+        sourceIndex: lineIdx,
+        sourceName: line.name,
+        urlIdentifier: episode.url.split('?')[0].slice(0, 240),
+        duration: resumeHistory?.duration || 0,
+        positionSeconds: startPositionSeconds,
+        completed: false
       }).catch(() => {})
     } catch (err: any) {
       setIsResolving(false)
       setLoadError(err?.message || '获取播放信息失败')
-      setPlaybackError(err?.message || '获取播放信息失败')
+      setPlaybackError(err?.message || '获取播放信息失败', {
+        stage: 'connect',
+        errorKind: 'unknown',
+        protocol: 'unknown',
+        sourceId: `${targetSiteKey}::${targetVodId}`,
+        nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+      })
       window.dispatchEvent(new CustomEvent('vod:playFailed', {
         detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: 'playerContent 失败', autoSwitch: true }
       }))
@@ -493,6 +554,19 @@ export default function VodDetail() {
       </div>
     )
   }
+
+  const resumeLineIndex = canResume(resumeHistory)
+    ? Math.min(Math.max(resumeHistory.sourceIndex || 0, 0), Math.max(0, lineSources.length - 1))
+    : -1
+  const resumeEpisodeIndex = canResume(resumeHistory)
+    ? Math.min(
+        Math.max(resumeHistory.episodeIndex || 0, 0),
+        Math.max(0, (lineSources[resumeLineIndex]?.episodes.length || 1) - 1)
+      )
+    : -1
+  const resumeEpisodeName = resumeEpisodeIndex >= 0
+    ? lineSources[resumeLineIndex]?.episodes[resumeEpisodeIndex]?.name || resumeHistory?.episodeName
+    : ''
 
   return (
     <div className="h-full overflow-y-auto scrollbar-dark">
@@ -572,12 +646,26 @@ export default function VodDetail() {
               {detail?.vod_actor && <p>演员：{detail.vod_actor}</p>}
             </div>
             <div className="flex gap-3 mt-4 flex-wrap">
+              {canResume(resumeHistory) && resumeLineIndex >= 0 && resumeEpisodeIndex >= 0 && (
+                <button
+                  onClick={() => handlePlay(resumeLineIndex, resumeEpisodeIndex, resumeHistory.positionSeconds || 0)}
+                  disabled={isResolving || lineSources.length === 0}
+                  className="flex items-center gap-2 px-5 py-2 bg-accent hover:bg-accent-hover text-bg-primary rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {isResolving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                  继续 {resumeEpisodeName || resumeHistory.episodeName || '上次观看'} · {formatResumeTime(resumeHistory.positionSeconds)}
+                </button>
+              )}
               <button
                 onClick={() => {
                   if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0)
                 }}
                 disabled={isResolving || lineSources.length === 0}
-                className="flex items-center gap-2 px-5 py-2 bg-accent hover:bg-accent-hover text-bg-primary rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className={`flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                  canResume(resumeHistory)
+                    ? 'border border-[#2a2a2a] text-text-secondary hover:text-accent hover:border-accent'
+                    : 'bg-accent hover:bg-accent-hover text-bg-primary'
+                }`}
               >
                 {isResolving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
                 {isResolving ? '解析中...' : '播放'}

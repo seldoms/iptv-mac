@@ -6,11 +6,14 @@ import { usePlayerStore } from '@/stores/usePlayerStore';
 import DanmakuLayer from '@/components/DanmakuLayer/DanmakuLayer';
 import SubtitleLayer from '@/components/SubtitleLayer/SubtitleLayer';
 import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, SkipBack, SkipForward, MessageSquare, PictureInPicture2, Loader2, ClipboardList, Copy, X, RotateCw, Shuffle } from 'lucide-react';
-import { windowApi } from '@/utils/ipc';
+import { historyApi, windowApi } from '@/utils/ipc';
 import { redactHeaders, redactText } from '@/utils/redact';
+import { getPlaybackMetricSummary, recordPlaybackMetric } from '@/utils/playbackMetrics';
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 const MAX_HLS_NETWORK_RECOVERY_ATTEMPTS = 3;
 const MAX_HLS_MEDIA_RECOVERY_ATTEMPTS = 2;
+const MAX_HLS_DEBUG_EVENTS = 20;
+const HISTORY_SAVE_INTERVAL_MS = 15_000;
 const emptyStreamStats = {
     bitrateKbps: null,
     linkSpeedKbps: null,
@@ -22,6 +25,46 @@ function formatThroughput(kbps) {
     if (kbps >= 1000)
         return `${(kbps / 1000).toFixed(kbps >= 10000 ? 0 : 1)} Mbps`;
     return `${Math.round(kbps)} Kbps`;
+}
+function inferProtocol(url) {
+    if (!url)
+        return 'unknown';
+    const candidates = [url];
+    try {
+        const nestedUrl = new URL(url).searchParams.get('url');
+        if (nestedUrl)
+            candidates.unshift(nestedUrl);
+    }
+    catch {
+        // Keep the original string fallback for non-URL values.
+    }
+    if (candidates.some((candidate) => /\.m3u8(?:$|[?&#])/i.test(candidate)))
+        return 'hls';
+    if (candidates.some((candidate) => /\.mpd(?:$|[?&#])/i.test(candidate)))
+        return 'dash';
+    if (candidates.some((candidate) => /\.(mp4|m4v|webm|mov|flv|ts)(?:$|[?&#])/i.test(candidate)))
+        return 'native';
+    return 'unknown';
+}
+function appendHlsDebugEvent(event) {
+    if (typeof window === 'undefined')
+        return;
+    const debug = window.__alphaPlaybackDebug || { events: [] };
+    debug.events = [...debug.events, { at: Date.now(), ...event }].slice(-MAX_HLS_DEBUG_EVENTS);
+    window.__alphaPlaybackDebug = debug;
+}
+function formatUrlIdentifier(url) {
+    if (!url)
+        return '';
+    try {
+        const parsed = new URL(url);
+        const nested = parsed.searchParams.get('url');
+        const target = nested ? new URL(nested) : parsed;
+        return `${target.hostname}${target.pathname}`.slice(0, 240);
+    }
+    catch {
+        return url.split('?')[0].slice(0, 240);
+    }
 }
 export default function VideoPlayer() {
     const videoRef = useRef(null);
@@ -43,15 +86,22 @@ export default function VideoPlayer() {
     const lastFragLoadedAtRef = useRef(0);
     /** stalled 防抖定时器 - 持续停滞超过阈值才显示覆盖层 */
     const stalledTimerRef = useRef(0);
+    const pendingSeekRef = useRef(0);
+    const lastHistorySaveAtRef = useRef(0);
     // 用 ref 缓存 store 中的 siteKey/vodId，避免 reportPlayFailure 引用变化导致 effect 重跑
     const currentSiteKeyRef = useRef('');
     const currentVodIdRef = useRef('');
-    const { isPlaying, currentUrl, playKey, currentTime, duration, speed, volume, isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex, playHeader, currentSiteKey, currentVod, playbackPhase, playbackMessage, playbackError, playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, sourceSwitchState, sourceSwitchMessage, autoSwitchSource, setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume, toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode, setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource } = usePlayerStore();
+    const { isPlaying, currentUrl, playKey, currentTime, duration, speed, volume, isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex, currentSourceIndex, playHeader, currentSiteKey, currentVod, playbackPhase, playbackMessage, playbackError, playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, playbackDiagnostic, alternativeSources, brokenSources, sourceSwitchState, sourceSwitchMessage, autoSwitchSource, setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume, toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode, setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource } = usePlayerStore();
     // 同步 siteKey/vodId 到 ref（变化时不影响 effect）
     useEffect(() => {
         currentSiteKeyRef.current = currentSiteKey || '';
         currentVodIdRef.current = currentVod?.vod_id || '';
     }, [currentSiteKey, currentVod?.vod_id]);
+    useEffect(() => {
+        const target = usePlayerStore.getState().currentTime;
+        pendingSeekRef.current = target > 3 ? target : 0;
+        lastHistorySaveAtRef.current = 0;
+    }, [currentUrl, playKey]);
     const [showControls, setShowControls] = useState(true);
     const [showSpeedMenu, setShowSpeedMenu] = useState(false);
     const [showDiagnostics, setShowDiagnostics] = useState(false);
@@ -67,9 +117,48 @@ export default function VideoPlayer() {
         failureReportedRef.current = true;
         const siteKey = currentSiteKeyRef.current;
         const vodId = currentVodIdRef.current;
+        const store = usePlayerStore.getState();
+        const elapsedMs = store.playbackStartedAt ? Math.max(0, Date.now() - store.playbackStartedAt) : undefined;
+        const protocol = inferProtocol(store.currentUrl);
+        const lowerReason = reason.toLowerCase();
+        const stage = reason.includes('清单') || reason.includes('MANIFEST') || lowerReason.includes('manifest')
+            ? 'manifest'
+            : reason.includes('超时') || lowerReason.includes('timeout')
+                ? 'connect'
+                : reason.includes('媒体') || reason.includes('视频')
+                    ? 'media'
+                    : reason.includes('网络') || lowerReason.includes('network')
+                        ? 'network'
+                        : protocol === 'hls'
+                            ? 'manifest'
+                            : 'unknown';
+        const errorKind = reason.includes('超时') || lowerReason.includes('timeout')
+            ? 'timeout'
+            : protocol === 'hls' || lowerReason.includes('hls')
+                ? 'hls'
+                : reason.includes('媒体') || reason.includes('视频')
+                    ? 'media'
+                    : 'unknown';
         console.error('[VideoPlayer] 播放失败:', reason, 'siteKey:', siteKey, 'vodId:', vodId);
-        usePlayerStore.getState().setPlaybackError(reason);
-        const detail = { siteKey, vodId, reason, autoSwitch: true };
+        store.setPlaybackError(reason, {
+            stage,
+            errorKind,
+            protocol,
+            elapsedMs,
+            sourceId: siteKey && vodId ? `${siteKey}::${vodId}` : undefined,
+            nextAction: store.autoSwitchSource ? '自动尝试下一条可用线路' : '可手动重试或切换线路'
+        });
+        recordPlaybackMetric({
+            type: 'failure',
+            at: Date.now(),
+            elapsedMs,
+            phase: store.playbackPhase,
+            stage,
+            errorKind,
+            protocol,
+            sourceId: siteKey && vodId ? `${siteKey}::${vodId}` : undefined
+        });
+        const detail = { siteKey, vodId, reason, autoSwitch: true, diagnostic: usePlayerStore.getState().playbackDiagnostic };
         window.dispatchEvent(new CustomEvent(siteKey || vodId ? 'vod:playFailed' : 'live:playFailed', { detail }));
     });
     // 清除加载超时的工具函数
@@ -95,9 +184,80 @@ export default function VideoPlayer() {
         const video = videoRef.current;
         console.log('[VideoPlayer] 首帧播放成功:', `time=${video?.currentTime.toFixed(2) || '0.00'}`, `size=${video?.videoWidth || 0}x${video?.videoHeight || 0}`);
         markPlaybackFirstFrame();
+        const store = usePlayerStore.getState();
+        const elapsedMs = store.playbackStartedAt ? Math.max(0, Date.now() - store.playbackStartedAt) : undefined;
+        recordPlaybackMetric({
+            type: 'first_frame',
+            at: Date.now(),
+            elapsedMs,
+            phase: store.playbackPhase,
+            protocol: inferProtocol(store.currentUrl),
+            sourceId: store.currentSiteKey && store.currentVod ? `${store.currentSiteKey}::${store.currentVod.vod_id}` : undefined
+        });
         clearLoadTimeout();
         clearStalledTimer();
     }, [clearLoadTimeout, clearStalledTimer, markPlaybackFirstFrame]);
+    const applyPendingSeek = useCallback(() => {
+        const video = videoRef.current;
+        const target = pendingSeekRef.current;
+        if (!video || target <= 3)
+            return;
+        if (!Number.isFinite(video.duration) || video.duration <= target + 2)
+            return;
+        video.currentTime = Math.min(target, Math.max(0, video.duration - 2));
+        pendingSeekRef.current = 0;
+    }, []);
+    const savePlaybackHistory = useCallback((force = false, completedOverride) => {
+        const video = videoRef.current;
+        const store = usePlayerStore.getState();
+        const vod = store.currentVod;
+        if (!vod || !store.currentSiteKey || !store.currentUrl || store.currentUrl === '__resolving__')
+            return;
+        const now = Date.now();
+        if (!force && now - lastHistorySaveAtRef.current < HISTORY_SAVE_INTERVAL_MS)
+            return;
+        const rawDuration = video?.duration || store.duration || 0;
+        const durationSeconds = Number.isFinite(rawDuration) ? Math.max(0, Math.round(rawDuration)) : 0;
+        const rawPosition = video?.currentTime ?? store.currentTime;
+        const positionSeconds = Number.isFinite(rawPosition) ? Math.max(0, Math.round(rawPosition)) : 0;
+        if (!force && positionSeconds < 5)
+            return;
+        const completed = completedOverride ?? (durationSeconds > 0 && positionSeconds / durationSeconds >= 0.95);
+        const savedPosition = completed ? 0 : positionSeconds;
+        const progress = durationSeconds > 0
+            ? Math.max(0, Math.min(100, Math.round((positionSeconds / durationSeconds) * 100)))
+            : 0;
+        const episode = store.episodes[store.currentEpisodeIndex];
+        const sourceName = store.currentSourceName || `线路 ${store.currentSourceIndex + 1}`;
+        const episodeName = episode?.name || `第 ${store.currentEpisodeIndex + 1} 集`;
+        lastHistorySaveAtRef.current = now;
+        historyApi.add({
+            siteKey: store.currentSiteKey,
+            vodId: vod.vod_id,
+            vodName: vod.vod_name,
+            vodPic: vod.vod_pic,
+            vodRemarks: vod.vod_remarks,
+            source: `${sourceName} · ${episodeName}`,
+            progress: completed ? 100 : progress,
+            episodeId: String(store.currentEpisodeIndex),
+            episodeName,
+            episodeIndex: store.currentEpisodeIndex,
+            sourceIndex: store.currentSourceIndex,
+            sourceName,
+            urlIdentifier: formatUrlIdentifier(store.currentUrl),
+            duration: durationSeconds,
+            positionSeconds: savedPosition,
+            completed
+        }).catch(() => { });
+    }, []);
+    useEffect(() => {
+        const handleFlushHistory = () => savePlaybackHistory(true);
+        window.addEventListener('player:flushHistory', handleFlushHistory);
+        return () => window.removeEventListener('player:flushHistory', handleFlushHistory);
+    }, [savePlaybackHistory]);
+    useEffect(() => {
+        return () => savePlaybackHistory(true);
+    }, [savePlaybackHistory]);
     // 进入精简模式
     const handleEnterMiniMode = useCallback(async () => {
         if (!currentUrl)
@@ -113,6 +273,12 @@ export default function VideoPlayer() {
         const video = videoRef.current;
         if (!video || !currentUrl)
             return;
+        const currentProtocol = inferProtocol(currentUrl);
+        window.__alphaPlaybackDebug = {
+            protocol: currentProtocol,
+            url: currentUrl,
+            events: []
+        };
         // 清理旧实例
         hlsRef.current?.destroy();
         dashRef.current?.reset();
@@ -120,6 +286,9 @@ export default function VideoPlayer() {
         dashRef.current = null;
         video.pause();
         video.removeAttribute('src');
+        video.muted = volume <= 0;
+        video.volume = volume;
+        video.playbackRate = speed;
         video.load();
         // 重置失败标记和播放标记
         failureReportedRef.current = false;
@@ -140,19 +309,24 @@ export default function VideoPlayer() {
             }
         }, 25000);
         let hlsRecoveryTimer = 0;
-        if (currentUrl.includes('.mpd')) {
+        if (currentProtocol === 'dash') {
             // DASH
             const player = dashjs.MediaPlayer().create();
             player.initialize(video, currentUrl, true);
             dashRef.current = player;
         }
-        else if (Hls.isSupported()) {
+        else if (currentProtocol === 'hls' && Hls.isSupported()) {
             let networkRecoveryAttempts = 0;
             let mediaRecoveryAttempts = 0;
             // 优先使用 HLS.js
             const hls = new Hls({
                 // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
                 enableWorker: false,
+                testBandwidth: false,
+                startFragPrefetch: true,
+                startLevel: 0,
+                maxBufferLength: 10,
+                maxMaxBufferLength: 30,
                 xhrSetup: (xhr, _url) => {
                     if (playHeader) {
                         for (const [key, value] of Object.entries(playHeader)) {
@@ -163,12 +337,46 @@ export default function VideoPlayer() {
             });
             hls.loadSource(currentUrl);
             hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+                appendHlsDebugEvent({
+                    event: 'manifest_loaded',
+                    levels: data.levels?.length,
+                    audioTracks: data.audioTracks?.length,
+                    subtitles: data.subtitles?.length
+                });
+            });
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
                 console.log('[VideoPlayer] HLS manifest 解析成功');
+                appendHlsDebugEvent({ event: 'manifest_parsed', levels: hls.levels.length });
                 setPlaybackPhase('buffering', '清单已加载，正在缓冲...');
                 video.play().catch(() => { });
             });
+            hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+                appendHlsDebugEvent({
+                    event: 'level_loaded',
+                    level: data.level,
+                    fragments: data.details?.fragments?.length,
+                    live: data.details?.live,
+                    targetduration: data.details?.targetduration
+                });
+            });
+            hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
+                appendHlsDebugEvent({
+                    event: 'frag_loading',
+                    sn: data.frag?.sn,
+                    level: data.frag?.level,
+                    type: data.frag?.type,
+                    duration: data.frag?.duration
+                });
+            });
             hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+                appendHlsDebugEvent({
+                    event: 'frag_loaded',
+                    sn: data.frag?.sn,
+                    level: data.frag?.level,
+                    type: data.frag?.type,
+                    payloadBytes: data.payload?.byteLength || 0
+                });
                 networkRecoveryAttempts = 0;
                 const now = performance.now();
                 const payloadBytes = data.payload?.byteLength || 0;
@@ -192,13 +400,21 @@ export default function VideoPlayer() {
             });
             hls.on(Hls.Events.ERROR, (_event, data) => {
                 console.error('[VideoPlayer] HLS错误:', data.type, data.details, data.fatal);
+                appendHlsDebugEvent({
+                    event: 'hls_error',
+                    type: data.type,
+                    details: data.details,
+                    fatal: data.fatal,
+                    responseCode: data.response?.code,
+                    responseText: data.response?.text,
+                    reason: data.error?.message
+                });
                 if (failureReportedRef.current)
                     return;
                 if (!data.fatal &&
                     video.currentTime <= 0 &&
                     (data.details === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
-                        data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
-                        data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR)) {
+                        data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR)) {
                     hls.stopLoad();
                     reportPlayFailureRef.current(`HLS首帧加载失败: ${data.details}`);
                     return;
@@ -248,7 +464,7 @@ export default function VideoPlayer() {
             });
             hlsRef.current = hls;
         }
-        else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        else if (currentProtocol === 'hls' && video.canPlayType('application/vnd.apple.mpegurl')) {
             // Safari 原生 HLS
             video.src = currentUrl;
             video.play().catch(() => { });
@@ -344,6 +560,7 @@ export default function VideoPlayer() {
         if (!video)
             return;
         video.volume = volume;
+        video.muted = volume <= 0;
         video.playbackRate = speed;
     }, [volume, speed]);
     // 视频事件
@@ -355,12 +572,26 @@ export default function VideoPlayer() {
             setCurrentTime(video.currentTime);
             if (video.currentTime > 0)
                 markPlaybackStarted();
+            savePlaybackHistory(false);
         };
-        const onDurationChange = () => setDuration(video.duration || 0);
+        const onDurationChange = () => {
+            setDuration(video.duration || 0);
+            applyPendingSeek();
+        };
         const onPlay = () => setIsPlaying(true);
-        const onPause = () => setIsPlaying(false);
+        const onPause = () => {
+            setIsPlaying(false);
+            savePlaybackHistory(true);
+        };
+        const onLoadedMetadata = () => applyPendingSeek();
+        const onLoadedData = () => {
+            applyPendingSeek();
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+                markPlaybackStarted();
+            }
+        };
         const onPlaying = () => {
-            if (video.currentTime > 0) {
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || video.currentTime > 0) {
                 markPlaybackStarted();
                 // 已开始播放时隐藏 stalled/buffering 覆盖层
                 clearStalledTimer();
@@ -370,6 +601,7 @@ export default function VideoPlayer() {
             }
         };
         const onEnded = () => {
+            savePlaybackHistory(true, true);
             if (currentEpisodeIndex < episodes.length - 1)
                 nextEpisode();
             else
@@ -379,6 +611,8 @@ export default function VideoPlayer() {
         video.addEventListener('durationchange', onDurationChange);
         video.addEventListener('play', onPlay);
         video.addEventListener('pause', onPause);
+        video.addEventListener('loadedmetadata', onLoadedMetadata);
+        video.addEventListener('loadeddata', onLoadedData);
         video.addEventListener('playing', onPlaying);
         video.addEventListener('ended', onEnded);
         return () => {
@@ -386,10 +620,22 @@ export default function VideoPlayer() {
             video.removeEventListener('durationchange', onDurationChange);
             video.removeEventListener('play', onPlay);
             video.removeEventListener('pause', onPause);
+            video.removeEventListener('loadedmetadata', onLoadedMetadata);
+            video.removeEventListener('loadeddata', onLoadedData);
             video.removeEventListener('playing', onPlaying);
             video.removeEventListener('ended', onEnded);
         };
-    }, [currentEpisodeIndex, episodes.length, markPlaybackStarted, nextEpisode, setDuration, setCurrentTime, setIsPlaying]);
+    }, [
+        applyPendingSeek,
+        currentEpisodeIndex,
+        episodes.length,
+        markPlaybackStarted,
+        nextEpisode,
+        savePlaybackHistory,
+        setDuration,
+        setCurrentTime,
+        setIsPlaying
+    ]);
     // 控制栏自动隐藏
     const resetHideTimer = useCallback(() => {
         setShowControls(true);
@@ -518,19 +764,30 @@ export default function VideoPlayer() {
     const bitrateText = formatThroughput(streamStats.bitrateKbps);
     const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps);
     const buildDiagnosticsText = () => {
+        const metricSummary = getPlaybackMetricSummary();
         const lines = [
             'IPTV Mac 播放诊断',
             `阶段: ${playbackPhase}`,
             `状态: ${playbackMessage || '-'}`,
             `错误: ${playbackError || '-'}`,
+            `错误阶段: ${playbackDiagnostic?.stage || '-'}`,
+            `错误类型: ${playbackDiagnostic?.errorKind || '-'}`,
+            `协议: ${playbackDiagnostic?.protocol || inferProtocol(currentUrl)}`,
             `站点: ${currentSiteKey || '-'}`,
             `影片: ${currentVod?.vod_name || '-'}`,
             `集数: ${episodes[currentEpisodeIndex]?.name || currentEpisodeIndex + 1 || '-'}`,
-            `线路索引: ${currentEpisodeIndex + 1}/${episodes.length || 0}`,
+            `线路索引: ${currentSourceIndex + 1}`,
+            `已失败源: ${brokenSources.size}`,
+            `备选源: ${alternativeSources.length}`,
             `首帧耗时: ${firstFrameMs == null ? '-' : `${firstFrameMs}ms`}`,
             `当前耗时: ${elapsedMs}ms`,
             `失败时间: ${playbackLastErrorAt ? new Date(playbackLastErrorAt).toISOString() : '-'}`,
             `换源状态: ${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`,
+            `下一步: ${playbackDiagnostic?.nextAction || (autoSwitchSource ? '自动换源开启' : '等待手动操作')}`,
+            `首帧样本数: ${metricSummary.totalFirstFrameSamples}`,
+            `首帧P50: ${metricSummary.p50FirstFrameMs == null ? '-' : `${metricSummary.p50FirstFrameMs}ms`}`,
+            `首帧P90: ${metricSummary.p90FirstFrameMs == null ? '-' : `${metricSummary.p90FirstFrameMs}ms`}`,
+            `失败样本数: ${metricSummary.totalFailures}`,
             `URL: ${redactedUrl || '-'}`,
             `Headers: ${Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders) : '-'}`
         ];
@@ -566,7 +823,7 @@ export default function VideoPlayer() {
     const handleNextSource = () => {
         window.dispatchEvent(new CustomEvent('player:nextSource'));
     };
-    return (_jsxs("div", { ref: containerRef, className: "relative w-full h-full bg-black group", onMouseMove: resetHideTimer, onMouseLeave: () => isPlaying && setShowControls(false), onDoubleClick: handleToggleFullscreen, children: [_jsx("video", { ref: videoRef, className: "w-full h-full object-contain", playsInline: true }), currentUrl && (_jsxs("div", { className: "pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u7801\u7387" }), _jsx("span", { className: "font-mono text-white", children: bitrateText })] }), _jsxs("div", { className: "mt-0.5 flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u901F\u5EA6" }), _jsx("span", { className: "font-mono text-white", children: linkSpeedText })] })] })), showPlaybackOverlay && (_jsxs("div", { className: "absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center", children: [playbackPhase === 'failed' ? (_jsx("div", { className: "flex h-10 w-10 items-center justify-center rounded-full border border-red-400/40 text-red-400", children: "!" })) : (_jsx(Loader2, { className: "w-8 h-8 animate-spin text-accent" })), _jsx("span", { className: "text-sm text-white/80", children: overlayText }), playbackPhase === 'failed' && (_jsx("span", { className: "max-w-md text-xs leading-5 text-white/50", children: "\u5E94\u7528\u4F1A\u5C1D\u8BD5\u81EA\u52A8\u6362\u6E90\uFF1B\u4E5F\u53EF\u4EE5\u5207\u6362\u7EBF\u8DEF\u6216\u91CD\u8BD5\u5F53\u524D\u96C6\u3002" }))] })), isDanmakuOn && _jsx(DanmakuLayer, {}), _jsx(SubtitleLayer, {}), _jsxs("div", { className: `absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-4 pb-3 pt-10 transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'}`, children: [_jsx("div", { className: "mb-2 cursor-pointer group/progress", onClick: handleProgressClick, children: _jsx("div", { className: "h-1 group-hover/progress:h-2 bg-white/20 rounded-full transition-all relative", children: _jsx("div", { className: "h-full bg-accent rounded-full relative", style: { width: `${progress}%` }, children: _jsx("div", { className: "absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-accent rounded-full opacity-0 group-hover/progress:opacity-100 transition-opacity" }) }) }) }), _jsxs("div", { className: "flex items-center justify-between", children: [_jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: prevEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipBack, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setIsPlaying(!isPlaying), className: "p-1 text-white hover:text-accent", children: isPlaying ? _jsx(Pause, { className: "w-5 h-5" }) : _jsx(Play, { className: "w-5 h-5" }) }), _jsx("button", { onClick: nextEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipForward, { className: "w-4 h-4" }) }), _jsxs("span", { className: "text-xs text-white/70 ml-2", children: [formatTime(currentTime), " / ", formatTime(duration)] })] }), _jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: () => setVolume(volume > 0 ? 0 : 1), className: "p-1 text-white/80 hover:text-white", children: volume > 0 ? _jsx(Volume2, { className: "w-4 h-4" }) : _jsx(VolumeX, { className: "w-4 h-4" }) }), _jsx("input", { type: "range", min: 0, max: 1, step: 0.05, value: volume, onChange: (e) => setVolume(Number(e.target.value)), className: "w-16 h-1 accent-accent" }), _jsxs("div", { className: "relative", children: [_jsxs("button", { onClick: () => setShowSpeedMenu(!showSpeedMenu), className: "px-2 py-0.5 text-xs text-white/80 hover:text-white rounded border border-white/20", children: [speed, "x"] }), showSpeedMenu && (_jsx("div", { className: "absolute bottom-full right-0 mb-2 bg-bg-secondary rounded-lg shadow-xl border border-[#2a2a2a] py-1 min-w-[80px]", children: SPEEDS.map((s) => (_jsxs("button", { onClick: () => { setSpeed(s); setShowSpeedMenu(false); }, className: `w-full px-3 py-1.5 text-xs text-left hover:bg-bg-hover ${speed === s ? 'text-accent' : 'text-text-secondary'}`, children: [s, "x"] }, s))) }))] }), _jsx("button", { onClick: toggleDanmaku, className: `p-1 ${isDanmakuOn ? 'text-accent' : 'text-white/40 hover:text-white/70'}`, children: _jsx(MessageSquare, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setShowDiagnostics(true), className: `p-1 ${playbackPhase === 'failed' ? 'text-red-400' : 'text-white/80 hover:text-white'}`, title: "\u64AD\u653E\u8BCA\u65AD", children: _jsx(ClipboardList, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleEnterMiniMode, className: "p-1 text-white/80 hover:text-white", title: "\u7CBE\u7B80\u6A21\u5F0F", children: _jsx(PictureInPicture2, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleToggleFullscreen, className: "p-1 text-white/80 hover:text-white", children: isActualFullscreen ? _jsx(Minimize, { className: "w-4 h-4" }) : _jsx(Maximize, { className: "w-4 h-4" }) })] })] })] }), showDiagnostics && (_jsxs("div", { className: "absolute inset-y-0 right-0 z-40 w-full max-w-sm border-l border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between border-b border-white/10 px-4 py-3", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(ClipboardList, { className: "w-4 h-4 text-accent" }), _jsx("h3", { className: "text-sm font-medium text-white", children: "\u64AD\u653E\u8BCA\u65AD" })] }), _jsx("button", { onClick: () => setShowDiagnostics(false), className: "p-1 text-white/60 hover:text-white", title: "\u5173\u95ED", children: _jsx(X, { className: "w-4 h-4" }) })] }), _jsxs("div", { className: "space-y-4 overflow-y-auto px-4 py-4 text-xs text-white/70 scrollbar-dark h-[calc(100%-49px)]", children: [_jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsx(DiagnosticMetric, { label: "\u9636\u6BB5", value: playbackPhase }), _jsx(DiagnosticMetric, { label: "\u9996\u5E27\u8017\u65F6", value: firstFrameMs == null ? '-' : `${firstFrameMs}ms` }), _jsx(DiagnosticMetric, { label: "\u5F53\u524D\u8017\u65F6", value: `${elapsedMs}ms` }), _jsx(DiagnosticMetric, { label: "\u97F3\u91CF/\u500D\u901F", value: `${Math.round(volume * 100)}% / ${speed}x` })] }), _jsxs(DiagnosticSection, { title: "\u72B6\u6001", children: [_jsx("p", { children: playbackMessage || '-' }), playbackError && _jsx("p", { className: "mt-2 text-red-300", children: playbackError }), _jsxs("label", { className: "mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3", children: [_jsx("span", { className: "text-white/60", children: "\u81EA\u52A8\u6362\u6E90" }), _jsx("input", { type: "checkbox", checked: autoSwitchSource, onChange: (event) => setAutoSwitchSource(event.target.checked), className: "h-4 w-4 accent-accent" })] })] }), _jsxs(DiagnosticSection, { title: "\u5185\u5BB9", children: [_jsx(DiagnosticRow, { label: "\u7AD9\u70B9", value: currentSiteKey || '-' }), _jsx(DiagnosticRow, { label: "\u5F71\u7247", value: currentVod?.vod_name || '-' }), _jsx(DiagnosticRow, { label: "\u96C6\u6570", value: episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1) }), _jsx(DiagnosticRow, { label: "\u6362\u6E90", value: `${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}` })] }), _jsx(DiagnosticSection, { title: "\u7EBF\u8DEF", children: _jsx("p", { className: "break-all font-mono text-[11px] leading-5 text-white/60", children: redactedUrl || '-' }) }), _jsx(DiagnosticSection, { title: "\u8BF7\u6C42\u5934", children: _jsx("pre", { className: "whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-white/60", children: Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders, null, 2) : '-' }) }), _jsxs("button", { onClick: handleCopyDiagnostics, className: "flex w-full items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg-primary hover:bg-accent-hover", children: [_jsx(Copy, { className: "w-4 h-4" }), copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制诊断信息'] }), _jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsxs("button", { onClick: handleRetryPlayback, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(RotateCw, { className: "w-4 h-4" }), "\u91CD\u8BD5\u5F53\u524D"] }), _jsxs("button", { onClick: handleNextSource, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(Shuffle, { className: "w-4 h-4" }), "\u5207\u6362\u7EBF\u8DEF"] })] })] })] }))] }));
+    return (_jsxs("div", { ref: containerRef, className: "relative w-full h-full bg-black group", onMouseMove: resetHideTimer, onMouseLeave: () => isPlaying && setShowControls(false), onDoubleClick: handleToggleFullscreen, children: [_jsx("video", { ref: videoRef, className: "w-full h-full object-contain", playsInline: true, muted: volume <= 0 }), currentUrl && (_jsxs("div", { className: "pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u7801\u7387" }), _jsx("span", { className: "font-mono text-white", children: bitrateText })] }), _jsxs("div", { className: "mt-0.5 flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u901F\u5EA6" }), _jsx("span", { className: "font-mono text-white", children: linkSpeedText })] })] })), showPlaybackOverlay && (_jsxs("div", { className: "absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center", children: [playbackPhase === 'failed' ? (_jsx("div", { className: "flex h-10 w-10 items-center justify-center rounded-full border border-red-400/40 text-red-400", children: "!" })) : (_jsx(Loader2, { className: "w-8 h-8 animate-spin text-accent" })), _jsx("span", { className: "text-sm text-white/80", children: overlayText }), playbackPhase === 'failed' && (_jsx("span", { className: "max-w-md text-xs leading-5 text-white/50", children: "\u5E94\u7528\u4F1A\u5C1D\u8BD5\u81EA\u52A8\u6362\u6E90\uFF1B\u4E5F\u53EF\u4EE5\u5207\u6362\u7EBF\u8DEF\u6216\u91CD\u8BD5\u5F53\u524D\u96C6\u3002" }))] })), isDanmakuOn && _jsx(DanmakuLayer, {}), _jsx(SubtitleLayer, {}), _jsxs("div", { className: `absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-4 pb-3 pt-10 transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'}`, children: [_jsx("div", { className: "mb-2 cursor-pointer group/progress", onClick: handleProgressClick, children: _jsx("div", { className: "h-1 group-hover/progress:h-2 bg-white/20 rounded-full transition-all relative", children: _jsx("div", { className: "h-full bg-accent rounded-full relative", style: { width: `${progress}%` }, children: _jsx("div", { className: "absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-accent rounded-full opacity-0 group-hover/progress:opacity-100 transition-opacity" }) }) }) }), _jsxs("div", { className: "flex items-center justify-between", children: [_jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: prevEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipBack, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setIsPlaying(!isPlaying), className: "p-1 text-white hover:text-accent", children: isPlaying ? _jsx(Pause, { className: "w-5 h-5" }) : _jsx(Play, { className: "w-5 h-5" }) }), _jsx("button", { onClick: nextEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipForward, { className: "w-4 h-4" }) }), _jsxs("span", { className: "text-xs text-white/70 ml-2", children: [formatTime(currentTime), " / ", formatTime(duration)] })] }), _jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: () => setVolume(volume > 0 ? 0 : 1), className: "p-1 text-white/80 hover:text-white", children: volume > 0 ? _jsx(Volume2, { className: "w-4 h-4" }) : _jsx(VolumeX, { className: "w-4 h-4" }) }), _jsx("input", { type: "range", min: 0, max: 1, step: 0.05, value: volume, onChange: (e) => setVolume(Number(e.target.value)), className: "w-16 h-1 accent-accent" }), _jsxs("div", { className: "relative", children: [_jsxs("button", { onClick: () => setShowSpeedMenu(!showSpeedMenu), className: "px-2 py-0.5 text-xs text-white/80 hover:text-white rounded border border-white/20", children: [speed, "x"] }), showSpeedMenu && (_jsx("div", { className: "absolute bottom-full right-0 mb-2 bg-bg-secondary rounded-lg shadow-xl border border-[#2a2a2a] py-1 min-w-[80px]", children: SPEEDS.map((s) => (_jsxs("button", { onClick: () => { setSpeed(s); setShowSpeedMenu(false); }, className: `w-full px-3 py-1.5 text-xs text-left hover:bg-bg-hover ${speed === s ? 'text-accent' : 'text-text-secondary'}`, children: [s, "x"] }, s))) }))] }), _jsx("button", { onClick: toggleDanmaku, className: `p-1 ${isDanmakuOn ? 'text-accent' : 'text-white/40 hover:text-white/70'}`, children: _jsx(MessageSquare, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setShowDiagnostics(true), className: `p-1 ${playbackPhase === 'failed' ? 'text-red-400' : 'text-white/80 hover:text-white'}`, title: "\u64AD\u653E\u8BCA\u65AD", children: _jsx(ClipboardList, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleEnterMiniMode, className: "p-1 text-white/80 hover:text-white", title: "\u7CBE\u7B80\u6A21\u5F0F", children: _jsx(PictureInPicture2, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleToggleFullscreen, className: "p-1 text-white/80 hover:text-white", children: isActualFullscreen ? _jsx(Minimize, { className: "w-4 h-4" }) : _jsx(Maximize, { className: "w-4 h-4" }) })] })] })] }), showDiagnostics && (_jsxs("div", { className: "absolute inset-y-0 right-0 z-40 w-full max-w-sm border-l border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between border-b border-white/10 px-4 py-3", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(ClipboardList, { className: "w-4 h-4 text-accent" }), _jsx("h3", { className: "text-sm font-medium text-white", children: "\u64AD\u653E\u8BCA\u65AD" })] }), _jsx("button", { onClick: () => setShowDiagnostics(false), className: "p-1 text-white/60 hover:text-white", title: "\u5173\u95ED", children: _jsx(X, { className: "w-4 h-4" }) })] }), _jsxs("div", { className: "space-y-4 overflow-y-auto px-4 py-4 text-xs text-white/70 scrollbar-dark h-[calc(100%-49px)]", children: [_jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsx(DiagnosticMetric, { label: "\u9636\u6BB5", value: playbackPhase }), _jsx(DiagnosticMetric, { label: "\u9996\u5E27\u8017\u65F6", value: firstFrameMs == null ? '-' : `${firstFrameMs}ms` }), _jsx(DiagnosticMetric, { label: "\u5F53\u524D\u8017\u65F6", value: `${elapsedMs}ms` }), _jsx(DiagnosticMetric, { label: "\u97F3\u91CF/\u500D\u901F", value: `${Math.round(volume * 100)}% / ${speed}x` })] }), _jsxs(DiagnosticSection, { title: "\u72B6\u6001", children: [_jsx("p", { children: playbackMessage || '-' }), playbackError && _jsx("p", { className: "mt-2 text-red-300", children: playbackError }), playbackDiagnostic && (_jsxs("div", { className: "mt-3 border-t border-white/10 pt-3", children: [_jsx(DiagnosticRow, { label: "\u9519\u8BEF\u9636\u6BB5", value: playbackDiagnostic.stage }), _jsx(DiagnosticRow, { label: "\u9519\u8BEF\u7C7B\u578B", value: playbackDiagnostic.errorKind }), _jsx(DiagnosticRow, { label: "\u4E0B\u4E00\u6B65", value: playbackDiagnostic.nextAction || '-' })] })), _jsxs("label", { className: "mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3", children: [_jsx("span", { className: "text-white/60", children: "\u81EA\u52A8\u6362\u6E90" }), _jsx("input", { type: "checkbox", checked: autoSwitchSource, onChange: (event) => setAutoSwitchSource(event.target.checked), className: "h-4 w-4 accent-accent" })] })] }), _jsxs(DiagnosticSection, { title: "\u5185\u5BB9", children: [_jsx(DiagnosticRow, { label: "\u7AD9\u70B9", value: currentSiteKey || '-' }), _jsx(DiagnosticRow, { label: "\u5F71\u7247", value: currentVod?.vod_name || '-' }), _jsx(DiagnosticRow, { label: "\u96C6\u6570", value: episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1) }), _jsx(DiagnosticRow, { label: "\u7EBF\u8DEF", value: String(currentSourceIndex + 1) }), _jsx(DiagnosticRow, { label: "\u6362\u6E90", value: `${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}` }), _jsx(DiagnosticRow, { label: "\u5DF2\u5931\u8D25/\u5907\u9009", value: `${brokenSources.size}/${alternativeSources.length}` })] }), _jsx(DiagnosticSection, { title: "\u7EBF\u8DEF", children: _jsx("p", { className: "break-all font-mono text-[11px] leading-5 text-white/60", children: redactedUrl || '-' }) }), _jsx(DiagnosticSection, { title: "\u8BF7\u6C42\u5934", children: _jsx("pre", { className: "whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-white/60", children: Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders, null, 2) : '-' }) }), _jsxs("button", { onClick: handleCopyDiagnostics, className: "flex w-full items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg-primary hover:bg-accent-hover", children: [_jsx(Copy, { className: "w-4 h-4" }), copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制诊断信息'] }), _jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsxs("button", { onClick: handleRetryPlayback, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(RotateCw, { className: "w-4 h-4" }), "\u91CD\u8BD5\u5F53\u524D"] }), _jsxs("button", { onClick: handleNextSource, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(Shuffle, { className: "w-4 h-4" }), "\u5207\u6362\u7EBF\u8DEF"] })] })] })] }))] }));
 }
 function DiagnosticMetric({ label, value }) {
     return (_jsxs("div", { className: "rounded-lg border border-white/10 bg-white/5 px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-white/40", children: label }), _jsx("p", { className: "mt-1 truncate text-sm text-white", children: value })] }));

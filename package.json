@@ -17,6 +17,8 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "smoke:alpha-playback-ui": "node scripts/alpha-playback-smoke.mjs",
+    "smoke:beta-continue": "node scripts/beta-continue-smoke.mjs",
     "check:tauri": "npm run check",
     "check": "npm run typecheck && npm test && npm run test:rust && npm run build:web && npm run build:check",
     "check:release": "npm run check && npm audit --omit=dev --registry=https://registry.npmjs.org && npm run build"

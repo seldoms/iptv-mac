@@ -6,6 +6,23 @@ import { useConfigStore } from '@/stores/useConfigStore'
 import AppLogo from '@/components/AppLogo/AppLogo'
 import type { ConfigInspection } from '@shared/types'
 
+function compatibilityBadgeClass(compatibility: ConfigInspection['compatibility']) {
+  if (compatibility === 'ready') return 'text-green-400'
+  if (compatibility === 'live') return 'text-sky-300'
+  if (compatibility === 'unsupported') return 'text-yellow-300'
+  return 'text-red-300'
+}
+
+function hasUsableVodSites(inspection: ConfigInspection) {
+  if (inspection.probeInspectedSiteCount > 0) return inspection.probePassedSiteCount > 0
+  return inspection.visibleSiteCount > 0
+}
+
+function probeMetric(inspection: ConfigInspection) {
+  if (inspection.probeInspectedSiteCount === 0) return '未抽样'
+  return `${inspection.probePassedSiteCount}/${inspection.probeInspectedSiteCount}`
+}
+
 export default function Onboarding() {
   const navigate = useNavigate()
   const { loadConfig } = useConfigStore()
@@ -48,6 +65,10 @@ export default function Onboarding() {
     try {
       const currentInspection = inspection?.url === normalizedUrl ? inspection : await inspect()
       if (!currentInspection) return
+      if (!currentInspection.canImport) {
+        showMessage('error', '该配置暂不兼容：没有可用的 HTTP API 点播站点或直播源')
+        return
+      }
 
       const result = await configApi.load(normalizedUrl) as { success: boolean; error?: string }
       if (!result.success) {
@@ -58,7 +79,7 @@ export default function Onboarding() {
       await loadConfig(normalizedUrl)
       showMessage('success', '配置导入成功')
 
-      if (currentInspection.visibleSiteCount > 0) {
+      if (hasUsableVodSites(currentInspection)) {
         navigate('/', { replace: true })
       } else if (currentInspection.liveCount > 0) {
         navigate('/live', { replace: true })
@@ -115,7 +136,7 @@ export default function Onboarding() {
             </button>
             <button
               onClick={importConfig}
-              disabled={!normalizedUrl || isInspecting || isImporting}
+              disabled={!normalizedUrl || isInspecting || isImporting || (inspection?.url === normalizedUrl && !inspection.canImport)}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-bg-primary transition-colors hover:bg-accent-hover disabled:opacity-50"
             >
               {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
@@ -141,12 +162,14 @@ export default function Onboarding() {
                   <p className="truncate text-sm font-medium text-text-primary">{inspection.name}</p>
                   <p className="mt-0.5 truncate text-xs text-text-muted">{inspection.url}</p>
                 </div>
-                <span className="shrink-0 text-xs text-green-400">可导入</span>
+                <span className={`shrink-0 text-xs ${compatibilityBadgeClass(inspection.compatibility)}`}>
+                  {inspection.compatibilityLabel}
+                </span>
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <Metric label="点播站点" value={`${inspection.visibleSiteCount}/${inspection.siteCount}`} />
-                <Metric label="可搜索" value={String(inspection.searchableSiteCount)} />
-                <Metric label="直播源" value={String(inspection.liveCount)} />
+                <Metric label="抽样通过" value={probeMetric(inspection)} />
+                <Metric label="直播源" value={inspection.liveChannelCount > 0 ? `${inspection.liveCount}/${inspection.liveChannelCount}` : String(inspection.liveCount)} />
                 <Metric label="解析器" value={String(inspection.parseCount)} />
               </div>
               {inspection.warnings.length > 0 && (

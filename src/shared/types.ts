@@ -202,6 +202,18 @@ export interface ConfigInspection {
   liveCount: number
   parseCount: number
   hasSpider: boolean
+  sourceType?: string
+  compatibility: 'ready' | 'live' | 'unsupported' | 'invalid'
+  compatibilityLabel: string
+  canImport: boolean
+  hiddenSiteCount: number
+  cspSiteCount: number
+  missingApiSiteCount: number
+  probeInspectedSiteCount: number
+  probePassedSiteCount: number
+  probeFailedSiteCount: number
+  probeSkippedSiteCount: number
+  liveChannelCount: number
   warnings: string[]
 }
 
@@ -290,6 +302,15 @@ export interface History {
   type?: number
   source?: string
   progress?: number
+  episodeId?: string
+  episodeName?: string
+  episodeIndex?: number
+  sourceIndex?: number
+  sourceName?: string
+  urlIdentifier?: string
+  duration?: number
+  positionSeconds?: number
+  completed?: boolean
   createTime?: number
   updateTime?: number
 }

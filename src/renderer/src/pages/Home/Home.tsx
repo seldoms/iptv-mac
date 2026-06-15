@@ -1,9 +1,20 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, ChevronDown, Loader2, ArrowLeft } from 'lucide-react'
+import { Search, ChevronDown, Loader2, ArrowLeft, Clock } from 'lucide-react'
 import { useConfigStore } from '@/stores/useConfigStore'
+import { historyApi } from '@/utils/ipc'
 import VodCard from '@/components/VodCard/VodCard'
 import EmptyState from '@/components/EmptyState/EmptyState'
+import type { History as HistoryItem } from '@shared/types'
+
+function formatResumeTime(seconds = 0): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds))
+  const h = Math.floor(safeSeconds / 3600)
+  const m = Math.floor((safeSeconds % 3600) / 60)
+  const s = safeSeconds % 60
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  return `${m}:${String(s).padStart(2, '0')}`
+}
 
 export default function Home() {
   const navigate = useNavigate()
@@ -19,6 +30,7 @@ export default function Home() {
       const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [showSiteSheet, setShowSiteSheet] = useState(false)
   const siteSheetRef = useRef<HTMLDivElement>(null)
+  const [continueItems, setContinueItems] = useState<HistoryItem[]>([])
 
   // 只显示 HTTP API 类型的站点（type 0/1/4）
   const visibleSites = sites.filter((s) => s.type === 0 || s.type === 1 || s.type === 4)
@@ -33,6 +45,23 @@ export default function Home() {
         setShowSiteSheet(false)
         scrollContainerRef.current?.scrollTo({ top: 0 })
       }, [currentSiteKey, sites])
+
+  useEffect(() => {
+    if (!currentConfig) {
+      setContinueItems([])
+      return
+    }
+    historyApi.list()
+      .then((items: HistoryItem[]) => {
+        setContinueItems(
+          items
+            .filter((item) => !item.completed && (item.positionSeconds || item.progress || 0) > 0)
+            .sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0))
+            .slice(0, 8)
+        )
+      })
+      .catch(() => setContinueItems([]))
+  }, [currentConfig])
 
   // 分类切换
   useEffect(() => {
@@ -246,6 +275,48 @@ export default function Home() {
         onScroll={handleScroll}
         className="flex-1 overflow-y-auto scrollbar-dark p-4"
       >
+        {!activeCategory && continueItems.length > 0 && (
+          <section className="mb-5">
+            <div className="mb-3 flex items-center gap-2">
+              <Clock className="h-4 w-4 text-accent" />
+              <h2 className="text-sm font-medium text-text-primary">继续观看</h2>
+            </div>
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+              {continueItems.map((item) => (
+                <button
+                  key={`${item.siteKey}:${item.vodId}`}
+                  onClick={() => navigate(`/vod/${item.siteKey}/${item.vodId}`)}
+                  className="flex min-w-0 items-center gap-3 rounded-lg bg-bg-secondary p-2 text-left transition-colors hover:bg-bg-hover"
+                >
+                  <div className="h-16 w-11 shrink-0 overflow-hidden rounded bg-bg-tertiary">
+                    <img
+                      src={item.vodPic}
+                      alt={item.vodName}
+                      className="h-full w-full object-cover"
+                      onError={(event) => { (event.target as HTMLImageElement).style.display = 'none' }}
+                    />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-text-primary">{item.vodName}</p>
+                    <p className="mt-1 truncate text-xs text-text-muted">{item.episodeName || item.source || '上次观看'}</p>
+                    <div className="mt-2 flex items-center gap-2">
+                      <div className="h-1 flex-1 overflow-hidden rounded-full bg-bg-tertiary">
+                        <div
+                          className="h-full rounded-full bg-accent"
+                          style={{ width: `${Math.max(0, Math.min(100, item.progress || 0))}%` }}
+                        />
+                      </div>
+                      <span className="shrink-0 text-[10px] text-text-muted">
+                        {(item.positionSeconds || 0) > 0 ? formatResumeTime(item.positionSeconds) : `${item.progress || 0}%`}
+                      </span>
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
         {isLoading && displayVideos.length === 0 ? (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
             {Array.from({ length: 12 }).map((_, i) => (

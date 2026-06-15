@@ -5,6 +5,7 @@ mod epg;
 mod error;
 mod hls;
 mod live;
+mod local_proxy;
 mod logging;
 mod network;
 mod path_safety;
@@ -24,6 +25,10 @@ use error::AppError;
 const MAX_SETTINGS_FILE_SIZE: u64 = 1 * 1024 * 1024; // 1MB
 const MAX_SETTINGS_VALUE_SIZE: usize = 100 * 1024; // 100KB
 const MAX_SETTINGS_KEY_LENGTH: usize = 100;
+const ALPHA_PLAYBACK_SMOKE_KEY: &str = "__alphaPlaybackSmoke";
+const BETA_CONTINUE_SMOKE_KEY: &str = "__betaContinueSmoke";
+const DEFAULT_ALPHA_PLAYBACK_SMOKE_MEDIA_URL: &str =
+    "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
 pub struct AppState {
     pub database: Mutex<Database>,
@@ -31,6 +36,7 @@ pub struct AppState {
     pub settings_path: PathBuf,
     pub settings: Mutex<Map<String, Value>>,
     pub player_state: Mutex<Option<Value>>,
+    pub local_proxy: local_proxy::LocalProxyInfo,
 }
 
 fn load_settings(path: &PathBuf) -> Map<String, Value> {
@@ -71,6 +77,67 @@ fn persist_settings(state: &AppState) -> Result<(), String> {
     let temporary_path = state.settings_path.with_extension("json.tmp");
     fs::write(&temporary_path, text).map_err(|error| error.to_string())?;
     fs::rename(temporary_path, &state.settings_path).map_err(|error| error.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn debug_data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("IPTV_TEST_DATA_DIR").map(PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_data_dir_override() -> Option<PathBuf> {
+    None
+}
+
+fn inject_alpha_playback_smoke_settings(settings: &mut Map<String, Value>) {
+    if std::env::var("IPTV_ALPHA_PLAYBACK_SMOKE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let media_url = std::env::var("IPTV_ALPHA_PLAYBACK_SMOKE_MEDIA_URL")
+        .unwrap_or_else(|_| DEFAULT_ALPHA_PLAYBACK_SMOKE_MEDIA_URL.to_string());
+    let timeout_ms = std::env::var("IPTV_ALPHA_PLAYBACK_SMOKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20_000);
+
+    settings.insert(
+        ALPHA_PLAYBACK_SMOKE_KEY.to_string(),
+        json!({
+            "enabled": true,
+            "mediaUrl": media_url,
+            "timeoutMs": timeout_ms
+        }),
+    );
+    settings.remove("__alphaPlaybackSmokeResult");
+}
+
+fn inject_beta_continue_smoke_settings(settings: &mut Map<String, Value>) {
+    if std::env::var("IPTV_BETA_CONTINUE_SMOKE").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let phase = std::env::var("IPTV_BETA_CONTINUE_SMOKE_PHASE")
+        .unwrap_or_else(|_| "seed".to_string());
+    let position_seconds = std::env::var("IPTV_BETA_CONTINUE_SMOKE_POSITION_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(372);
+    let tolerance_seconds = std::env::var("IPTV_BETA_CONTINUE_SMOKE_TOLERANCE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(20);
+
+    settings.insert(
+        BETA_CONTINUE_SMOKE_KEY.to_string(),
+        json!({
+            "enabled": true,
+            "phase": if phase == "validate" { "validate" } else { "seed" },
+            "positionSeconds": position_seconds,
+            "toleranceSeconds": tolerance_seconds
+        }),
+    );
+    settings.remove("__betaContinueSmokeResult");
 }
 
 pub fn build_live_tree(channels: Vec<Value>) -> Value {
@@ -344,10 +411,7 @@ fn invoke_ipc(
         }
 
         // Local server
-        "local:getServerInfo" => Ok(json!({
-            "success": true,
-            "data": { "port": 0, "token": "" }
-        })),
+        "local:getServerInfo" => Ok(json!(state.local_proxy.clone())),
         // DLNA (stubs)
         "dlna:search" => Ok(json!({ "success": true, "data": [] })),
         "dlna:cast" | "dlna:control" => {
@@ -520,6 +584,10 @@ mod tests {
             settings_path: path.clone(),
             settings: Mutex::new(settings_map),
             player_state: Mutex::new(None),
+            local_proxy: local_proxy::LocalProxyInfo {
+                url: "http://127.0.0.1:0".to_string(),
+                token: "test".to_string(),
+            },
         };
 
         persist_settings(&state).unwrap();
@@ -540,17 +608,22 @@ mod tests {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
+            let data_dir = debug_data_dir_override().unwrap_or(app.path().app_data_dir()?);
             fs::create_dir_all(&data_dir)?;
             let settings_path = data_dir.join("settings.json");
             let database = Database::open(data_dir.join("iptv.db")).map_err(std::io::Error::other)?;
+            let local_proxy = local_proxy::start_local_proxy().map_err(std::io::Error::other)?;
+            let mut settings = load_settings(&settings_path);
+            inject_alpha_playback_smoke_settings(&mut settings);
+            inject_beta_continue_smoke_settings(&mut settings);
 
             app.manage(AppState {
                 database: Mutex::new(database),
                 config_manager: Mutex::new(config::ConfigManager::new(data_dir.clone())),
-                settings: Mutex::new(load_settings(&settings_path)),
+                settings: Mutex::new(settings),
                 settings_path,
                 player_state: Mutex::new(None),
+                local_proxy,
             });
 
             // 启动自动刷新后台任务

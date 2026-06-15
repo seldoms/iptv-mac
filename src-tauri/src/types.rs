@@ -40,7 +40,11 @@ pub struct AppError {
 
 impl AppError {
     pub fn new(code: AppErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), internal: None }
+        Self {
+            code,
+            message: message.into(),
+            internal: None,
+        }
     }
 
     pub fn with_internal(mut self, internal: impl Into<String>) -> Self {
@@ -109,11 +113,19 @@ pub struct IpcResponse<T: Serialize> {
 
 impl<T: Serialize> IpcResponse<T> {
     pub fn ok(data: T) -> Self {
-        Self { success: true, data: Some(data), error: None }
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
     }
 
     pub fn err(error: impl Into<String>) -> Self {
-        Self { success: false, data: None, error: Some(error.into()) }
+        Self {
+            success: false,
+            data: None,
+            error: Some(error.into()),
+        }
     }
 }
 
@@ -126,8 +138,18 @@ pub struct SimpleResponse {
 }
 
 impl SimpleResponse {
-    pub fn ok() -> Self { Self { success: true, error: None } }
-    pub fn err(error: impl Into<String>) -> Self { Self { success: false, error: Some(error.into()) } }
+    pub fn ok() -> Self {
+        Self {
+            success: true,
+            error: None,
+        }
+    }
+    pub fn err(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: Some(error.into()),
+        }
+    }
 }
 
 // ==================== Config 类型 ====================
@@ -200,6 +222,18 @@ pub struct ConfigInspection {
     pub live_count: i64,
     pub parse_count: i64,
     pub has_spider: bool,
+    pub source_type: Option<String>,
+    pub compatibility: String,
+    pub compatibility_label: String,
+    pub can_import: bool,
+    pub hidden_site_count: i64,
+    pub csp_site_count: i64,
+    pub missing_api_site_count: i64,
+    pub probe_inspected_site_count: i64,
+    pub probe_passed_site_count: i64,
+    pub probe_failed_site_count: i64,
+    pub probe_skipped_site_count: i64,
+    pub live_channel_count: i64,
     pub warnings: Vec<String>,
 }
 
@@ -251,6 +285,15 @@ pub struct HistoryItem {
     pub item_type: Option<i64>,
     pub source: Option<String>,
     pub progress: Option<i64>,
+    pub episode_id: Option<String>,
+    pub episode_name: Option<String>,
+    pub episode_index: Option<i64>,
+    pub source_index: Option<i64>,
+    pub source_name: Option<String>,
+    pub url_identifier: Option<String>,
+    pub duration: Option<i64>,
+    pub position_seconds: Option<i64>,
+    pub completed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

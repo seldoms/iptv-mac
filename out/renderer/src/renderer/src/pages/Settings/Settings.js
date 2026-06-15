@@ -1,9 +1,28 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useState, useEffect, useCallback } from 'react';
-import { Settings as SettingsIcon, Plus, Trash2, RefreshCw, Globe, Monitor, Info, ChevronRight, Link, Check, AlertCircle, Edit3, Save, X, Tv } from 'lucide-react';
+import { Settings as SettingsIcon, Plus, Trash2, RefreshCw, Globe, Monitor, Info, ChevronRight, Link, Check, AlertCircle, Edit3, Loader2, Save, X, Tv } from 'lucide-react';
 import { configApi, invoke, localApi, on } from '@/utils/ipc';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useNavigate } from 'react-router-dom';
+function compatibilityBadgeClass(compatibility) {
+    if (compatibility === 'ready')
+        return 'text-green-400';
+    if (compatibility === 'live')
+        return 'text-sky-300';
+    if (compatibility === 'unsupported')
+        return 'text-yellow-300';
+    return 'text-red-300';
+}
+function usableVodSiteCount(inspection) {
+    if (inspection.probeInspectedSiteCount > 0)
+        return inspection.probePassedSiteCount;
+    return inspection.visibleSiteCount;
+}
+function probeMetric(inspection) {
+    if (inspection.probeInspectedSiteCount === 0)
+        return '未抽样';
+    return `${inspection.probePassedSiteCount}/${inspection.probeInspectedSiteCount}`;
+}
 export default function Settings() {
     const navigate = useNavigate();
     const [activeTab, setActiveTab] = useState('config');
@@ -15,6 +34,8 @@ export default function Settings() {
     const [inspection, setInspection] = useState(null);
     const [editingConfigUrl, setEditingConfigUrl] = useState('');
     const [editingConfigName, setEditingConfigName] = useState('');
+    const [deleteConfirmUrl, setDeleteConfirmUrl] = useState('');
+    const [deletingConfigUrl, setDeletingConfigUrl] = useState('');
     const [message, setMessage] = useState(null);
     const [version, setVersion] = useState('1.0.0');
     const [localServer, setLocalServer] = useState({ url: '', token: '' });
@@ -143,6 +164,10 @@ export default function Settings() {
             const currentInspection = inspection?.url === url ? inspection : await handleInspectConfig();
             if (!currentInspection)
                 return;
+            if (!currentInspection.canImport) {
+                showMessage('error', '该配置暂不兼容：没有可用的 HTTP API 点播站点或直播源');
+                return;
+            }
             const result = await configApi.load(url);
             if (result?.success) {
                 setNewConfigUrl('');
@@ -151,7 +176,7 @@ export default function Settings() {
                 // 刷新首页内容
                 await loadConfig(url);
                 await loadData();
-                showMessage('success', `配置添加成功：${currentInspection.visibleSiteCount} 个点播站点，${currentInspection.liveCount} 个直播源`);
+                showMessage('success', `配置添加成功：${usableVodSiteCount(currentInspection)} 个可用点播站点，${currentInspection.liveCount} 个直播源`);
             }
             else {
                 showMessage('error', '加载配置失败: ' + (result?.error || '未知错误'));
@@ -164,48 +189,65 @@ export default function Settings() {
             setLoading(false);
         }
     };
-    // 删除配置
-    const handleDeleteConfig = async (config) => {
-        const confirmed = window.confirm(`确定删除配置「${config.name}」吗？`);
-        if (!confirmed)
+    const resetActiveConfig = () => {
+        useConfigStore.getState().reset();
+        useConfigStore.setState({
+            sites: [],
+            currentSiteKey: '',
+            categories: [],
+            filters: {},
+            homeVideos: [],
+            categoryVideos: [],
+            currentPage: 1,
+            hasMore: false,
+            isLoading: false,
+            error: null
+        });
+    };
+    const handleRequestDeleteConfig = (config) => {
+        if (deletingConfigUrl)
             return;
-        const url = config.url;
-        try {
-            const result = await configApi.remove(url);
-            if (!result.success) {
-                showMessage('error', result.error || '删除失败');
-                return;
-            }
-        }
-        catch (err) {
-            showMessage('error', '后端删除失败: ' + String(err));
-            return;
-        }
-        if (url === currentUrl) {
-            setCurrentUrl('');
-            useConfigStore.getState().reset();
-            useConfigStore.setState({
-                sites: [],
-                currentSiteKey: '',
-                categories: [],
-                filters: {},
-                homeVideos: [],
-                categoryVideos: [],
-                currentPage: 1,
-                hasMore: false,
-                isLoading: false,
-                error: null,
-            });
-        }
-        if (editingConfigUrl === url) {
+        setDeleteConfirmUrl(config.url);
+        if (editingConfigUrl === config.url) {
             setEditingConfigUrl('');
             setEditingConfigName('');
         }
-        const freshList = await configApi.list();
-        const freshUrl = await configApi.getCurrentUrl();
-        setConfigs(freshList || []);
-        setCurrentUrl(freshUrl || '');
-        showMessage('success', '配置已删除');
+    };
+    // 删除配置
+    const handleDeleteConfig = async (config) => {
+        const url = config.url;
+        const wasCurrent = url === currentUrl;
+        setDeletingConfigUrl(url);
+        try {
+            const result = await configApi.remove(url);
+            if (!result?.success) {
+                showMessage('error', result?.error || '删除失败');
+                return;
+            }
+            const [freshList, freshUrl] = await Promise.all([
+                configApi.list(),
+                configApi.getCurrentUrl()
+            ]);
+            const nextUrl = freshUrl || '';
+            setConfigs(freshList || []);
+            setCurrentUrl(nextUrl);
+            setDeleteConfirmUrl('');
+            if (wasCurrent) {
+                if (nextUrl) {
+                    await loadConfig(nextUrl);
+                }
+                else {
+                    resetActiveConfig();
+                }
+            }
+            showMessage('success', '配置已删除');
+        }
+        catch (err) {
+            showMessage('error', '删除失败: ' + String(err));
+        }
+        finally {
+            setDeletingConfigUrl('');
+        }
     };
     const handleStartRename = (config) => {
         setEditingConfigUrl(config.url);
@@ -283,8 +325,10 @@ export default function Settings() {
                             : 'bg-red-500/10 text-red-400 border border-red-500/20'}`, children: [message.type === 'success' ? _jsx(Check, { className: "w-4 h-4 shrink-0" }) : _jsx(AlertCircle, { className: "w-4 h-4 shrink-0" }), message.text] })), activeTab === 'config' && (_jsxs("div", { className: "space-y-6 max-w-2xl", children: [_jsxs("div", { children: [_jsx("h3", { className: "text-sm font-medium text-text-primary mb-3", children: "\u6DFB\u52A0\u914D\u7F6E" }), _jsxs("div", { className: "flex gap-2", children: [_jsx("input", { type: "text", value: newConfigUrl, onChange: (e) => {
                                                     setNewConfigUrl(e.target.value);
                                                     setInspection(null);
-                                                }, placeholder: "\u8F93\u5165\u914D\u7F6E\u5730\u5740\uFF08JSON URL\uFF09...", className: "flex-1 px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent", onKeyDown: (e) => e.key === 'Enter' && handleAddConfig(), disabled: loading || inspectLoading }), _jsxs("button", { onClick: handleInspectConfig, disabled: !newConfigUrl.trim() || loading || inspectLoading, className: "flex items-center gap-1.5 px-4 py-2 border border-[#2a2a2a] hover:bg-bg-hover disabled:opacity-50 text-text-secondary text-sm font-medium rounded-lg transition-colors", children: [_jsx(RefreshCw, { className: `w-4 h-4 ${inspectLoading ? 'animate-spin' : ''}` }), inspectLoading ? '预检中...' : '预检'] }), _jsxs("button", { onClick: handleAddConfig, disabled: !newConfigUrl.trim() || loading || inspectLoading, className: "flex items-center gap-1.5 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-bg-primary text-sm font-medium rounded-lg transition-colors", children: [_jsx(Plus, { className: "w-4 h-4" }), " ", loading ? '加载中...' : '添加'] })] }), _jsx("p", { className: "text-xs text-text-muted mt-2", children: "\u8F93\u5165 FongMi/TV \u517C\u5BB9\u7684\u914D\u7F6E JSON \u5730\u5740\uFF0C\u52A0\u8F7D\u540E\u5373\u53EF\u6D4F\u89C8\u5185\u5BB9" }), inspection && (_jsxs("div", { className: "mt-3 rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3", children: [_jsxs("div", { className: "flex items-start justify-between gap-4", children: [_jsxs("div", { className: "min-w-0", children: [_jsx("p", { className: "text-sm font-medium text-text-primary truncate", children: inspection.name }), _jsx("p", { className: "text-xs text-text-muted truncate mt-0.5", children: inspection.url })] }), _jsx("span", { className: "shrink-0 text-xs text-green-400", children: "\u53EF\u5BFC\u5165" })] }), _jsxs("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3", children: [_jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u70B9\u64AD\u7AD9\u70B9" }), _jsxs("p", { className: "text-sm text-text-primary mt-1", children: [inspection.visibleSiteCount, "/", inspection.siteCount] })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u53EF\u641C\u7D22" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: inspection.searchableSiteCount })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u76F4\u64AD\u6E90" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: inspection.liveCount })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u89E3\u6790\u5668" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: inspection.parseCount })] })] }), inspection.warnings.length > 0 && (_jsx("div", { className: "mt-3 space-y-1", children: inspection.warnings.map((warning) => (_jsxs("div", { className: "flex items-start gap-2 text-xs text-yellow-300", children: [_jsx(AlertCircle, { className: "w-3.5 h-3.5 shrink-0 mt-0.5" }), _jsx("span", { children: warning })] }, warning))) }))] }))] }), _jsxs("div", { children: [_jsx("h3", { className: "text-sm font-medium text-text-primary mb-3", children: "\u914D\u7F6E\u5217\u8868" }), configs.length === 0 ? (_jsxs("div", { className: "py-8 text-center", children: [_jsx(Link, { className: "w-10 h-10 text-text-muted mx-auto mb-3" }), _jsx("p", { className: "text-sm text-text-muted", children: "\u6682\u65E0\u914D\u7F6E" }), _jsx("p", { className: "text-xs text-text-muted mt-1", children: "\u5728\u4E0A\u65B9\u8F93\u5165\u914D\u7F6E\u5730\u5740\u6DFB\u52A0" })] })) : (_jsx("div", { className: "space-y-2", children: configs.map((config) => {
+                                                }, placeholder: "\u8F93\u5165\u914D\u7F6E\u5730\u5740\uFF08JSON URL\uFF09...", className: "flex-1 px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent", onKeyDown: (e) => e.key === 'Enter' && handleAddConfig(), disabled: loading || inspectLoading }), _jsxs("button", { onClick: handleInspectConfig, disabled: !newConfigUrl.trim() || loading || inspectLoading, className: "flex items-center gap-1.5 px-4 py-2 border border-[#2a2a2a] hover:bg-bg-hover disabled:opacity-50 text-text-secondary text-sm font-medium rounded-lg transition-colors", children: [_jsx(RefreshCw, { className: `w-4 h-4 ${inspectLoading ? 'animate-spin' : ''}` }), inspectLoading ? '预检中...' : '预检'] }), _jsxs("button", { onClick: handleAddConfig, disabled: !newConfigUrl.trim() || loading || inspectLoading || (inspection?.url === newConfigUrl.trim() && !inspection.canImport), className: "flex items-center gap-1.5 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-bg-primary text-sm font-medium rounded-lg transition-colors", children: [_jsx(Plus, { className: "w-4 h-4" }), " ", loading ? '加载中...' : '添加'] })] }), _jsx("p", { className: "text-xs text-text-muted mt-2", children: "\u8F93\u5165 FongMi/TV \u517C\u5BB9\u7684\u914D\u7F6E JSON \u5730\u5740\uFF0C\u52A0\u8F7D\u540E\u5373\u53EF\u6D4F\u89C8\u5185\u5BB9" }), inspection && (_jsxs("div", { className: "mt-3 rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3", children: [_jsxs("div", { className: "flex items-start justify-between gap-4", children: [_jsxs("div", { className: "min-w-0", children: [_jsx("p", { className: "text-sm font-medium text-text-primary truncate", children: inspection.name }), _jsx("p", { className: "text-xs text-text-muted truncate mt-0.5", children: inspection.url })] }), _jsx("span", { className: `shrink-0 text-xs ${compatibilityBadgeClass(inspection.compatibility)}`, children: inspection.compatibilityLabel })] }), _jsxs("div", { className: "grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3", children: [_jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u70B9\u64AD\u7AD9\u70B9" }), _jsxs("p", { className: "text-sm text-text-primary mt-1", children: [inspection.visibleSiteCount, "/", inspection.siteCount] })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u62BD\u6837\u901A\u8FC7" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: probeMetric(inspection) })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u76F4\u64AD\u6E90" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: inspection.liveChannelCount > 0 ? `${inspection.liveCount}/${inspection.liveChannelCount}` : inspection.liveCount })] }), _jsxs("div", { className: "rounded-md bg-bg-tertiary px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-text-muted", children: "\u89E3\u6790\u5668" }), _jsx("p", { className: "text-sm text-text-primary mt-1", children: inspection.parseCount })] })] }), inspection.warnings.length > 0 && (_jsx("div", { className: "mt-3 space-y-1", children: inspection.warnings.map((warning) => (_jsxs("div", { className: "flex items-start gap-2 text-xs text-yellow-300", children: [_jsx(AlertCircle, { className: "w-3.5 h-3.5 shrink-0 mt-0.5" }), _jsx("span", { children: warning })] }, warning))) }))] }))] }), _jsxs("div", { children: [_jsx("h3", { className: "text-sm font-medium text-text-primary mb-3", children: "\u914D\u7F6E\u5217\u8868" }), configs.length === 0 ? (_jsxs("div", { className: "py-8 text-center", children: [_jsx(Link, { className: "w-10 h-10 text-text-muted mx-auto mb-3" }), _jsx("p", { className: "text-sm text-text-muted", children: "\u6682\u65E0\u914D\u7F6E" }), _jsx("p", { className: "text-xs text-text-muted mt-1", children: "\u5728\u4E0A\u65B9\u8F93\u5165\u914D\u7F6E\u5730\u5740\u6DFB\u52A0" })] })) : (_jsx("div", { className: "space-y-2", children: configs.map((config) => {
                                             const isActive = config.url === currentUrl;
+                                            const isConfirmingDelete = deleteConfirmUrl === config.url;
+                                            const isDeleting = deletingConfigUrl === config.url;
                                             return (_jsxs("div", { className: `flex items-center gap-3 px-4 py-3 rounded-lg border transition-colors ${isActive
                                                     ? 'border-accent/30 bg-accent-muted'
                                                     : 'border-[#2a2a2a] bg-bg-secondary hover:bg-bg-hover'}`, children: [_jsxs("div", { className: "flex-1 min-w-0", children: [editingConfigUrl === config.url ? (_jsx("input", { value: editingConfigName, onChange: (e) => setEditingConfigName(e.target.value), onKeyDown: (e) => {
@@ -292,7 +336,7 @@ export default function Settings() {
                                                                         handleSaveRename(config.url);
                                                                     if (e.key === 'Escape')
                                                                         handleCancelRename();
-                                                                }, className: "w-full px-2 py-1 bg-bg-tertiary rounded-md text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent", autoFocus: true })) : (_jsx("p", { className: `text-sm truncate ${isActive ? 'text-accent' : 'text-text-primary'}`, children: config.name })), _jsx("p", { className: "text-xs text-text-muted truncate mt-0.5", children: config.url })] }), editingConfigUrl === config.url ? (_jsxs(_Fragment, { children: [_jsx("button", { onClick: () => handleSaveRename(config.url), className: "shrink-0 p-1.5 text-text-muted hover:text-green-400 transition-colors", title: "\u4FDD\u5B58\u540D\u79F0", children: _jsx(Save, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleCancelRename, className: "shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors", title: "\u53D6\u6D88\u7F16\u8F91", children: _jsx(X, { className: "w-4 h-4" }) })] })) : (_jsx("button", { onClick: () => handleStartRename(config), className: "shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors", title: "\u91CD\u547D\u540D", children: _jsx(Edit3, { className: "w-4 h-4" }) })), _jsx("button", { onClick: () => handleInspectSavedConfig(config), disabled: inspectLoading || loading, className: "shrink-0 p-1.5 text-text-muted hover:text-accent disabled:opacity-50 transition-colors", title: "\u91CD\u65B0\u9884\u68C0", children: _jsx(AlertCircle, { className: "w-4 h-4" }) }), !isActive && (_jsx("button", { onClick: () => handleSwitchConfig(config.url), className: "shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors", title: "\u5207\u6362\u5230\u6B64\u914D\u7F6E", children: _jsx(RefreshCw, { className: "w-4 h-4" }) })), isActive && (_jsx("span", { className: "shrink-0 text-xs text-accent font-medium", children: "\u5F53\u524D" })), _jsx("button", { onClick: () => handleDeleteConfig(config), className: "shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors", title: "\u5220\u9664", children: _jsx(Trash2, { className: "w-4 h-4" }) })] }, config.url));
+                                                                }, className: "w-full px-2 py-1 bg-bg-tertiary rounded-md text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent", autoFocus: true })) : (_jsx("p", { className: `text-sm truncate ${isActive ? 'text-accent' : 'text-text-primary'}`, children: config.name })), _jsx("p", { className: "text-xs text-text-muted truncate mt-0.5", children: config.url })] }), isConfirmingDelete ? (_jsxs("div", { className: "shrink-0 flex items-center gap-1.5", children: [_jsx("span", { className: "text-xs text-red-300", children: "\u786E\u8BA4\u5220\u9664\uFF1F" }), _jsx("button", { onClick: () => handleDeleteConfig(config), disabled: isDeleting, className: "shrink-0 p-1.5 text-red-300 hover:text-red-200 disabled:opacity-50 transition-colors", title: "\u786E\u8BA4\u5220\u9664", children: isDeleting ? _jsx(Loader2, { className: "w-4 h-4 animate-spin" }) : _jsx(Check, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setDeleteConfirmUrl(''), disabled: isDeleting, className: "shrink-0 p-1.5 text-text-muted hover:text-text-primary disabled:opacity-50 transition-colors", title: "\u53D6\u6D88\u5220\u9664", children: _jsx(X, { className: "w-4 h-4" }) })] })) : (_jsxs(_Fragment, { children: [editingConfigUrl === config.url ? (_jsxs(_Fragment, { children: [_jsx("button", { onClick: () => handleSaveRename(config.url), className: "shrink-0 p-1.5 text-text-muted hover:text-green-400 transition-colors", title: "\u4FDD\u5B58\u540D\u79F0", children: _jsx(Save, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleCancelRename, className: "shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors", title: "\u53D6\u6D88\u7F16\u8F91", children: _jsx(X, { className: "w-4 h-4" }) })] })) : (_jsx("button", { onClick: () => handleStartRename(config), className: "shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors", title: "\u91CD\u547D\u540D", children: _jsx(Edit3, { className: "w-4 h-4" }) })), _jsx("button", { onClick: () => handleInspectSavedConfig(config), disabled: inspectLoading || loading, className: "shrink-0 p-1.5 text-text-muted hover:text-accent disabled:opacity-50 transition-colors", title: "\u91CD\u65B0\u9884\u68C0", children: _jsx(AlertCircle, { className: "w-4 h-4" }) }), !isActive && (_jsx("button", { onClick: () => handleSwitchConfig(config.url), className: "shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors", title: "\u5207\u6362\u5230\u6B64\u914D\u7F6E", children: _jsx(RefreshCw, { className: "w-4 h-4" }) })), isActive && (_jsx("span", { className: "shrink-0 text-xs text-accent font-medium", children: "\u5F53\u524D" })), _jsx("button", { onClick: () => handleRequestDeleteConfig(config), disabled: Boolean(deletingConfigUrl), className: "shrink-0 p-1.5 text-text-muted hover:text-red-400 disabled:opacity-50 transition-colors", title: "\u5220\u9664", children: _jsx(Trash2, { className: "w-4 h-4" }) })] }))] }, config.url));
                                         }) }))] })] })), activeTab === 'live' && (_jsxs("div", { className: "space-y-6 max-w-2xl", children: [_jsxs("div", { children: [_jsx("h3", { className: "text-sm font-medium text-text-primary mb-3", children: "\u9891\u9053\u5237\u65B0" }), _jsxs("div", { className: "flex items-center gap-3", children: [_jsxs("button", { onClick: handleLiveRefresh, disabled: liveRefreshing, className: `flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${liveRefreshing
                                                     ? 'bg-accent-muted text-text-muted cursor-not-allowed'
                                                     : 'bg-accent text-white hover:bg-accent-hover'}`, children: [_jsx(RefreshCw, { className: `w-4 h-4 ${liveRefreshing ? 'animate-spin' : ''}` }), liveRefreshing ? '刷新中...' : '立即刷新'] }), _jsx("span", { className: "text-xs text-text-muted", children: "\u5237\u65B0\u5C06\u6D4B\u8BD5\u6240\u6709\u76F4\u64AD\u6E90\u7684 URL \u8FDE\u901A\u6027\uFF0C\u53BB\u91CD\u9009\u4F18\u540E\u6309 \u56FD\u5BB6-\u7C7B\u522B-\u9891\u9053 \u5206\u7C7B" })] }), liveRefreshing && liveRefreshProgress && (_jsxs("div", { className: "mt-3 space-y-1", children: [_jsxs("div", { className: "flex items-center justify-between text-xs text-text-muted", children: [_jsx("span", { children: liveRefreshProgress.message }), _jsxs("span", { children: [liveRefreshProgress.total > 0

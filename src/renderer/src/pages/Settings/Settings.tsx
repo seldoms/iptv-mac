@@ -12,6 +12,7 @@ import {
   Check,
   AlertCircle,
   Edit3,
+  Loader2,
   Save,
   X,
   Tv
@@ -19,13 +20,30 @@ import {
 import { configApi, invoke, localApi, on } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
 import type { ConfigInspection } from '@shared/types'
- import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 
 interface ConfigItem {
   url: string
   name: string
   addTime: number
   updateTime: number
+}
+
+function compatibilityBadgeClass(compatibility: ConfigInspection['compatibility']) {
+  if (compatibility === 'ready') return 'text-green-400'
+  if (compatibility === 'live') return 'text-sky-300'
+  if (compatibility === 'unsupported') return 'text-yellow-300'
+  return 'text-red-300'
+}
+
+function usableVodSiteCount(inspection: ConfigInspection) {
+  if (inspection.probeInspectedSiteCount > 0) return inspection.probePassedSiteCount
+  return inspection.visibleSiteCount
+}
+
+function probeMetric(inspection: ConfigInspection) {
+  if (inspection.probeInspectedSiteCount === 0) return '未抽样'
+  return `${inspection.probePassedSiteCount}/${inspection.probeInspectedSiteCount}`
 }
 
 export default function Settings() {
@@ -39,6 +57,8 @@ export default function Settings() {
   const [inspection, setInspection] = useState<ConfigInspection | null>(null)
   const [editingConfigUrl, setEditingConfigUrl] = useState('')
   const [editingConfigName, setEditingConfigName] = useState('')
+  const [deleteConfirmUrl, setDeleteConfirmUrl] = useState('')
+  const [deletingConfigUrl, setDeletingConfigUrl] = useState('')
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [version, setVersion] = useState('1.0.0')
   const [localServer, setLocalServer] = useState<{ url: string; token: string }>({ url: '', token: '' })
@@ -169,6 +189,10 @@ export default function Settings() {
       const url = newConfigUrl.trim()
       const currentInspection = inspection?.url === url ? inspection : await handleInspectConfig()
       if (!currentInspection) return
+      if (!currentInspection.canImport) {
+        showMessage('error', '该配置暂不兼容：没有可用的 HTTP API 点播站点或直播源')
+        return
+      }
 
       const result = await configApi.load(url) as { success: boolean; error?: string; data?: any }
       if (result?.success) {
@@ -178,7 +202,7 @@ export default function Settings() {
         // 刷新首页内容
         await loadConfig(url)
         await loadData()
-        showMessage('success', `配置添加成功：${currentInspection.visibleSiteCount} 个点播站点，${currentInspection.liveCount} 个直播源`)
+        showMessage('success', `配置添加成功：${usableVodSiteCount(currentInspection)} 个可用点播站点，${currentInspection.liveCount} 个直播源`)
       } else {
         showMessage('error', '加载配置失败: ' + (result?.error || '未知错误'))
       }
@@ -189,46 +213,68 @@ export default function Settings() {
     }
   }
 
+  const resetActiveConfig = () => {
+    useConfigStore.getState().reset()
+    useConfigStore.setState({
+      sites: [],
+      currentSiteKey: '',
+      categories: [],
+      filters: {},
+      homeVideos: [],
+      categoryVideos: [],
+      currentPage: 1,
+      hasMore: false,
+      isLoading: false,
+      error: null
+    })
+  }
+
+  const handleRequestDeleteConfig = (config: ConfigItem) => {
+    if (deletingConfigUrl) return
+    setDeleteConfirmUrl(config.url)
+    if (editingConfigUrl === config.url) {
+      setEditingConfigUrl('')
+      setEditingConfigName('')
+    }
+  }
+
   // 删除配置
- const handleDeleteConfig = async (config: ConfigItem) => {
-   const confirmed = window.confirm(`确定删除配置「${config.name}」吗？`)
-   if (!confirmed) return
-   const url = config.url
-   try {
-     const result = await configApi.remove(url) as { success: boolean; error?: string }
-     if (!result.success) {
-       showMessage('error', result.error || '删除失败')
-       return
-     }
-   } catch (err) {
-      showMessage('error', '后端删除失败: ' + String(err))
-     return
-   }
-   if (url === currentUrl) {
-     setCurrentUrl('')
-      useConfigStore.getState().reset()
-      useConfigStore.setState({
-        sites: [],
-        currentSiteKey: '',
-        categories: [],
-        filters: {},
-        homeVideos: [],
-        categoryVideos: [],
-        currentPage: 1,
-        hasMore: false,
-        isLoading: false,
-        error: null,
-      })
-   }
-   if (editingConfigUrl === url) {
-     setEditingConfigUrl('')
-     setEditingConfigName('')
-   }
-    const freshList = await configApi.list()
-    const freshUrl = await configApi.getCurrentUrl()
-    setConfigs(freshList || [])
-    setCurrentUrl(freshUrl || '')
-    showMessage('success', '配置已删除')
+  const handleDeleteConfig = async (config: ConfigItem) => {
+    const url = config.url
+    const wasCurrent = url === currentUrl
+    setDeletingConfigUrl(url)
+
+    try {
+      const result = await configApi.remove(url) as { success: boolean; error?: string }
+      if (!result?.success) {
+        showMessage('error', result?.error || '删除失败')
+        return
+      }
+
+      const [freshList, freshUrl] = await Promise.all([
+        configApi.list(),
+        configApi.getCurrentUrl()
+      ])
+      const nextUrl = freshUrl || ''
+
+      setConfigs(freshList || [])
+      setCurrentUrl(nextUrl)
+      setDeleteConfirmUrl('')
+
+      if (wasCurrent) {
+        if (nextUrl) {
+          await loadConfig(nextUrl)
+        } else {
+          resetActiveConfig()
+        }
+      }
+
+      showMessage('success', '配置已删除')
+    } catch (err) {
+      showMessage('error', '删除失败: ' + String(err))
+    } finally {
+      setDeletingConfigUrl('')
+    }
   }
 
   const handleStartRename = (config: ConfigItem) => {
@@ -369,7 +415,7 @@ export default function Settings() {
                 </button>
                 <button
                   onClick={handleAddConfig}
-                  disabled={!newConfigUrl.trim() || loading || inspectLoading}
+                  disabled={!newConfigUrl.trim() || loading || inspectLoading || (inspection?.url === newConfigUrl.trim() && !inspection.canImport)}
                   className="flex items-center gap-1.5 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-bg-primary text-sm font-medium rounded-lg transition-colors"
                 >
                   <Plus className="w-4 h-4" /> {loading ? '加载中...' : '添加'}
@@ -385,7 +431,9 @@ export default function Settings() {
                       <p className="text-sm font-medium text-text-primary truncate">{inspection.name}</p>
                       <p className="text-xs text-text-muted truncate mt-0.5">{inspection.url}</p>
                     </div>
-                    <span className="shrink-0 text-xs text-green-400">可导入</span>
+                    <span className={`shrink-0 text-xs ${compatibilityBadgeClass(inspection.compatibility)}`}>
+                      {inspection.compatibilityLabel}
+                    </span>
                   </div>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
                     <div className="rounded-md bg-bg-tertiary px-3 py-2">
@@ -393,12 +441,12 @@ export default function Settings() {
                       <p className="text-sm text-text-primary mt-1">{inspection.visibleSiteCount}/{inspection.siteCount}</p>
                     </div>
                     <div className="rounded-md bg-bg-tertiary px-3 py-2">
-                      <p className="text-[11px] text-text-muted">可搜索</p>
-                      <p className="text-sm text-text-primary mt-1">{inspection.searchableSiteCount}</p>
+                      <p className="text-[11px] text-text-muted">抽样通过</p>
+                      <p className="text-sm text-text-primary mt-1">{probeMetric(inspection)}</p>
                     </div>
                     <div className="rounded-md bg-bg-tertiary px-3 py-2">
                       <p className="text-[11px] text-text-muted">直播源</p>
-                      <p className="text-sm text-text-primary mt-1">{inspection.liveCount}</p>
+                      <p className="text-sm text-text-primary mt-1">{inspection.liveChannelCount > 0 ? `${inspection.liveCount}/${inspection.liveChannelCount}` : inspection.liveCount}</p>
                     </div>
                     <div className="rounded-md bg-bg-tertiary px-3 py-2">
                       <p className="text-[11px] text-text-muted">解析器</p>
@@ -431,6 +479,8 @@ export default function Settings() {
                 <div className="space-y-2">
                   {configs.map((config) => {
                     const isActive = config.url === currentUrl
+                    const isConfirmingDelete = deleteConfirmUrl === config.url
+                    const isDeleting = deletingConfigUrl === config.url
                     return (
                       <div
                         key={config.url}
@@ -459,59 +509,84 @@ export default function Settings() {
                           )}
                           <p className="text-xs text-text-muted truncate mt-0.5">{config.url}</p>
                         </div>
-                        {editingConfigUrl === config.url ? (
-                          <>
+                        {isConfirmingDelete ? (
+                          <div className="shrink-0 flex items-center gap-1.5">
+                            <span className="text-xs text-red-300">确认删除？</span>
                             <button
-                              onClick={() => handleSaveRename(config.url)}
-                              className="shrink-0 p-1.5 text-text-muted hover:text-green-400 transition-colors"
-                              title="保存名称"
+                              onClick={() => handleDeleteConfig(config)}
+                              disabled={isDeleting}
+                              className="shrink-0 p-1.5 text-red-300 hover:text-red-200 disabled:opacity-50 transition-colors"
+                              title="确认删除"
                             >
-                              <Save className="w-4 h-4" />
+                              {isDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
                             </button>
                             <button
-                              onClick={handleCancelRename}
-                              className="shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors"
-                              title="取消编辑"
+                              onClick={() => setDeleteConfirmUrl('')}
+                              disabled={isDeleting}
+                              className="shrink-0 p-1.5 text-text-muted hover:text-text-primary disabled:opacity-50 transition-colors"
+                              title="取消删除"
                             >
                               <X className="w-4 h-4" />
                             </button>
-                          </>
+                          </div>
                         ) : (
-                          <button
-                            onClick={() => handleStartRename(config)}
-                            className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors"
-                            title="重命名"
-                          >
-                            <Edit3 className="w-4 h-4" />
-                          </button>
+                          <>
+                            {editingConfigUrl === config.url ? (
+                              <>
+                                <button
+                                  onClick={() => handleSaveRename(config.url)}
+                                  className="shrink-0 p-1.5 text-text-muted hover:text-green-400 transition-colors"
+                                  title="保存名称"
+                                >
+                                  <Save className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={handleCancelRename}
+                                  className="shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors"
+                                  title="取消编辑"
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                onClick={() => handleStartRename(config)}
+                                className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors"
+                                title="重命名"
+                              >
+                                <Edit3 className="w-4 h-4" />
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleInspectSavedConfig(config)}
+                              disabled={inspectLoading || loading}
+                              className="shrink-0 p-1.5 text-text-muted hover:text-accent disabled:opacity-50 transition-colors"
+                              title="重新预检"
+                            >
+                              <AlertCircle className="w-4 h-4" />
+                            </button>
+                            {!isActive && (
+                              <button
+                                onClick={() => handleSwitchConfig(config.url)}
+                                className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors"
+                                title="切换到此配置"
+                              >
+                                <RefreshCw className="w-4 h-4" />
+                              </button>
+                            )}
+                            {isActive && (
+                              <span className="shrink-0 text-xs text-accent font-medium">当前</span>
+                            )}
+                            <button
+                              onClick={() => handleRequestDeleteConfig(config)}
+                              disabled={Boolean(deletingConfigUrl)}
+                              className="shrink-0 p-1.5 text-text-muted hover:text-red-400 disabled:opacity-50 transition-colors"
+                              title="删除"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </>
                         )}
-                        <button
-                          onClick={() => handleInspectSavedConfig(config)}
-                          disabled={inspectLoading || loading}
-                          className="shrink-0 p-1.5 text-text-muted hover:text-accent disabled:opacity-50 transition-colors"
-                          title="重新预检"
-                        >
-                          <AlertCircle className="w-4 h-4" />
-                        </button>
-                        {!isActive && (
-                          <button
-                            onClick={() => handleSwitchConfig(config.url)}
-                            className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors"
-                            title="切换到此配置"
-                          >
-                            <RefreshCw className="w-4 h-4" />
-                          </button>
-                        )}
-                        {isActive && (
-                          <span className="shrink-0 text-xs text-accent font-medium">当前</span>
-                        )}
-                        <button
-                          onClick={() => handleDeleteConfig(config)}
-                          className="shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors"
-                          title="删除"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
                       </div>
                     )
                   })}

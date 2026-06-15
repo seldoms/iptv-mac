@@ -131,14 +131,19 @@ impl ConfigManager {
     }
 
     pub fn remove(&mut self, url: &str) -> Result<(), AppError> {
-        let before = self.items.len();
-        self.items.retain(|i| i.url != url);
-        if self.items.len() == before {
+        let Some(removed_index) = self.items.iter().position(|i| i.url == url) else {
             return Err(AppError::not_found(format!("配置不存在: {}", url)));
-        }
+        };
+
+        self.items.remove(removed_index);
         if self.current_url.as_deref() == Some(url) {
-            self.current_url = None;
+            self.current_url = self
+                .items
+                .get(removed_index)
+                .or_else(|| self.items.last())
+                .map(|item| item.url.clone());
         }
+
         self.save_store()
     }
 
@@ -232,7 +237,9 @@ pub fn parse_config_or_live_source(url: &str, text: &str) -> Result<Value, AppEr
             return Ok(wrap_live_source_config(url, groups.len(), channel_count));
         }
 
-        return Ok(config);
+        return Err(AppError::parse_error(
+            "JSON 内容不是 TVBox 配置或直播源，请检查是否返回了网页、接口数据或未公开文档",
+        ));
     }
 
     let groups = crate::live::parse_live_content(text);
@@ -281,7 +288,11 @@ pub fn merge_tvbox_configs(configs: Vec<Value>) -> Value {
     for config in &configs {
         if let Some(sites) = config.get("sites").and_then(Value::as_array) {
             for site in sites {
-                let key = site.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+                let key = site
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 if !key.is_empty() && !seen_site_keys.contains(&key) {
                     seen_site_keys.insert(key);
                     all_sites.push(site.clone());
@@ -381,7 +392,7 @@ async fn load_single_sub_config(client: &reqwest::Client, url: &str) -> Result<V
         if channel_count > 0 {
             return Ok(wrap_live_source_config(url, groups.len(), channel_count));
         }
-        return Ok(parsed);
+        return Err(AppError::parse_error("无法识别子配置格式"));
     }
     // 可能直播源文本
     let groups = crate::live::parse_live_content(&text);
@@ -389,9 +400,7 @@ async fn load_single_sub_config(client: &reqwest::Client, url: &str) -> Result<V
     if channel_count > 0 {
         return Ok(wrap_live_source_config(url, groups.len(), channel_count));
     }
-    Err(AppError::parse_error(
-        "无法识别子配置格式",
-    ))
+    Err(AppError::parse_error("无法识别子配置格式"))
 }
 
 fn wrap_live_source_config(url: &str, group_count: usize, channel_count: usize) -> Value {
@@ -440,6 +449,23 @@ pub fn github_raw_fallback_url(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     if parsed.host_str() == Some("raw.githubusercontent.com") {
         return None;
+    }
+
+    if parsed.host_str() == Some("github.com") {
+        let parts: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+        if parts.len() >= 5 && (parts[2] == "blob" || parts[2] == "raw") {
+            let owner = parts[0];
+            let repo = parts[1];
+            let branch = parts[3];
+            let file_path = parts[4..].join("/");
+            if !owner.is_empty() && !repo.is_empty() && !branch.is_empty() && !file_path.is_empty()
+            {
+                return Some(format!(
+                    "https://raw.githubusercontent.com/{}/{}/{}/{}",
+                    owner, repo, branch, file_path
+                ));
+            }
+        }
     }
 
     let path = parsed.path().trim_start_matches('/');
@@ -510,6 +536,47 @@ mod tests {
 
         mgr.remove("https://example.com/config.json").unwrap();
         assert!(mgr.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_manager_selects_next_config_when_current_is_removed() {
+        let dir = test_dir("iptv-config-test-remove-current");
+        let mut mgr = ConfigManager::new(dir.clone());
+        mgr.add("https://example.com/a.json", "A").unwrap();
+        mgr.add("https://example.com/b.json", "B").unwrap();
+        mgr.add("https://example.com/c.json", "C").unwrap();
+        mgr.set_current_url(Some("https://example.com/b.json".to_string()))
+            .unwrap();
+
+        mgr.remove("https://example.com/b.json").unwrap();
+        assert_eq!(mgr.get_current_url(), Some("https://example.com/c.json"));
+        assert_eq!(mgr.list().len(), 2);
+
+        let reloaded = ConfigManager::new(dir.clone());
+        assert_eq!(
+            reloaded.get_current_url(),
+            Some("https://example.com/c.json")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_manager_clears_current_when_last_config_is_removed() {
+        let dir = test_dir("iptv-config-test-remove-last");
+        let mut mgr = ConfigManager::new(dir.clone());
+        mgr.add("https://example.com/only.json", "Only").unwrap();
+        mgr.set_current_url(Some("https://example.com/only.json".to_string()))
+            .unwrap();
+
+        mgr.remove("https://example.com/only.json").unwrap();
+        assert!(mgr.list().is_empty());
+        assert_eq!(mgr.get_current_url(), None);
+
+        let reloaded = ConfigManager::new(dir.clone());
+        assert_eq!(reloaded.get_current_url(), None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -661,6 +728,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_unknown_json_rejects_non_config_payload() {
+        let result = parse_config_or_live_source(
+            "https://example.com/api.json",
+            r#"{"code":200,"list":[{"name":"not a config"}]}"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn github_raw_fallback_rewrites_proxy_url() {
         let fallback = github_raw_fallback_url(
             "https://gh.example.com/raw.githubusercontent.com/owner/repo/main/live.txt",
@@ -669,6 +746,17 @@ mod tests {
         assert_eq!(
             fallback.as_deref(),
             Some("https://raw.githubusercontent.com/owner/repo/main/live.txt")
+        );
+    }
+
+    #[test]
+    fn github_raw_fallback_rewrites_blob_url() {
+        let fallback =
+            github_raw_fallback_url("https://github.com/owner/repo/blob/main/path/config.json");
+
+        assert_eq!(
+            fallback.as_deref(),
+            Some("https://raw.githubusercontent.com/owner/repo/main/path/config.json")
         );
     }
 

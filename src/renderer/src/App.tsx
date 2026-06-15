@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom'
 import Sidebar from './components/Sidebar/Sidebar'
 import MiniPlayer from './components/MiniPlayer/MiniPlayer'
@@ -10,8 +10,12 @@ import History from './pages/History/History'
 import Keep from './pages/Keep/Keep'
 import Settings from './pages/Settings/Settings'
 import Onboarding from './pages/Onboarding/Onboarding'
+import AlphaPlaybackSmoke from './components/AlphaPlaybackSmoke/AlphaPlaybackSmoke'
+import type { AlphaPlaybackSmokeConfig } from './components/AlphaPlaybackSmoke/AlphaPlaybackSmoke'
+import BetaContinueSmoke from './components/BetaContinueSmoke/BetaContinueSmoke'
+import type { BetaContinueSmokeConfig } from './components/BetaContinueSmoke/BetaContinueSmoke'
 import { useConfigStore } from './stores/useConfigStore'
-import { configApi } from './utils/ipc'
+import { configApi, settingsApi } from './utils/ipc'
 
 /** 检测是否为精简模式 */
 function isMiniMode(): boolean {
@@ -24,6 +28,8 @@ export default function App() {
   const navigate = useNavigate()
   const location = useLocation()
   const didAutoLoad = useRef(false)
+  const [smokeConfig, setSmokeConfig] = useState<AlphaPlaybackSmokeConfig | null>(null)
+  const [betaContinueSmokeConfig, setBetaContinueSmokeConfig] = useState<BetaContinueSmokeConfig | null>(null)
 
   // 精简模式：只渲染 MiniPlayer
   if (isMiniMode()) {
@@ -55,6 +61,32 @@ export default function App() {
     }
     autoLoad()
   }, [loadConfig, location.pathname, navigate])
+
+  useEffect(() => {
+    let cancelled = false
+    const loadSmokeConfig = async () => {
+      const value = await settingsApi.get('__alphaPlaybackSmoke') as AlphaPlaybackSmokeConfig | null
+      if (!cancelled && value?.enabled) {
+        setSmokeConfig(value)
+      }
+      const betaValue = await settingsApi.get('__betaContinueSmoke') as BetaContinueSmokeConfig | null
+      if (!cancelled && betaValue?.enabled) {
+        setBetaContinueSmokeConfig(betaValue)
+      }
+    }
+    void loadSmokeConfig()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (smokeConfig?.enabled) {
+    return <AlphaPlaybackSmoke config={smokeConfig} />
+  }
+
+  if (betaContinueSmokeConfig?.enabled) {
+    return <BetaContinueSmoke config={betaContinueSmokeConfig} />
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg-primary">

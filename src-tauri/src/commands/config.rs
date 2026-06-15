@@ -2,7 +2,145 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::error::AppError;
+use crate::spider::{HttpSpider, SiteConfig};
 use crate::AppState;
+
+const MAX_INSPECT_SITE_PROBES: usize = 6;
+const INSPECT_SITE_TIMEOUT_SECS: i64 = 5;
+
+#[derive(Default)]
+struct SiteProbeStats {
+    inspected: i64,
+    passed: i64,
+    failed: i64,
+    skipped: i64,
+}
+
+fn site_type(site: &Value) -> i64 {
+    site.get("type").and_then(Value::as_i64).unwrap_or(1)
+}
+
+fn site_api(site: &Value) -> Option<&str> {
+    site.get("api")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|api| !api.is_empty())
+}
+
+fn site_name(site: &Value) -> Option<&str> {
+    site.get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+fn is_hidden_site(site: &Value) -> bool {
+    site.get("hide").and_then(Value::as_i64) == Some(1)
+}
+
+fn is_http_api_site(site: &Value) -> bool {
+    matches!(site_type(site), 0 | 1 | 4)
+}
+
+fn is_directly_supported_site(site: &Value) -> bool {
+    is_http_api_site(site) && !is_hidden_site(site) && site_api(site).is_some()
+}
+
+fn is_searchable_site(site: &Value) -> bool {
+    is_directly_supported_site(site) && site.get("searchable").and_then(Value::as_i64) != Some(0)
+}
+
+fn live_channel_count(live: &Value) -> i64 {
+    if let Some(count) = live.get("channelCount").and_then(Value::as_i64) {
+        return count;
+    }
+
+    live.get("groups")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|group| {
+                    group
+                        .get("channel")
+                        .or_else(|| group.get("channels"))
+                        .and_then(Value::as_array)
+                        .map(|channels| channels.len() as i64)
+                        .unwrap_or(0)
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+async fn probe_supported_sites(config_url: &str, config: &Value) -> SiteProbeStats {
+    let mut stats = SiteProbeStats::default();
+    let Some(sites) = config.get("sites").and_then(Value::as_array) else {
+        return stats;
+    };
+
+    for site in sites.iter().filter(|site| is_directly_supported_site(site)) {
+        if stats.inspected as usize >= MAX_INSPECT_SITE_PROBES {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let Some(api) = site_api(site) else {
+            continue;
+        };
+
+        stats.inspected += 1;
+        let key = site
+            .get("key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or(api);
+        let timeout = site
+            .get("timeout")
+            .and_then(Value::as_i64)
+            .filter(|timeout| *timeout > 0)
+            .map(|timeout| timeout.min(INSPECT_SITE_TIMEOUT_SECS))
+            .unwrap_or(INSPECT_SITE_TIMEOUT_SECS);
+        let spider = HttpSpider::new(SiteConfig {
+            key: key.to_string(),
+            name: site_name(site).unwrap_or(key).to_string(),
+            site_type: site_type(site),
+            api: crate::config::resolve_relative_url(config_url, api),
+            ext: site.get("ext").cloned(),
+            play_url: site
+                .get("playUrl")
+                .and_then(Value::as_str)
+                .map(String::from),
+            click: site.get("click").and_then(Value::as_str).map(String::from),
+            header: site.get("header").cloned(),
+            timeout: Some(timeout),
+        });
+
+        let passed = match spider.home_content(true).await {
+            Ok(result) => {
+                result
+                    .class
+                    .as_ref()
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false)
+                    || result
+                        .list
+                        .as_ref()
+                        .map(|items| !items.is_empty())
+                        .unwrap_or(false)
+            }
+            Err(_) => false,
+        };
+
+        if passed {
+            stats.passed += 1;
+        } else {
+            stats.failed += 1;
+        }
+    }
+
+    stats
+}
 
 /// 获取当前配置
 pub fn handle_config_get_current(state: &State<'_, AppState>) -> Result<Value, AppError> {
@@ -44,11 +182,15 @@ pub fn handle_config_list(state: &State<'_, AppState>) -> Result<Value, AppError
 
 /// 获取配置预检信息
 pub fn handle_config_inspect(state: &State<'_, AppState>, url: String) -> Result<Value, AppError> {
-    let mgr = state.config_manager.lock();
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
 
-    match rt.block_on(mgr.load_from_url(&url)) {
+    let config_result = {
+        let mgr = state.config_manager.lock();
+        rt.block_on(mgr.load_from_url(&url))
+    };
+
+    match config_result {
         Ok(config) => {
             let sites = config
                 .get("sites")
@@ -76,58 +218,119 @@ pub fn handle_config_inspect(state: &State<'_, AppState>, url: String) -> Result
                 .unwrap_or("tvbox");
 
             let mut warnings: Vec<String> = Vec::new();
-            if sites == 0 && lives == 0 {
-                warnings.push("配置中没有可用站点或直播源".to_string());
-            }
             if source_type == "live" {
                 warnings.push("已识别为直播源直链，将作为单个直播源加载".to_string());
             }
 
-            let visible_sites = config
+            let site_entries = config
                 .get("sites")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|s| {
-                            let t = s.get("type").and_then(Value::as_i64).unwrap_or(0);
-                            t == 0 || t == 1 || t == 4
-                        })
-                        .count() as i64
-                })
-                .unwrap_or(0);
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
 
-            let searchable_sites = config
-                .get("sites")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|s| s.get("searchable").and_then(Value::as_i64) != Some(0))
-                        .count() as i64
-                })
-                .unwrap_or(0);
+            let visible_sites = site_entries
+                .iter()
+                .filter(|site| is_directly_supported_site(site))
+                .count() as i64;
 
-            let unsupported_sites = config
-                .get("sites")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|s| s.get("type").and_then(Value::as_i64).unwrap_or(0) == 3)
-                        .count() as i64
-                })
-                .unwrap_or(0);
+            let searchable_sites = site_entries
+                .iter()
+                .filter(|site| is_searchable_site(site))
+                .count() as i64;
 
-            if unsupported_sites > 0 {
+            let hidden_sites = site_entries
+                .iter()
+                .filter(|site| is_hidden_site(site))
+                .count() as i64;
+
+            let csp_sites = site_entries
+                .iter()
+                .filter(|site| site_type(site) == 3)
+                .count() as i64;
+
+            let missing_api_sites = site_entries
+                .iter()
+                .filter(|site| {
+                    is_http_api_site(site) && !is_hidden_site(site) && site_api(site).is_none()
+                })
+                .count() as i64;
+
+            let unsupported_sites = site_entries
+                .iter()
+                .filter(|site| !is_hidden_site(site) && !is_directly_supported_site(site))
+                .count() as i64;
+
+            if csp_sites > 0 {
                 warnings.push(format!(
-                    "包含 {} 个暂不支持的 CSP Jar 站点",
-                    unsupported_sites
+                    "包含 {} 个 type=3 CSP/Jar/JS/Python 站点，当前桌面端暂不执行此类爬虫",
+                    csp_sites
                 ));
+            }
+            if hidden_sites > 0 {
+                warnings.push(format!("已忽略 {} 个 hide=1 的隐藏站点", hidden_sites));
+            }
+            if missing_api_sites > 0 {
+                warnings.push(format!(
+                    "有 {} 个 HTTP API 站点缺少 api 地址，已排除",
+                    missing_api_sites
+                ));
+            }
+
+            let probe_stats = rt.block_on(probe_supported_sites(&url, &config));
+            if probe_stats.inspected > 0 && probe_stats.passed == 0 {
+                warnings.push(format!(
+                    "已抽样测试 {} 个 HTTP API 站点，暂未拿到首页分类或列表",
+                    probe_stats.inspected
+                ));
+            } else if probe_stats.failed > 0 {
+                warnings.push(format!(
+                    "抽样测试中 {} 个 HTTP API 站点未返回可用首页内容",
+                    probe_stats.failed
+                ));
+            }
+            if probe_stats.skipped > 0 {
+                warnings.push(format!(
+                    "为避免预检过慢，另有 {} 个 HTTP API 站点留待导入后探测",
+                    probe_stats.skipped
+                ));
+            }
+
+            let live_channels = config
+                .get("lives")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().map(live_channel_count).sum::<i64>())
+                .unwrap_or(0);
+
+            let has_probe_data = probe_stats.inspected > 0;
+            let direct_sites_ready =
+                visible_sites > 0 && (!has_probe_data || probe_stats.passed > 0);
+            let has_live_sources = lives > 0;
+            let (compatibility, compatibility_label, can_import) = if direct_sites_ready {
+                ("ready", "点播可用", true)
+            } else if has_live_sources {
+                ("live", "仅直播可用", true)
+            } else if sites > 0 || parses > 0 {
+                ("unsupported", "暂不兼容", false)
+            } else {
+                ("invalid", "不可用", false)
+            };
+
+            if !can_import {
+                warnings.push("当前项目没有可消费的 type=0/1/4 HTTP API 站点或直播源".to_string());
             }
 
             let name = config
                 .get("sites")
                 .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|s| s.get("name").and_then(Value::as_str))
+                .and_then(|arr| arr.iter().find(|site| is_directly_supported_site(site)))
+                .and_then(site_name)
+                .or_else(|| {
+                    config
+                        .get("sites")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(site_name)
+                })
                 .or_else(|| {
                     config
                         .get("lives")
@@ -151,6 +354,17 @@ pub fn handle_config_inspect(state: &State<'_, AppState>, url: String) -> Result
                     "parseCount": parses,
                     "hasSpider": has_spider,
                     "sourceType": source_type,
+                    "compatibility": compatibility,
+                    "compatibilityLabel": compatibility_label,
+                    "canImport": can_import,
+                    "hiddenSiteCount": hidden_sites,
+                    "cspSiteCount": csp_sites,
+                    "missingApiSiteCount": missing_api_sites,
+                    "probeInspectedSiteCount": probe_stats.inspected,
+                    "probePassedSiteCount": probe_stats.passed,
+                    "probeFailedSiteCount": probe_stats.failed,
+                    "probeSkippedSiteCount": probe_stats.skipped,
+                    "liveChannelCount": live_channels,
                     "warnings": warnings,
                 }
             }))

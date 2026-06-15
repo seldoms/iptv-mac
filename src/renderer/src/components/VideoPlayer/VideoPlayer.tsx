@@ -23,12 +23,25 @@ import {
   RotateCw,
   Shuffle
 } from 'lucide-react'
-import { windowApi } from '@/utils/ipc'
+import { historyApi, windowApi } from '@/utils/ipc'
 import { redactHeaders, redactText } from '@/utils/redact'
+import { getPlaybackMetricSummary, recordPlaybackMetric } from '@/utils/playbackMetrics'
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
 const MAX_HLS_NETWORK_RECOVERY_ATTEMPTS = 3
 const MAX_HLS_MEDIA_RECOVERY_ATTEMPTS = 2
+const MAX_HLS_DEBUG_EVENTS = 20
+const HISTORY_SAVE_INTERVAL_MS = 15_000
+
+declare global {
+  interface Window {
+    __alphaPlaybackDebug?: {
+      protocol?: string
+      url?: string
+      events: Array<Record<string, unknown>>
+    }
+  }
+}
 
 interface StreamStats {
   bitrateKbps: number | null
@@ -46,6 +59,40 @@ function formatThroughput(kbps: number | null): string {
   if (!kbps || !Number.isFinite(kbps) || kbps <= 0) return '--'
   if (kbps >= 1000) return `${(kbps / 1000).toFixed(kbps >= 10000 ? 0 : 1)} Mbps`
   return `${Math.round(kbps)} Kbps`
+}
+
+function inferProtocol(url: string): 'hls' | 'dash' | 'native' | 'unknown' {
+  if (!url) return 'unknown'
+  const candidates = [url]
+  try {
+    const nestedUrl = new URL(url).searchParams.get('url')
+    if (nestedUrl) candidates.unshift(nestedUrl)
+  } catch {
+    // Keep the original string fallback for non-URL values.
+  }
+  if (candidates.some((candidate) => /\.m3u8(?:$|[?&#])/i.test(candidate))) return 'hls'
+  if (candidates.some((candidate) => /\.mpd(?:$|[?&#])/i.test(candidate))) return 'dash'
+  if (candidates.some((candidate) => /\.(mp4|m4v|webm|mov|flv|ts)(?:$|[?&#])/i.test(candidate))) return 'native'
+  return 'unknown'
+}
+
+function appendHlsDebugEvent(event: Record<string, unknown>) {
+  if (typeof window === 'undefined') return
+  const debug = window.__alphaPlaybackDebug || { events: [] }
+  debug.events = [...debug.events, { at: Date.now(), ...event }].slice(-MAX_HLS_DEBUG_EVENTS)
+  window.__alphaPlaybackDebug = debug
+}
+
+function formatUrlIdentifier(url: string): string {
+  if (!url) return ''
+  try {
+    const parsed = new URL(url)
+    const nested = parsed.searchParams.get('url')
+    const target = nested ? new URL(nested) : parsed
+    return `${target.hostname}${target.pathname}`.slice(0, 240)
+  } catch {
+    return url.split('?')[0].slice(0, 240)
+  }
 }
 
 export default function VideoPlayer() {
@@ -68,6 +115,8 @@ export default function VideoPlayer() {
   const lastFragLoadedAtRef = useRef<number>(0)
   /** stalled 防抖定时器 - 持续停滞超过阈值才显示覆盖层 */
   const stalledTimerRef = useRef<number>(0)
+  const pendingSeekRef = useRef<number>(0)
+  const lastHistorySaveAtRef = useRef<number>(0)
 
   // 用 ref 缓存 store 中的 siteKey/vodId，避免 reportPlayFailure 引用变化导致 effect 重跑
   const currentSiteKeyRef = useRef<string>('')
@@ -75,9 +124,10 @@ export default function VideoPlayer() {
 
   const {
     isPlaying, currentUrl, playKey, currentTime, duration, speed, volume,
-    isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex,
+    isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex, currentSourceIndex,
     playHeader, currentSiteKey, currentVod, playbackPhase, playbackMessage, playbackError,
-    playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
+    playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, playbackDiagnostic,
+    alternativeSources, brokenSources, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
     setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume,
     toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode,
     setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource
@@ -88,6 +138,12 @@ export default function VideoPlayer() {
     currentSiteKeyRef.current = currentSiteKey || ''
     currentVodIdRef.current = currentVod?.vod_id || ''
   }, [currentSiteKey, currentVod?.vod_id])
+
+  useEffect(() => {
+    const target = usePlayerStore.getState().currentTime
+    pendingSeekRef.current = target > 3 ? target : 0
+    lastHistorySaveAtRef.current = 0
+  }, [currentUrl, playKey])
 
   const [showControls, setShowControls] = useState(true)
   const [showSpeedMenu, setShowSpeedMenu] = useState(false)
@@ -104,9 +160,48 @@ export default function VideoPlayer() {
     failureReportedRef.current = true
     const siteKey = currentSiteKeyRef.current
     const vodId = currentVodIdRef.current
+    const store = usePlayerStore.getState()
+    const elapsedMs = store.playbackStartedAt ? Math.max(0, Date.now() - store.playbackStartedAt) : undefined
+    const protocol = inferProtocol(store.currentUrl)
+    const lowerReason = reason.toLowerCase()
+    const stage = reason.includes('清单') || reason.includes('MANIFEST') || lowerReason.includes('manifest')
+      ? 'manifest'
+      : reason.includes('超时') || lowerReason.includes('timeout')
+        ? 'connect'
+        : reason.includes('媒体') || reason.includes('视频')
+          ? 'media'
+          : reason.includes('网络') || lowerReason.includes('network')
+            ? 'network'
+            : protocol === 'hls'
+              ? 'manifest'
+              : 'unknown'
+    const errorKind = reason.includes('超时') || lowerReason.includes('timeout')
+      ? 'timeout'
+      : protocol === 'hls' || lowerReason.includes('hls')
+        ? 'hls'
+        : reason.includes('媒体') || reason.includes('视频')
+          ? 'media'
+          : 'unknown'
     console.error('[VideoPlayer] 播放失败:', reason, 'siteKey:', siteKey, 'vodId:', vodId)
-    usePlayerStore.getState().setPlaybackError(reason)
-    const detail = { siteKey, vodId, reason, autoSwitch: true }
+    store.setPlaybackError(reason, {
+      stage,
+      errorKind,
+      protocol,
+      elapsedMs,
+      sourceId: siteKey && vodId ? `${siteKey}::${vodId}` : undefined,
+      nextAction: store.autoSwitchSource ? '自动尝试下一条可用线路' : '可手动重试或切换线路'
+    })
+    recordPlaybackMetric({
+      type: 'failure',
+      at: Date.now(),
+      elapsedMs,
+      phase: store.playbackPhase,
+      stage,
+      errorKind,
+      protocol,
+      sourceId: siteKey && vodId ? `${siteKey}::${vodId}` : undefined
+    })
+    const detail = { siteKey, vodId, reason, autoSwitch: true, diagnostic: usePlayerStore.getState().playbackDiagnostic }
     window.dispatchEvent(new CustomEvent(siteKey || vodId ? 'vod:playFailed' : 'live:playFailed', { detail }))
   })
 
@@ -138,9 +233,83 @@ export default function VideoPlayer() {
       `size=${video?.videoWidth || 0}x${video?.videoHeight || 0}`
     )
     markPlaybackFirstFrame()
+    const store = usePlayerStore.getState()
+    const elapsedMs = store.playbackStartedAt ? Math.max(0, Date.now() - store.playbackStartedAt) : undefined
+    recordPlaybackMetric({
+      type: 'first_frame',
+      at: Date.now(),
+      elapsedMs,
+      phase: store.playbackPhase,
+      protocol: inferProtocol(store.currentUrl),
+      sourceId: store.currentSiteKey && store.currentVod ? `${store.currentSiteKey}::${store.currentVod.vod_id}` : undefined
+    })
     clearLoadTimeout()
     clearStalledTimer()
   }, [clearLoadTimeout, clearStalledTimer, markPlaybackFirstFrame])
+
+  const applyPendingSeek = useCallback(() => {
+    const video = videoRef.current
+    const target = pendingSeekRef.current
+    if (!video || target <= 3) return
+    if (!Number.isFinite(video.duration) || video.duration <= target + 2) return
+    video.currentTime = Math.min(target, Math.max(0, video.duration - 2))
+    pendingSeekRef.current = 0
+  }, [])
+
+  const savePlaybackHistory = useCallback((force = false, completedOverride?: boolean) => {
+    const video = videoRef.current
+    const store = usePlayerStore.getState()
+    const vod = store.currentVod
+    if (!vod || !store.currentSiteKey || !store.currentUrl || store.currentUrl === '__resolving__') return
+
+    const now = Date.now()
+    if (!force && now - lastHistorySaveAtRef.current < HISTORY_SAVE_INTERVAL_MS) return
+
+    const rawDuration = video?.duration || store.duration || 0
+    const durationSeconds = Number.isFinite(rawDuration) ? Math.max(0, Math.round(rawDuration)) : 0
+    const rawPosition = video?.currentTime ?? store.currentTime
+    const positionSeconds = Number.isFinite(rawPosition) ? Math.max(0, Math.round(rawPosition)) : 0
+    if (!force && positionSeconds < 5) return
+
+    const completed = completedOverride ?? (durationSeconds > 0 && positionSeconds / durationSeconds >= 0.95)
+    const savedPosition = completed ? 0 : positionSeconds
+    const progress = durationSeconds > 0
+      ? Math.max(0, Math.min(100, Math.round((positionSeconds / durationSeconds) * 100)))
+      : 0
+    const episode = store.episodes[store.currentEpisodeIndex]
+    const sourceName = store.currentSourceName || `线路 ${store.currentSourceIndex + 1}`
+    const episodeName = episode?.name || `第 ${store.currentEpisodeIndex + 1} 集`
+
+    lastHistorySaveAtRef.current = now
+    historyApi.add({
+      siteKey: store.currentSiteKey,
+      vodId: vod.vod_id,
+      vodName: vod.vod_name,
+      vodPic: vod.vod_pic,
+      vodRemarks: vod.vod_remarks,
+      source: `${sourceName} · ${episodeName}`,
+      progress: completed ? 100 : progress,
+      episodeId: String(store.currentEpisodeIndex),
+      episodeName,
+      episodeIndex: store.currentEpisodeIndex,
+      sourceIndex: store.currentSourceIndex,
+      sourceName,
+      urlIdentifier: formatUrlIdentifier(store.currentUrl),
+      duration: durationSeconds,
+      positionSeconds: savedPosition,
+      completed
+    }).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const handleFlushHistory = () => savePlaybackHistory(true)
+    window.addEventListener('player:flushHistory', handleFlushHistory)
+    return () => window.removeEventListener('player:flushHistory', handleFlushHistory)
+  }, [savePlaybackHistory])
+
+  useEffect(() => {
+    return () => savePlaybackHistory(true)
+  }, [savePlaybackHistory])
 
   // 进入精简模式
   const handleEnterMiniMode = useCallback(async () => {
@@ -156,6 +325,12 @@ export default function VideoPlayer() {
   useEffect(() => {
     const video = videoRef.current
     if (!video || !currentUrl) return
+    const currentProtocol = inferProtocol(currentUrl)
+    window.__alphaPlaybackDebug = {
+      protocol: currentProtocol,
+      url: currentUrl,
+      events: []
+    }
 
     // 清理旧实例
     hlsRef.current?.destroy()
@@ -164,6 +339,9 @@ export default function VideoPlayer() {
     dashRef.current = null
     video.pause()
     video.removeAttribute('src')
+    video.muted = volume <= 0
+    video.volume = volume
+    video.playbackRate = speed
     video.load()
 
     // 重置失败标记和播放标记
@@ -189,12 +367,12 @@ export default function VideoPlayer() {
 
     let hlsRecoveryTimer = 0
 
-    if (currentUrl.includes('.mpd')) {
+    if (currentProtocol === 'dash') {
       // DASH
       const player = dashjs.MediaPlayer().create()
       player.initialize(video, currentUrl, true)
       dashRef.current = player
-    } else if (Hls.isSupported()) {
+    } else if (currentProtocol === 'hls' && Hls.isSupported()) {
       let networkRecoveryAttempts = 0
       let mediaRecoveryAttempts = 0
 
@@ -202,6 +380,11 @@ export default function VideoPlayer() {
       const hls = new Hls({
         // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
         enableWorker: false,
+        testBandwidth: false,
+        startFragPrefetch: true,
+        startLevel: 0,
+        maxBufferLength: 10,
+        maxMaxBufferLength: 30,
         xhrSetup: (xhr, _url) => {
           if (playHeader) {
             for (const [key, value] of Object.entries(playHeader)) {
@@ -212,12 +395,46 @@ export default function VideoPlayer() {
       })
       hls.loadSource(currentUrl)
       hls.attachMedia(video)
+      hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+        appendHlsDebugEvent({
+          event: 'manifest_loaded',
+          levels: data.levels?.length,
+          audioTracks: data.audioTracks?.length,
+          subtitles: data.subtitles?.length
+        })
+      })
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         console.log('[VideoPlayer] HLS manifest 解析成功')
+        appendHlsDebugEvent({ event: 'manifest_parsed', levels: hls.levels.length })
         setPlaybackPhase('buffering', '清单已加载，正在缓冲...')
         video.play().catch(() => {})
       })
+      hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+        appendHlsDebugEvent({
+          event: 'level_loaded',
+          level: data.level,
+          fragments: data.details?.fragments?.length,
+          live: data.details?.live,
+          targetduration: data.details?.targetduration
+        })
+      })
+      hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
+        appendHlsDebugEvent({
+          event: 'frag_loading',
+          sn: data.frag?.sn,
+          level: data.frag?.level,
+          type: data.frag?.type,
+          duration: data.frag?.duration
+        })
+      })
       hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+        appendHlsDebugEvent({
+          event: 'frag_loaded',
+          sn: data.frag?.sn,
+          level: data.frag?.level,
+          type: data.frag?.type,
+          payloadBytes: data.payload?.byteLength || 0
+        })
         networkRecoveryAttempts = 0
         const now = performance.now()
         const payloadBytes = data.payload?.byteLength || 0
@@ -242,6 +459,15 @@ export default function VideoPlayer() {
       })
       hls.on(Hls.Events.ERROR, (_event, data) => {
         console.error('[VideoPlayer] HLS错误:', data.type, data.details, data.fatal)
+        appendHlsDebugEvent({
+          event: 'hls_error',
+          type: data.type,
+          details: data.details,
+          fatal: data.fatal,
+          responseCode: data.response?.code,
+          responseText: data.response?.text,
+          reason: data.error?.message
+        })
         if (failureReportedRef.current) return
 
         if (
@@ -249,8 +475,7 @@ export default function VideoPlayer() {
           video.currentTime <= 0 &&
           (
             data.details === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
-            data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
-            data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR
+            data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR
           )
         ) {
           hls.stopLoad()
@@ -300,7 +525,7 @@ export default function VideoPlayer() {
         }
       })
       hlsRef.current = hls
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    } else if (currentProtocol === 'hls' && video.canPlayType('application/vnd.apple.mpegurl')) {
       // Safari 原生 HLS
       video.src = currentUrl
       video.play().catch(() => {})
@@ -394,6 +619,7 @@ export default function VideoPlayer() {
     const video = videoRef.current
     if (!video) return
     video.volume = volume
+    video.muted = volume <= 0
     video.playbackRate = speed
   }, [volume, speed])
 
@@ -405,12 +631,26 @@ export default function VideoPlayer() {
     const onTimeUpdate = () => {
       setCurrentTime(video.currentTime)
       if (video.currentTime > 0) markPlaybackStarted()
+      savePlaybackHistory(false)
     }
-    const onDurationChange = () => setDuration(video.duration || 0)
+    const onDurationChange = () => {
+      setDuration(video.duration || 0)
+      applyPendingSeek()
+    }
     const onPlay = () => setIsPlaying(true)
-    const onPause = () => setIsPlaying(false)
+    const onPause = () => {
+      setIsPlaying(false)
+      savePlaybackHistory(true)
+    }
+    const onLoadedMetadata = () => applyPendingSeek()
+    const onLoadedData = () => {
+      applyPendingSeek()
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        markPlaybackStarted()
+      }
+    }
     const onPlaying = () => {
-      if (video.currentTime > 0) {
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA || video.currentTime > 0) {
         markPlaybackStarted()
         // 已开始播放时隐藏 stalled/buffering 覆盖层
         clearStalledTimer()
@@ -420,6 +660,7 @@ export default function VideoPlayer() {
       }
     }
     const onEnded = () => {
+      savePlaybackHistory(true, true)
       if (currentEpisodeIndex < episodes.length - 1) nextEpisode()
       else setIsPlaying(false)
     }
@@ -428,6 +669,8 @@ export default function VideoPlayer() {
     video.addEventListener('durationchange', onDurationChange)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
+    video.addEventListener('loadedmetadata', onLoadedMetadata)
+    video.addEventListener('loadeddata', onLoadedData)
     video.addEventListener('playing', onPlaying)
     video.addEventListener('ended', onEnded)
 
@@ -436,10 +679,22 @@ export default function VideoPlayer() {
       video.removeEventListener('durationchange', onDurationChange)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
+      video.removeEventListener('loadedmetadata', onLoadedMetadata)
+      video.removeEventListener('loadeddata', onLoadedData)
       video.removeEventListener('playing', onPlaying)
       video.removeEventListener('ended', onEnded)
     }
-  }, [currentEpisodeIndex, episodes.length, markPlaybackStarted, nextEpisode, setDuration, setCurrentTime, setIsPlaying])
+  }, [
+    applyPendingSeek,
+    currentEpisodeIndex,
+    episodes.length,
+    markPlaybackStarted,
+    nextEpisode,
+    savePlaybackHistory,
+    setDuration,
+    setCurrentTime,
+    setIsPlaying
+  ])
 
   // 控制栏自动隐藏
   const resetHideTimer = useCallback(() => {
@@ -565,19 +820,30 @@ export default function VideoPlayer() {
   const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps)
 
   const buildDiagnosticsText = () => {
+    const metricSummary = getPlaybackMetricSummary()
     const lines = [
       'IPTV Mac 播放诊断',
       `阶段: ${playbackPhase}`,
       `状态: ${playbackMessage || '-'}`,
       `错误: ${playbackError || '-'}`,
+      `错误阶段: ${playbackDiagnostic?.stage || '-'}`,
+      `错误类型: ${playbackDiagnostic?.errorKind || '-'}`,
+      `协议: ${playbackDiagnostic?.protocol || inferProtocol(currentUrl)}`,
       `站点: ${currentSiteKey || '-'}`,
       `影片: ${currentVod?.vod_name || '-'}`,
       `集数: ${episodes[currentEpisodeIndex]?.name || currentEpisodeIndex + 1 || '-'}`,
-      `线路索引: ${currentEpisodeIndex + 1}/${episodes.length || 0}`,
+      `线路索引: ${currentSourceIndex + 1}`,
+      `已失败源: ${brokenSources.size}`,
+      `备选源: ${alternativeSources.length}`,
       `首帧耗时: ${firstFrameMs == null ? '-' : `${firstFrameMs}ms`}`,
       `当前耗时: ${elapsedMs}ms`,
       `失败时间: ${playbackLastErrorAt ? new Date(playbackLastErrorAt).toISOString() : '-'}`,
       `换源状态: ${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`,
+      `下一步: ${playbackDiagnostic?.nextAction || (autoSwitchSource ? '自动换源开启' : '等待手动操作')}`,
+      `首帧样本数: ${metricSummary.totalFirstFrameSamples}`,
+      `首帧P50: ${metricSummary.p50FirstFrameMs == null ? '-' : `${metricSummary.p50FirstFrameMs}ms`}`,
+      `首帧P90: ${metricSummary.p90FirstFrameMs == null ? '-' : `${metricSummary.p90FirstFrameMs}ms`}`,
+      `失败样本数: ${metricSummary.totalFailures}`,
       `URL: ${redactedUrl || '-'}`,
       `Headers: ${Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders) : '-'}`
     ]
@@ -623,7 +889,7 @@ export default function VideoPlayer() {
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onDoubleClick={handleToggleFullscreen}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" playsInline />
+      <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} />
 
       {currentUrl && (
         <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
@@ -792,6 +1058,13 @@ export default function VideoPlayer() {
             <DiagnosticSection title="状态">
               <p>{playbackMessage || '-'}</p>
               {playbackError && <p className="mt-2 text-red-300">{playbackError}</p>}
+              {playbackDiagnostic && (
+                <div className="mt-3 border-t border-white/10 pt-3">
+                  <DiagnosticRow label="错误阶段" value={playbackDiagnostic.stage} />
+                  <DiagnosticRow label="错误类型" value={playbackDiagnostic.errorKind} />
+                  <DiagnosticRow label="下一步" value={playbackDiagnostic.nextAction || '-'} />
+                </div>
+              )}
               <label className="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
                 <span className="text-white/60">自动换源</span>
                 <input
@@ -807,7 +1080,9 @@ export default function VideoPlayer() {
               <DiagnosticRow label="站点" value={currentSiteKey || '-'} />
               <DiagnosticRow label="影片" value={currentVod?.vod_name || '-'} />
               <DiagnosticRow label="集数" value={episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1)} />
+              <DiagnosticRow label="线路" value={String(currentSourceIndex + 1)} />
               <DiagnosticRow label="换源" value={`${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`} />
+              <DiagnosticRow label="已失败/备选" value={`${brokenSources.size}/${alternativeSources.length}`} />
             </DiagnosticSection>
 
             <DiagnosticSection title="线路">

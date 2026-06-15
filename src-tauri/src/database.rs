@@ -7,7 +7,7 @@ use std::{
 use rusqlite::{params, Connection, Row};
 use serde_json::{json, Value};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 struct Migration {
     version: i64,
@@ -86,6 +86,20 @@ const MIGRATIONS: &[Migration] = &[
             );
             INSERT OR IGNORE INTO live_refresh_status (id, status, refresh_interval_minutes)
               VALUES (1, 'idle', 30);
+        ",
+    },
+    Migration {
+        version: 3,
+        up: "
+            ALTER TABLE history ADD COLUMN episodeId TEXT DEFAULT '';
+            ALTER TABLE history ADD COLUMN episodeName TEXT DEFAULT '';
+            ALTER TABLE history ADD COLUMN episodeIndex INTEGER DEFAULT 0;
+            ALTER TABLE history ADD COLUMN sourceIndex INTEGER DEFAULT 0;
+            ALTER TABLE history ADD COLUMN sourceName TEXT DEFAULT '';
+            ALTER TABLE history ADD COLUMN urlIdentifier TEXT DEFAULT '';
+            ALTER TABLE history ADD COLUMN duration INTEGER DEFAULT 0;
+            ALTER TABLE history ADD COLUMN positionSeconds INTEGER DEFAULT 0;
+            ALTER TABLE history ADD COLUMN completed INTEGER DEFAULT 0;
         ",
     },
 ];
@@ -194,8 +208,10 @@ impl Database {
             .execute(
                 "
                 INSERT INTO history
-                  (siteKey, vodId, vodName, vodPic, vodRemarks, type, source, progress, createTime, updateTime)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                  (siteKey, vodId, vodName, vodPic, vodRemarks, type, source, progress,
+                   episodeId, episodeName, episodeIndex, sourceIndex, sourceName, urlIdentifier,
+                   duration, positionSeconds, completed, createTime, updateTime)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
                 ON CONFLICT(siteKey, vodId) DO UPDATE SET
                   vodName = excluded.vodName,
                   vodPic = excluded.vodPic,
@@ -203,6 +219,15 @@ impl Database {
                   type = excluded.type,
                   source = excluded.source,
                   progress = excluded.progress,
+                  episodeId = excluded.episodeId,
+                  episodeName = excluded.episodeName,
+                  episodeIndex = excluded.episodeIndex,
+                  sourceIndex = excluded.sourceIndex,
+                  sourceName = excluded.sourceName,
+                  urlIdentifier = excluded.urlIdentifier,
+                  duration = excluded.duration,
+                  positionSeconds = excluded.positionSeconds,
+                  completed = excluded.completed,
                   updateTime = excluded.updateTime
                 ",
                 params![
@@ -214,6 +239,15 @@ impl Database {
                     optional_i64(item, "type"),
                     optional_text(item, "source"),
                     optional_i64(item, "progress"),
+                    optional_text(item, "episodeId"),
+                    optional_text(item, "episodeName"),
+                    optional_i64(item, "episodeIndex"),
+                    optional_i64(item, "sourceIndex"),
+                    optional_text(item, "sourceName"),
+                    optional_text(item, "urlIdentifier"),
+                    optional_i64(item, "duration"),
+                    optional_i64(item, "positionSeconds"),
+                    optional_bool_i64(item, "completed"),
                     now
                 ],
             )
@@ -223,7 +257,9 @@ impl Database {
 
     pub fn history_list(&self, limit: i64, offset: i64) -> Result<Value, String> {
         self.list(
-            "SELECT id, siteKey, vodId, vodName, vodPic, vodRemarks, type, source, progress, createTime, updateTime
+            "SELECT id, siteKey, vodId, vodName, vodPic, vodRemarks, type, source, progress,
+                    episodeId, episodeName, episodeIndex, sourceIndex, sourceName, urlIdentifier,
+                    duration, positionSeconds, completed, createTime, updateTime
              FROM history ORDER BY updateTime DESC LIMIT ?1 OFFSET ?2",
             limit,
             offset,
@@ -505,8 +541,17 @@ fn history_row(row: &Row<'_>) -> rusqlite::Result<Value> {
         "type": row.get::<_, i64>(6)?,
         "source": row.get::<_, String>(7)?,
         "progress": row.get::<_, i64>(8)?,
-        "createTime": row.get::<_, i64>(9)?,
-        "updateTime": row.get::<_, i64>(10)?
+        "episodeId": row.get::<_, String>(9)?,
+        "episodeName": row.get::<_, String>(10)?,
+        "episodeIndex": row.get::<_, i64>(11)?,
+        "sourceIndex": row.get::<_, i64>(12)?,
+        "sourceName": row.get::<_, String>(13)?,
+        "urlIdentifier": row.get::<_, String>(14)?,
+        "duration": row.get::<_, i64>(15)?,
+        "positionSeconds": row.get::<_, i64>(16)?,
+        "completed": row.get::<_, i64>(17)? == 1,
+        "createTime": row.get::<_, i64>(18)?,
+        "updateTime": row.get::<_, i64>(19)?
     }))
 }
 
@@ -571,6 +616,14 @@ fn optional_i64(value: &Value, key: &str) -> i64 {
     value.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+fn optional_bool_i64(value: &Value, key: &str) -> i64 {
+    match value.get(key) {
+        Some(Value::Bool(true)) => 1,
+        Some(Value::Number(number)) if number.as_i64().unwrap_or(0) != 0 => 1,
+        _ => 0,
+    }
+}
+
 #[allow(dead_code)]
 fn optional_f64(value: &Value, key: &str) -> f64 {
     value.get(key).and_then(Value::as_f64).unwrap_or(0.0)
@@ -623,7 +676,16 @@ mod tests {
             "siteKey": "site-a",
             "vodId": "vod-1",
             "vodName": "Updated",
-            "progress": 35
+            "progress": 35,
+            "episodeId": "2",
+            "episodeName": "第 2 集",
+            "episodeIndex": 1,
+            "sourceIndex": 2,
+            "sourceName": "高清",
+            "urlIdentifier": "abc123",
+            "duration": 1800,
+            "positionSeconds": 630,
+            "completed": false
         }))
         .unwrap();
 
@@ -631,6 +693,11 @@ mod tests {
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["vodName"], "Updated");
         assert_eq!(rows[0]["progress"], 35);
+        assert_eq!(rows[0]["episodeName"], "第 2 集");
+        assert_eq!(rows[0]["episodeIndex"], 1);
+        assert_eq!(rows[0]["sourceIndex"], 2);
+        assert_eq!(rows[0]["positionSeconds"], 630);
+        assert_eq!(rows[0]["completed"], false);
     }
 
     #[test]
@@ -771,6 +838,82 @@ mod tests {
         db.save_live_channels(&[]).unwrap();
         let tree = db.get_live_tree().unwrap();
         assert!(tree.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_from_v2_adds_resume_history_columns() {
+        let dir = std::env::temp_dir().join("iptv-mig-test-v2");
+        let _ = std::fs::remove_file(&dir);
+        let path = dir.to_string_lossy().to_string() + ".db";
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS history (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              siteKey TEXT NOT NULL,
+              vodId TEXT NOT NULL,
+              vodName TEXT NOT NULL,
+              vodPic TEXT DEFAULT '',
+              vodRemarks TEXT DEFAULT '',
+              type INTEGER DEFAULT 0,
+              source TEXT DEFAULT '',
+              progress INTEGER DEFAULT 0,
+              createTime INTEGER NOT NULL DEFAULT 0,
+              updateTime INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(siteKey, vodId)
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_update ON history(updateTime DESC);
+            CREATE TABLE IF NOT EXISTS keep (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              siteKey TEXT NOT NULL,
+              vodId TEXT NOT NULL,
+              vodName TEXT NOT NULL,
+              vodPic TEXT DEFAULT '',
+              vodRemarks TEXT DEFAULT '',
+              type INTEGER DEFAULT 0,
+              source TEXT DEFAULT '',
+              createTime INTEGER NOT NULL DEFAULT 0,
+              updateTime INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(siteKey, vodId)
+            );
+            CREATE TABLE IF NOT EXISTS cache (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL DEFAULT '',
+              createTime INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS live_channels (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              urls TEXT NOT NULL,
+              best_url TEXT NOT NULL,
+              country TEXT NOT NULL,
+              category TEXT NOT NULL,
+              sort_order REAL DEFAULT 0,
+              latency INTEGER DEFAULT -1,
+              original_groups TEXT,
+              last_test_time INTEGER NOT NULL,
+              is_alive INTEGER DEFAULT 1,
+              UNIQUE(name, country, category)
+            );
+            CREATE TABLE IF NOT EXISTS live_refresh_status (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              status TEXT DEFAULT 'idle'
+            );
+            INSERT INTO history (siteKey, vodId, vodName, progress, createTime, updateTime)
+              VALUES ('site-a', 'vod-1', 'Legacy', 12, 1, 1);
+            PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::open(PathBuf::from(&path)).unwrap();
+        let rows = db.history_list(50, 0).unwrap();
+        assert_eq!(rows[0]["vodName"], "Legacy");
+        assert_eq!(rows[0]["episodeIndex"], 0);
+        assert_eq!(rows[0]["positionSeconds"], 0);
+        assert_eq!(rows[0]["completed"], false);
 
         let _ = std::fs::remove_file(&path);
     }

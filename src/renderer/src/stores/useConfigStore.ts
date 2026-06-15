@@ -8,6 +8,7 @@ export interface Site {
   api: string
   ext?: string
   jar?: string
+  hide?: number
   searchable: number
   changeable: number
 }
@@ -93,7 +94,7 @@ const initialState: ConfigState = {
  * 判断站点是否可用于首页（type=0/1/4 是 HTTP API 站点）
  */
 function isVisibleSite(s: Site): boolean {
-  return s.type === 0 || s.type === 1 || s.type === 4
+  return (s.type === 0 || s.type === 1 || s.type === 4) && s.hide !== 1 && Boolean(s.api?.trim())
 }
 
 /**

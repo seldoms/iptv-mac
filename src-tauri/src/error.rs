@@ -41,7 +41,11 @@ pub struct AppError {
 
 impl AppError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), internal: None }
+        Self {
+            code,
+            message: message.into(),
+            internal: None,
+        }
     }
 
     pub fn with_internal(mut self, internal: impl Into<String>) -> Self {
@@ -55,14 +59,30 @@ impl AppError {
     }
 
     // Convenience constructors
-    pub fn invalid_input(msg: impl Into<String>) -> Self { Self::new(ErrorCode::InvalidInput, msg) }
-    pub fn not_found(msg: impl Into<String>) -> Self { Self::new(ErrorCode::NotFound, msg) }
-    pub fn network_error(msg: impl Into<String>) -> Self { Self::new(ErrorCode::NetworkError, msg) }
-    pub fn timeout(msg: impl Into<String>) -> Self { Self::new(ErrorCode::Timeout, msg) }
-    pub fn parse_error(msg: impl Into<String>) -> Self { Self::new(ErrorCode::ParseError, msg) }
-    pub fn database_error(msg: impl Into<String>) -> Self { Self::new(ErrorCode::DatabaseError, msg) }
-    pub fn unsupported(msg: impl Into<String>) -> Self { Self::new(ErrorCode::Unsupported, msg) }
-    pub fn internal(msg: impl Into<String>) -> Self { Self::new(ErrorCode::InternalError, msg) }
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidInput, msg)
+    }
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotFound, msg)
+    }
+    pub fn network_error(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NetworkError, msg)
+    }
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Timeout, msg)
+    }
+    pub fn parse_error(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ParseError, msg)
+    }
+    pub fn database_error(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::DatabaseError, msg)
+    }
+    pub fn unsupported(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unsupported, msg)
+    }
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InternalError, msg)
+    }
 }
 
 impl fmt::Display for AppError {
@@ -74,7 +94,9 @@ impl fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 impl From<AppError> for String {
-    fn from(error: AppError) -> Self { error.message }
+    fn from(error: AppError) -> Self {
+        error.message
+    }
 }
 
 impl From<serde_json::Error> for AppError {

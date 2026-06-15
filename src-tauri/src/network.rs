@@ -22,19 +22,15 @@ pub fn create_client() -> Result<Client, AppError> {
 
 /// 带超时和大小限制的 GET 请求
 pub async fn http_get(client: &Client, url: &str) -> Result<String, AppError> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                AppError::timeout(format!("请求超时: {}", url))
-            } else if e.is_connect() {
-                AppError::network_error(format!("无法连接: {}", url))
-            } else {
-                AppError::network_error(format!("请求失败: {}", url)).with_internal(e.to_string())
-            }
-        })?;
+    let response = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            AppError::timeout(format!("请求超时: {}", url))
+        } else if e.is_connect() {
+            AppError::network_error(format!("无法连接: {}", url))
+        } else {
+            AppError::network_error(format!("请求失败: {}", url)).with_internal(e.to_string())
+        }
+    })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -64,9 +60,8 @@ pub async fn http_get(client: &Client, url: &str) -> Result<String, AppError> {
 /// 带超时和大小限制的 GET 请求，返回 JSON
 pub async fn http_get_json(client: &Client, url: &str) -> Result<Value, AppError> {
     let text = http_get(client, url).await?;
-    serde_json::from_str(&text).map_err(|e| {
-        AppError::parse_error("响应不是合法 JSON").with_internal(e.to_string())
-    })
+    serde_json::from_str(&text)
+        .map_err(|e| AppError::parse_error("响应不是合法 JSON").with_internal(e.to_string()))
 }
 
 /// 带额外 header 的 GET 请求
@@ -195,8 +190,11 @@ pub fn safe_json_parse(text: &str) -> Result<Value, AppError> {
     // 清理后重试
     let cleaned = clean_json_text(text);
     serde_json::from_str(&cleaned).map_err(|e| {
-        AppError::parse_error("JSON 格式错误，请检查内容是否完整")
-            .with_internal(format!("{}. cleaned_length={}", e, cleaned.len()))
+        AppError::parse_error("JSON 格式错误，请检查内容是否完整").with_internal(format!(
+            "{}. cleaned_length={}",
+            e,
+            cleaned.len()
+        ))
     })
 }
 

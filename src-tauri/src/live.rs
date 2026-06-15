@@ -100,7 +100,9 @@ fn parse_txt_format(content: &str) -> Vec<Group> {
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         if line.contains("#genre#") {
             let comma_idx = line.find(',');
@@ -116,11 +118,21 @@ fn parse_txt_format(content: &str) -> Vec<Group> {
                     let rest = line[genre_idx + 7..].trim().to_string();
                     if rest.starts_with('_') && rest.len() > 1 {
                         Some(rest[1..].to_string())
-                    } else { None }
-                } else { None }
-            } else { None };
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            groups.push(Group { name: group_name, pass: after_genre, channel: Vec::new() });
+            groups.push(Group {
+                name: group_name,
+                pass: after_genre,
+                channel: Vec::new(),
+            });
             current_group = Some(groups.len() - 1);
             group_directives = Directives::default();
             continue;
@@ -147,7 +159,11 @@ fn parse_txt_format(content: &str) -> Vec<Group> {
         }
 
         let group_idx = current_group.unwrap_or_else(|| {
-            groups.push(Group { name: String::new(), pass: None, channel: Vec::new() });
+            groups.push(Group {
+                name: String::new(),
+                pass: None,
+                channel: Vec::new(),
+            });
             current_group = Some(groups.len() - 1);
             current_group.unwrap()
         });
@@ -168,7 +184,9 @@ fn parse_m3u_format(content: &str) -> Vec<Group> {
     let mut global_catchup: Option<Catchup> = None;
 
     let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() { return groups; }
+    if lines.is_empty() {
+        return groups;
+    }
 
     if lines[0].contains("#EXTM3U") {
         global_catchup = parse_m3u_catchup(lines[0]);
@@ -179,11 +197,15 @@ fn parse_m3u_format(content: &str) -> Vec<Group> {
     let mut pending_directives = Directives::default();
     let mut start_line = 0;
 
-    if lines[0].contains("#EXTM3U") { start_line = 1; }
+    if lines[0].contains("#EXTM3U") {
+        start_line = 1;
+    }
 
     for i in start_line..lines.len() {
         let line = lines[i].trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         if line.starts_with("#EXTINF:") {
             let parsed = parse_extinf_line(line);
@@ -211,7 +233,9 @@ fn parse_m3u_format(content: &str) -> Vec<Group> {
         if line.contains("://") && pending_channel.is_some() {
             let (url, inline_headers) = parse_inline_headers(line);
             let pc = pending_channel.take().unwrap_or_else(|| Channel {
-                name: String::new(), urls: vec![], ..Default::default()
+                name: String::new(),
+                urls: vec![],
+                ..Default::default()
             });
             let group_name = std::mem::take(&mut pending_group_name);
 
@@ -219,7 +243,11 @@ fn parse_m3u_format(content: &str) -> Vec<Group> {
                 Some(&idx) => idx,
                 None => {
                     let idx = groups.len();
-                    groups.push(Group { name: group_name.clone(), pass: None, channel: Vec::new() });
+                    groups.push(Group {
+                        name: group_name.clone(),
+                        pass: None,
+                        channel: Vec::new(),
+                    });
                     group_map.insert(group_name.clone(), idx);
                     idx
                 }
@@ -249,7 +277,9 @@ fn parse_m3u_format(content: &str) -> Vec<Group> {
             apply_directives_to_channel(&mut ch, &merged_dirs);
             if pc.header.is_some() || !inline_headers.is_empty() {
                 let mut h = pc.header.unwrap_or_default();
-                for (k, v) in &inline_headers { h.insert(k.clone(), v.clone()); }
+                for (k, v) in &inline_headers {
+                    h.insert(k.clone(), v.clone());
+                }
                 ch.header = Some(h);
             }
 
@@ -268,48 +298,88 @@ fn parse_json_format(content: &str) -> Vec<Group> {
         Err(_) => return vec![],
     };
 
-    raw.into_iter().map(|g| {
-        let name = g.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-        let pass = g.get("pass").and_then(Value::as_str).map(String::from);
-        let channels = g.get("channel").and_then(Value::as_array).map(|arr| {
-            arr.iter().map(|c| {
-                let name = c.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let urls = c.get("urls").and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let header = c.get("header").and_then(|v| {
-                    v.as_object().map(|obj| {
-                        obj.iter().map(|(k, v)| {
-                            (k.clone(), v.as_str().unwrap_or("").to_string())
-                        }).collect()
-                    })
-                });
-                let catchup = c.get("catchup").map(|v| serde_json::from_value(v.clone()).unwrap_or_default());
-                let drm = c.get("drm").map(|v| serde_json::from_value(v.clone()).unwrap_or_default());
+    raw.into_iter()
+        .map(|g| {
+            let name = g
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let pass = g.get("pass").and_then(Value::as_str).map(String::from);
+            let channels = g
+                .get("channel")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|c| {
+                            let name = c
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let urls = c
+                                .get("urls")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let header = c.get("header").and_then(|v| {
+                                v.as_object().map(|obj| {
+                                    obj.iter()
+                                        .map(|(k, v)| {
+                                            (k.clone(), v.as_str().unwrap_or("").to_string())
+                                        })
+                                        .collect()
+                                })
+                            });
+                            let catchup = c
+                                .get("catchup")
+                                .map(|v| serde_json::from_value(v.clone()).unwrap_or_default());
+                            let drm = c
+                                .get("drm")
+                                .map(|v| serde_json::from_value(v.clone()).unwrap_or_default());
 
-                Channel {
-                    name,
-                    urls,
-                    number: c.get("number").and_then(Value::as_str).map(String::from),
-                    logo: c.get("logo").and_then(Value::as_str).map(String::from),
-                    epg: c.get("epg").and_then(Value::as_str).map(String::from),
-                    ua: c.get("ua").and_then(Value::as_str).map(String::from),
-                    click: c.get("click").and_then(Value::as_str).map(String::from),
-                    format: c.get("format").and_then(Value::as_str).map(String::from),
-                    origin: c.get("origin").and_then(Value::as_str).map(String::from),
-                    referer: c.get("referer").and_then(Value::as_str).map(String::from),
-                    tvg_id: c.get("tvgId").or_else(|| c.get("tvg_id")).and_then(Value::as_str).map(String::from),
-                    tvg_name: c.get("tvgName").or_else(|| c.get("tvg_name")).and_then(Value::as_str).map(String::from),
-                    header,
-                    parse: c.get("parse").and_then(Value::as_i64),
-                    catchup,
-                    drm,
-                }
-            }).collect()
-        }).unwrap_or_default();
+                            Channel {
+                                name,
+                                urls,
+                                number: c.get("number").and_then(Value::as_str).map(String::from),
+                                logo: c.get("logo").and_then(Value::as_str).map(String::from),
+                                epg: c.get("epg").and_then(Value::as_str).map(String::from),
+                                ua: c.get("ua").and_then(Value::as_str).map(String::from),
+                                click: c.get("click").and_then(Value::as_str).map(String::from),
+                                format: c.get("format").and_then(Value::as_str).map(String::from),
+                                origin: c.get("origin").and_then(Value::as_str).map(String::from),
+                                referer: c.get("referer").and_then(Value::as_str).map(String::from),
+                                tvg_id: c
+                                    .get("tvgId")
+                                    .or_else(|| c.get("tvg_id"))
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                tvg_name: c
+                                    .get("tvgName")
+                                    .or_else(|| c.get("tvg_name"))
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                                header,
+                                parse: c.get("parse").and_then(Value::as_i64),
+                                catchup,
+                                drm,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        Group { name, pass, channel: channels }
-    }).collect()
+            Group {
+                name,
+                pass,
+                channel: channels,
+            }
+        })
+        .collect()
 }
 
 // ==================== 辅助函数 ====================
@@ -317,57 +387,116 @@ fn parse_json_format(content: &str) -> Vec<Group> {
 impl Default for Channel {
     fn default() -> Self {
         Self {
-            name: String::new(), urls: vec![],
-            number: None, logo: None, epg: None,
-            ua: None, click: None, format: None,
-            origin: None, referer: None,
-            tvg_id: None, tvg_name: None,
-            header: None, parse: None,
-            catchup: None, drm: None,
+            name: String::new(),
+            urls: vec![],
+            number: None,
+            logo: None,
+            epg: None,
+            ua: None,
+            click: None,
+            format: None,
+            origin: None,
+            referer: None,
+            tvg_id: None,
+            tvg_name: None,
+            header: None,
+            parse: None,
+            catchup: None,
+            drm: None,
         }
     }
 }
 
 impl Default for Catchup {
-    fn default() -> Self { Self { catchup_type: None, source: None, replace: None } }
+    fn default() -> Self {
+        Self {
+            catchup_type: None,
+            source: None,
+            replace: None,
+        }
+    }
 }
 
 impl Default for Drm {
-    fn default() -> Self { Self { drm_type: String::new(), key: String::new(), header: None } }
+    fn default() -> Self {
+        Self {
+            drm_type: String::new(),
+            key: String::new(),
+            header: None,
+        }
+    }
 }
 
 fn parse_directive(line: &str) -> Option<Directives> {
     if line.starts_with("ua=") {
-        Some(Directives { ua: Some(line[3..].trim().to_string()), ..Default::default() })
+        Some(Directives {
+            ua: Some(line[3..].trim().to_string()),
+            ..Default::default()
+        })
     } else if line.starts_with("origin=") {
-        Some(Directives { origin: Some(line[7..].trim().to_string()), ..Default::default() })
+        Some(Directives {
+            origin: Some(line[7..].trim().to_string()),
+            ..Default::default()
+        })
     } else if line.starts_with("referer=") || line.starts_with("referrer=") {
         let eq_idx = line.find('=')?;
-        Some(Directives { referer: Some(line[eq_idx + 1..].trim().to_string()), ..Default::default() })
+        Some(Directives {
+            referer: Some(line[eq_idx + 1..].trim().to_string()),
+            ..Default::default()
+        })
     } else if line.starts_with("header=") {
         let header = serde_json::from_str::<HashMap<String, String>>(line[7..].trim()).ok();
-        Some(Directives { header, ..Default::default() })
+        Some(Directives {
+            header,
+            ..Default::default()
+        })
     } else if line.starts_with("format=") {
-        Some(Directives { format: Some(map_format(line[7..].trim())), ..Default::default() })
+        Some(Directives {
+            format: Some(map_format(line[7..].trim())),
+            ..Default::default()
+        })
     } else if line.starts_with("parse=") {
-        Some(Directives { parse: line[6..].trim().parse::<i64>().ok(), ..Default::default() })
+        Some(Directives {
+            parse: line[6..].trim().parse::<i64>().ok(),
+            ..Default::default()
+        })
     } else if line.starts_with("click=") {
-        Some(Directives { click: Some(line[6..].trim().to_string()), ..Default::default() })
+        Some(Directives {
+            click: Some(line[6..].trim().to_string()),
+            ..Default::default()
+        })
     } else if line.starts_with("forceKey=") {
-        Some(Directives { force_key: line[9..].trim() == "true", ..Default::default() })
+        Some(Directives {
+            force_key: line[9..].trim() == "true",
+            ..Default::default()
+        })
     } else {
         None
     }
 }
 
 fn merge_directives(target: &mut Directives, src: &Directives) {
-    if src.ua.is_some() { target.ua = src.ua.clone(); }
-    if src.origin.is_some() { target.origin = src.origin.clone(); }
-    if src.referer.is_some() { target.referer = src.referer.clone(); }
-    if src.format.is_some() { target.format = src.format.clone(); }
-    if src.parse.is_some() { target.parse = src.parse; }
-    if src.click.is_some() { target.click = src.click.clone(); }
-    if src.force_key { target.force_key = true; }
+    if src.ua.is_some() {
+        target.ua = src.ua.clone();
+    }
+    if src.origin.is_some() {
+        target.origin = src.origin.clone();
+    }
+    if src.referer.is_some() {
+        target.referer = src.referer.clone();
+    }
+    if src.format.is_some() {
+        target.format = src.format.clone();
+    }
+    if src.parse.is_some() {
+        target.parse = src.parse;
+    }
+    if src.click.is_some() {
+        target.click = src.click.clone();
+    }
+    if src.force_key {
+        target.force_key = true;
+    }
     if let Some(ref h) = src.header {
         merge_header(target, h);
     }
@@ -375,7 +504,9 @@ fn merge_directives(target: &mut Directives, src: &Directives) {
 
 fn merge_header(dirs: &mut Directives, headers: &HashMap<String, String>) {
     let mut h = dirs.header.take().unwrap_or_default();
-    for (k, v) in headers { h.insert(k.clone(), v.clone()); }
+    for (k, v) in headers {
+        h.insert(k.clone(), v.clone());
+    }
     dirs.header = Some(h);
 }
 
@@ -393,15 +524,25 @@ fn parse_channel_urls(name: &str, url_part: &str, directives: &Directives) -> Ch
 
     for segment in url_part.split('#') {
         let trimmed = segment.trim();
-        if trimmed.is_empty() { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
         let (url, headers) = parse_inline_headers(trimmed);
         urls.push(url);
-        for (k, v) in headers { all_headers.insert(k, v); }
+        for (k, v) in headers {
+            all_headers.insert(k, v);
+        }
     }
 
-    let mut ch = Channel { name: name.to_string(), urls, ..Default::default() };
+    let mut ch = Channel {
+        name: name.to_string(),
+        urls,
+        ..Default::default()
+    };
     apply_directives_to_channel(&mut ch, directives);
-    if !all_headers.is_empty() { ch.header = Some(all_headers); }
+    if !all_headers.is_empty() {
+        ch.header = Some(all_headers);
+    }
     ch
 }
 
@@ -422,39 +563,67 @@ fn parse_inline_headers(url: &str) -> (String, HashMap<String, String>) {
         };
         let key = decode_inline_part(&pair[..eq_idx]);
         let value = decode_inline_part(&pair[eq_idx + 1..]);
-        if !key.is_empty() { headers.insert(key, value); }
+        if !key.is_empty() {
+            headers.insert(key, value);
+        }
     }
 
     (actual_url, headers)
 }
 
 fn decode_inline_part(value: &str) -> String {
-    urlencoding::decode(value).map(|s| s.to_string()).unwrap_or_else(|_| value.to_string())
+    urlencoding::decode(value)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn apply_directives_to_channel(ch: &mut Channel, dirs: &Directives) {
-    if let Some(ref ua) = dirs.ua { ch.ua = Some(ua.clone()); }
-    if let Some(ref origin) = dirs.origin { ch.origin = Some(origin.clone()); }
-    if let Some(ref referer) = dirs.referer { ch.referer = Some(referer.clone()); }
-    if let Some(ref format) = dirs.format { ch.format = Some(format.clone()); }
-    if let Some(parse) = dirs.parse { ch.parse = Some(parse); }
-    if let Some(ref click) = dirs.click { ch.click = Some(click.clone()); }
+    if let Some(ref ua) = dirs.ua {
+        ch.ua = Some(ua.clone());
+    }
+    if let Some(ref origin) = dirs.origin {
+        ch.origin = Some(origin.clone());
+    }
+    if let Some(ref referer) = dirs.referer {
+        ch.referer = Some(referer.clone());
+    }
+    if let Some(ref format) = dirs.format {
+        ch.format = Some(format.clone());
+    }
+    if let Some(parse) = dirs.parse {
+        ch.parse = Some(parse);
+    }
+    if let Some(ref click) = dirs.click {
+        ch.click = Some(click.clone());
+    }
     if let Some(ref header) = dirs.header {
         let mut h = ch.header.take().unwrap_or_default();
-        for (k, v) in header { h.insert(k.clone(), v.clone()); }
+        for (k, v) in header {
+            h.insert(k.clone(), v.clone());
+        }
         ch.header = Some(h);
     }
 }
 
 fn merge_channels(target: &mut Channel, src: &Channel) {
-    if src.ua.is_some() { target.ua = src.ua.clone(); }
-    if src.referer.is_some() { target.referer = src.referer.clone(); }
-    if src.origin.is_some() { target.origin = src.origin.clone(); }
-    if src.drm.is_some() { target.drm = src.drm.clone(); }
+    if src.ua.is_some() {
+        target.ua = src.ua.clone();
+    }
+    if src.referer.is_some() {
+        target.referer = src.referer.clone();
+    }
+    if src.origin.is_some() {
+        target.origin = src.origin.clone();
+    }
+    if src.drm.is_some() {
+        target.drm = src.drm.clone();
+    }
     if src.header.is_some() {
         let mut h = target.header.take().unwrap_or_default();
         if let Some(ref sh) = src.header {
-            for (k, v) in sh { h.insert(k.clone(), v.clone()); }
+            for (k, v) in sh {
+                h.insert(k.clone(), v.clone());
+            }
         }
         target.header = Some(h);
     }
@@ -463,7 +632,8 @@ fn merge_channels(target: &mut Channel, src: &Channel) {
 fn extract_attr(line: &str, attr: &str) -> Option<String> {
     let pattern = format!(r#"{}=["']([^"']*)["']"#, regex::escape(attr));
     let re = regex::Regex::new(&pattern).ok()?;
-    re.captures(line).and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    re.captures(line)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
 fn parse_extinf_line(line: &str) -> M3uParsedLine {
@@ -495,7 +665,10 @@ fn parse_extinf_line(line: &str) -> M3uParsedLine {
         });
     }
 
-    M3uParsedLine { channel: Some(channel), group_name }
+    M3uParsedLine {
+        channel: Some(channel),
+        group_name,
+    }
 }
 
 fn parse_m3u_catchup(line: &str) -> Option<Catchup> {
@@ -503,9 +676,15 @@ fn parse_m3u_catchup(line: &str) -> Option<Catchup> {
     let catchup_source = extract_attr(line, "catchup-source");
     let catchup_replace = extract_attr(line, "catchup-replace");
 
-    if catchup_type.is_none() && catchup_source.is_none() { return None; }
+    if catchup_type.is_none() && catchup_source.is_none() {
+        return None;
+    }
 
-    Some(Catchup { catchup_type, source: catchup_source, replace: catchup_replace })
+    Some(Catchup {
+        catchup_type,
+        source: catchup_source,
+        replace: catchup_replace,
+    })
 }
 
 struct M3uParsedLine {
@@ -521,26 +700,41 @@ struct M3uDirectiveResult {
 fn parse_m3u_directive(line: &str) -> Option<M3uDirectiveResult> {
     if line.starts_with("#EXTHTTP:") {
         let header: HashMap<String, String> = serde_json::from_str(&line[9..].trim()).ok()?;
-        return Some(M3uDirectiveResult { channel: Some(Channel { header: Some(header), ..Default::default() }), directives: None });
+        return Some(M3uDirectiveResult {
+            channel: Some(Channel {
+                header: Some(header),
+                ..Default::default()
+            }),
+            directives: None,
+        });
     }
 
     if line.starts_with("#EXTVLCOPT:http-user-agent=") {
         return Some(M3uDirectiveResult {
-            channel: Some(Channel { ua: Some(line[27..].trim().to_string()), ..Default::default() }),
+            channel: Some(Channel {
+                ua: Some(line[27..].trim().to_string()),
+                ..Default::default()
+            }),
             directives: None,
         });
     }
 
     if line.starts_with("#EXTVLCOPT:http-referrer=") {
         return Some(M3uDirectiveResult {
-            channel: Some(Channel { referer: Some(line[25..].trim().to_string()), ..Default::default() }),
+            channel: Some(Channel {
+                referer: Some(line[25..].trim().to_string()),
+                ..Default::default()
+            }),
             directives: None,
         });
     }
 
     if line.starts_with("#EXTVLCOPT:http-origin=") {
         return Some(M3uDirectiveResult {
-            channel: Some(Channel { origin: Some(line[22..].trim().to_string()), ..Default::default() }),
+            channel: Some(Channel {
+                origin: Some(line[22..].trim().to_string()),
+                ..Default::default()
+            }),
             directives: None,
         });
     }
@@ -550,27 +744,44 @@ fn parse_m3u_directive(line: &str) -> Option<M3uDirectiveResult> {
     }
 
     if let Some(dirs) = parse_directive(line) {
-        return Some(M3uDirectiveResult { channel: None, directives: Some(dirs) });
+        return Some(M3uDirectiveResult {
+            channel: None,
+            directives: Some(dirs),
+        });
     }
 
     None
 }
 
 fn parse_kodi_prop(prop: &str) -> M3uDirectiveResult {
-    let mut result = M3uDirectiveResult { channel: None, directives: None };
+    let mut result = M3uDirectiveResult {
+        channel: None,
+        directives: None,
+    };
 
     if prop.starts_with("inputstream.adaptive.license_type=") {
         let drm_type = prop[34..].trim();
         result.channel = Some(Channel {
-            drm: Some(Drm { drm_type: drm_type.to_string(), key: String::new(), header: None }),
+            drm: Some(Drm {
+                drm_type: drm_type.to_string(),
+                key: String::new(),
+                header: None,
+            }),
             ..Default::default()
         });
     } else if prop.starts_with("inputstream.adaptive.license_key=") {
         let license_key = prop[33..].trim();
         let pipe_idx = license_key.find('|');
-        let key = pipe_idx.map(|i| &license_key[..i]).unwrap_or(license_key).to_string();
+        let key = pipe_idx
+            .map(|i| &license_key[..i])
+            .unwrap_or(license_key)
+            .to_string();
 
-        let mut drm = Drm { drm_type: String::new(), key, header: None };
+        let mut drm = Drm {
+            drm_type: String::new(),
+            key,
+            header: None,
+        };
         if let Some(pi) = pipe_idx {
             let header_part = &license_key[pi + 1..];
             let mut header = HashMap::new();
@@ -588,11 +799,16 @@ fn parse_kodi_prop(prop: &str) -> M3uDirectiveResult {
             if let Some(ref mut ch) = result.channel {
                 if let Some(ref mut d) = ch.drm {
                     d.key = drm.key.clone();
-                    if drm.header.is_some() { d.header = drm.header.clone(); }
+                    if drm.header.is_some() {
+                        d.header = drm.header.clone();
+                    }
                 }
             }
         } else {
-            result.channel = Some(Channel { drm: Some(drm), ..Default::default() });
+            result.channel = Some(Channel {
+                drm: Some(drm),
+                ..Default::default()
+            });
         }
     } else if prop.starts_with("inputstream.adaptive.drm_legacy=") {
         let legacy = prop[32..].trim();
@@ -609,7 +825,10 @@ fn parse_kodi_prop(prop: &str) -> M3uDirectiveResult {
         }
     } else if prop.starts_with("inputstream.adaptive.manifest_type=") {
         let manifest_type = map_format(prop[35..].trim());
-        result.directives = Some(Directives { format: Some(manifest_type), ..Default::default() });
+        result.directives = Some(Directives {
+            format: Some(manifest_type),
+            ..Default::default()
+        });
     } else if prop.starts_with("inputstream.adaptive.stream_headers=")
         || prop.starts_with("inputstream.adaptive.common_headers=")
     {
@@ -627,14 +846,20 @@ fn parse_kodi_prop(prop: &str) -> M3uDirectiveResult {
                     match k.as_str() {
                         "drmScheme" => drm_type = Some(v),
                         "drmLicense" => drm_key = Some(v),
-                        _ => { header.insert(k, v); }
+                        _ => {
+                            header.insert(k, v);
+                        }
                     }
                 }
             }
         }
 
-        let mut ch = Channel { ..Default::default() };
-        if !header.is_empty() { ch.header = Some(header); }
+        let mut ch = Channel {
+            ..Default::default()
+        };
+        if !header.is_empty() {
+            ch.header = Some(header);
+        }
         if drm_type.is_some() || drm_key.is_some() {
             ch.drm = Some(Drm {
                 drm_type: drm_type.unwrap_or_default(),
@@ -663,7 +888,9 @@ const GET_PREFERRED_EXTENSIONS: &[&str] = &["m3u8", "m3u", "mpd", "xml", "json",
 
 fn should_prefer_get(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url);
-    GET_PREFERRED_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
+    GET_PREFERRED_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(ext))
 }
 
 /// 测试单个 URL 连通性
@@ -674,10 +901,21 @@ pub async fn test_url(url: &str, timeout_ms: u64) -> TestResult {
         .build()
     {
         Ok(c) => c,
-        Err(e) => return TestResult { url: url.to_string(), alive: false, latency: -1, error: Some(e.to_string()) },
+        Err(e) => {
+            return TestResult {
+                url: url.to_string(),
+                alive: false,
+                latency: -1,
+                error: Some(e.to_string()),
+            }
+        }
     };
 
-    let method = if should_prefer_get(url) { "GET" } else { "HEAD" };
+    let method = if should_prefer_get(url) {
+        "GET"
+    } else {
+        "HEAD"
+    };
 
     let result = if method == "GET" {
         client.get(url).send().await
@@ -701,19 +939,25 @@ pub async fn test_url(url: &str, timeout_ms: u64) -> TestResult {
                 url: url.to_string(),
                 alive: status < 400,
                 latency,
-                error: if status >= 400 { Some(format!("HTTP {}", status)) } else { None },
+                error: if status >= 400 {
+                    Some(format!("HTTP {}", status))
+                } else {
+                    None
+                },
             }
         }
-        Err(e) => {
-            TestResult {
-                url: url.to_string(),
-                alive: false,
-                latency: -1,
-                error: if e.is_timeout() { Some("Timeout".to_string()) }
-                       else if e.is_connect() { Some(format!("Connect error: {}", e)) }
-                       else { Some(e.to_string()) },
-            }
-        }
+        Err(e) => TestResult {
+            url: url.to_string(),
+            alive: false,
+            latency: -1,
+            error: if e.is_timeout() {
+                Some("Timeout".to_string())
+            } else if e.is_connect() {
+                Some(format!("Connect error: {}", e))
+            } else {
+                Some(e.to_string())
+            },
+        },
     }
 }
 
@@ -731,19 +975,32 @@ pub fn normalize_name(name: &str) -> String {
 pub fn dedup_channels(groups: Vec<Group>) -> Vec<Group> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    groups.into_iter().map(|mut group| {
-        group.channel = group.channel.into_iter()
-            .filter(|ch| seen.insert(normalize_name(&ch.name)))
-            .collect();
-        group
-    }).filter(|g| !g.channel.is_empty()).collect()
+    groups
+        .into_iter()
+        .map(|mut group| {
+            group.channel = group
+                .channel
+                .into_iter()
+                .filter(|ch| seen.insert(normalize_name(&ch.name)))
+                .collect();
+            group
+        })
+        .filter(|g| !g.channel.is_empty())
+        .collect()
 }
 
 // ==================== 分类器 ====================
 
 /// 国家/地区代码
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Country { China, Uk, Us, Japan, Korea, Other }
+pub enum Country {
+    China,
+    Uk,
+    Us,
+    Japan,
+    Korea,
+    Other,
+}
 
 /// 频道分类
 #[derive(Debug, Clone)]
@@ -772,7 +1029,8 @@ pub fn classify_channel(name: &str) -> (Country, String, f64) {
 
     // 检测中国频道 (CCTV 系列)
     if lower.contains("cctv") || lower.starts_with("cctv") {
-        let num: f64 = lower.chars()
+        let num: f64 = lower
+            .chars()
             .skip_while(|c| !c.is_ascii_digit())
             .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect::<String>()
@@ -787,7 +1045,8 @@ pub fn classify_channel(name: &str) -> (Country, String, f64) {
 
     // CCTV 子台 (CCTV-1, CCTV-5 等)
     if lower.starts_with("cctv") || lower.contains("cctv") {
-        let num: f64 = lower.trim_start_matches("cctv")
+        let num: f64 = lower
+            .trim_start_matches("cctv")
             .trim_start_matches('-')
             .trim_start_matches(' ')
             .chars()
@@ -804,34 +1063,101 @@ pub fn classify_channel(name: &str) -> (Country, String, f64) {
     }
 
     // 地方台
-    let local_keywords = ["上海", "北京", "广东", "深圳", "浙江", "江苏", "湖南",
-                          "湖北", "四川", "山东", "福建", "天津", "重庆", "安徽",
-                          "辽宁", "河南", "河北", "陕西", "云南", "贵州", "广西",
-                          "江西", "山西", "吉林", "黑龙江", "内蒙古", "新疆", "甘肃",
-                          "海南", "宁夏", "青海", "西藏", "channel", "本地"];
+    let local_keywords = [
+        "上海",
+        "北京",
+        "广东",
+        "深圳",
+        "浙江",
+        "江苏",
+        "湖南",
+        "湖北",
+        "四川",
+        "山东",
+        "福建",
+        "天津",
+        "重庆",
+        "安徽",
+        "辽宁",
+        "河南",
+        "河北",
+        "陕西",
+        "云南",
+        "贵州",
+        "广西",
+        "江西",
+        "山西",
+        "吉林",
+        "黑龙江",
+        "内蒙古",
+        "新疆",
+        "甘肃",
+        "海南",
+        "宁夏",
+        "青海",
+        "西藏",
+        "channel",
+        "本地",
+    ];
     if local_keywords.iter().any(|k| lower.contains(k)) {
         return (Country::China, "地方".to_string(), 0.0);
     }
 
     // 英国频道
-    let uk_keywords = ["bbc", "itv", "channel 4", "channel 5", "sky news",
-                       "dave", "drama", "film4", "uktv", "british"];
+    let uk_keywords = [
+        "bbc",
+        "itv",
+        "channel 4",
+        "channel 5",
+        "sky news",
+        "dave",
+        "drama",
+        "film4",
+        "uktv",
+        "british",
+    ];
     if uk_keywords.iter().any(|k| lower.contains(k)) || lower.ends_with(".uk") {
         return (Country::Uk, guess_category(&lower).to_string(), 0.0);
     }
 
     // 美国频道
-    let us_keywords = ["cnn", "fox", "nbc", "abc", "cbs", "hbo", "discovery",
-                       "national geographic", "history channel", "espn", "mtv",
-                       "comedy central", "tlc", "usa network", "pbs", "nfl",
-                       "nba", "mlb", "nhl"];
+    let us_keywords = [
+        "cnn",
+        "fox",
+        "nbc",
+        "abc",
+        "cbs",
+        "hbo",
+        "discovery",
+        "national geographic",
+        "history channel",
+        "espn",
+        "mtv",
+        "comedy central",
+        "tlc",
+        "usa network",
+        "pbs",
+        "nfl",
+        "nba",
+        "mlb",
+        "nhl",
+    ];
     if us_keywords.iter().any(|k| lower.contains(k)) {
         return (Country::Us, guess_category(&lower).to_string(), 0.0);
     }
 
     // 日本频道
-    let jp_keywords = ["nhk", "tv asahi", "fuji tv", "tbs", "tv tokyo", "ntv",
-                       "japan", "東京", "テレビ"];
+    let jp_keywords = [
+        "nhk",
+        "tv asahi",
+        "fuji tv",
+        "tbs",
+        "tv tokyo",
+        "ntv",
+        "japan",
+        "東京",
+        "テレビ",
+    ];
     if jp_keywords.iter().any(|k| lower.contains(k)) {
         return (Country::Japan, guess_category(&lower).to_string(), 0.0);
     }
@@ -848,12 +1174,37 @@ pub fn classify_channel(name: &str) -> (Country, String, f64) {
 fn guess_category(name: &str) -> &str {
     let lower = name.to_lowercase();
     let categories: &[(&[&str], &str)] = &[
-        (&["news", "bbc", "cnn", "nbc", "abc", "cbs", "pbs", "itv", "sky", "新闻", "報導"], "News"),
-        (&["sport", "espn", "nfl", "nba", "mlb", "nhl", "体育", "運動", "赛事"], "Sports"),
+        (
+            &[
+                "news", "bbc", "cnn", "nbc", "abc", "cbs", "pbs", "itv", "sky", "新闻", "報導",
+            ],
+            "News",
+        ),
+        (
+            &[
+                "sport", "espn", "nfl", "nba", "mlb", "nhl", "体育", "運動", "赛事",
+            ],
+            "Sports",
+        ),
         (&["movie", "film", "hbo", "电影", "影院", "影视"], "Movies"),
         (&["music", "mtv", "音乐", "音樂", "mv"], "Music"),
-        (&["kids", "children", "disney", "cartoon", "儿童", "卡通", "少儿"], "Kids"),
-        (&["document", "discovery", "national geographic", "history", "纪录片", "纪实"], "Documentary"),
+        (
+            &[
+                "kids", "children", "disney", "cartoon", "儿童", "卡通", "少儿",
+            ],
+            "Kids",
+        ),
+        (
+            &[
+                "document",
+                "discovery",
+                "national geographic",
+                "history",
+                "纪录片",
+                "纪实",
+            ],
+            "Documentary",
+        ),
         (&["drama", "剧集", "电视剧", "连续剧"], "Drama"),
         (&["entertain", "综艺", "娱乐", "真人秀"], "Entertainment"),
         (&["education", "学习", "教育", "教学"], "Education"),
@@ -1015,12 +1366,22 @@ mod tests {
 
     #[test]
     fn dedup_removes_duplicates() {
-        let groups = vec![
-            Group { name: "CCTV".to_string(), pass: None, channel: vec![
-                Channel { name: "CCTV-1".to_string(), urls: vec!["http://a.com".to_string()], ..Default::default() },
-                Channel { name: "cctv 1".to_string(), urls: vec!["http://b.com".to_string()], ..Default::default() },
-            ]},
-        ];
+        let groups = vec![Group {
+            name: "CCTV".to_string(),
+            pass: None,
+            channel: vec![
+                Channel {
+                    name: "CCTV-1".to_string(),
+                    urls: vec!["http://a.com".to_string()],
+                    ..Default::default()
+                },
+                Channel {
+                    name: "cctv 1".to_string(),
+                    urls: vec!["http://b.com".to_string()],
+                    ..Default::default()
+                },
+            ],
+        }];
         let result = dedup_channels(groups);
         assert_eq!(result[0].channel.len(), 1);
     }

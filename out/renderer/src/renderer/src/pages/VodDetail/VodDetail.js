@@ -15,6 +15,18 @@ function isVideoFormat(url) {
         /\/m3u8\?|\/playlist\.m3u8|\/index\.m3u8/i.test(url) ||
         /^https?:\/\/[^/]+\/.+\.(m3u8|mp4|flv|ts|mpd)(\?|$)/i.test(url);
 }
+function formatResumeTime(seconds = 0) {
+    const safeSeconds = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(safeSeconds / 3600);
+    const m = Math.floor((safeSeconds % 3600) / 60);
+    const s = safeSeconds % 60;
+    if (h > 0)
+        return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
+}
+function canResume(history) {
+    return Boolean(history && !history.completed && (history.positionSeconds || 0) > 5);
+}
 export default function VodDetail() {
     const { siteKey, vodId } = useParams();
     const { currentConfig } = useConfigStore();
@@ -28,6 +40,7 @@ export default function VodDetail() {
     const [isResolving, setIsResolving] = useState(false);
     const [allSourcesExhausted, setAllSourcesExhausted] = useState(false);
     const [loadError, setLoadError] = useState(null);
+    const [resumeHistory, setResumeHistory] = useState(null);
     // 当前正在播放的源信息
     const [currentPlaySource, setCurrentPlaySource] = useState(null);
     const switchingRef = useRef(false);
@@ -45,6 +58,7 @@ export default function VodDetail() {
         setIsLoading(true);
         setLoadError(null);
         setAllSourcesExhausted(false);
+        setResumeHistory(null);
         failureHandledRef.current = false;
         resetSourceSwitch();
         loadVodDetail(siteKey, vodId);
@@ -62,6 +76,15 @@ export default function VodDetail() {
                 return;
             }
             setDetail(vod);
+            let savedHistory = null;
+            try {
+                const historyList = (await historyApi.list());
+                savedHistory = historyList.find((item) => item.siteKey === sKey && item.vodId === vId) || null;
+                setResumeHistory(savedHistory);
+            }
+            catch {
+                setResumeHistory(null);
+            }
             // 解析播放源和集数
             const playFroms = (vod.vod_play_from || '').split('$$$').filter(Boolean);
             const urlGroups = (vod.vod_play_url || '').split('$$$');
@@ -111,7 +134,10 @@ export default function VodDetail() {
             setLineSources(parsedLines);
             // 优先选择含直链标识的线路（m3u8/mp4/mpd 等）
             const bestLineIdx = parsedLines.findIndex((l) => /m3u8|mp4|mpd|flv|ts/i.test(l.name) && l.episodes.length > 0);
-            setActiveLineIndex(bestLineIdx >= 0 ? bestLineIdx : 0);
+            const resumeLineIdx = canResume(savedHistory)
+                ? Math.min(Math.max(savedHistory.sourceIndex || 0, 0), Math.max(0, parsedLines.length - 1))
+                : -1;
+            setActiveLineIndex(resumeLineIdx >= 0 ? resumeLineIdx : bestLineIdx >= 0 ? bestLineIdx : 0);
             setIsLoading(false);
         }
         catch (err) {
@@ -173,13 +199,13 @@ export default function VodDetail() {
         switchingRef.current = true;
         try {
             setSourceSwitchState('switching', `正在加载「${source.siteName}」...`);
-            markCurrentSourceBroken(source.siteKey, source.vodId);
             // 在当前页面内加载新源的详情
             try {
                 const res = await siteApi.detailContent(source.siteKey, [source.vodId]);
                 const result = res.data || res;
                 const vod = result.list?.[0];
                 if (!vod) {
+                    markCurrentSourceBroken(source.siteKey, source.vodId);
                     setSourceSwitchState('idle', '加载失败，尝试下一个...');
                     setTimeout(() => { if (mountedRef.current)
                         setSourceSwitchState('idle', ''); }, 2000);
@@ -240,6 +266,7 @@ export default function VodDetail() {
                     }
                 }
                 if (newLines.length === 0) {
+                    markCurrentSourceBroken(source.siteKey, source.vodId);
                     setSourceSwitchState('idle', '该源无播放数据');
                     setTimeout(() => { if (mountedRef.current)
                         setSourceSwitchState('idle', ''); }, 2000);
@@ -256,6 +283,7 @@ export default function VodDetail() {
                     setSourceSwitchState('idle', ''); }, 2000);
             }
             catch (err) {
+                markCurrentSourceBroken(source.siteKey, source.vodId);
                 setSourceSwitchState('idle', '加载失败');
                 setTimeout(() => { if (mountedRef.current)
                     setSourceSwitchState('idle', ''); }, 2000);
@@ -315,10 +343,11 @@ export default function VodDetail() {
         };
     }, [activeLine, activeLineIndex, currentEpisodeIndex, switchToNextSource]);
     // 播放集数
-    const handlePlay = async (lineIdx, epIdx) => {
+    const handlePlay = async (lineIdx, epIdx, startPositionSeconds = 0) => {
         const line = lineSources[lineIdx];
         if (!line || !line.episodes[epIdx])
             return;
+        window.dispatchEvent(new Event('player:flushHistory'));
         setIsResolving(true);
         setPlaybackPhase('resolving', '正在获取播放信息...');
         setCurrentSourceIndex(lineIdx);
@@ -354,8 +383,8 @@ export default function VodDetail() {
                 setPlaybackPhase('connecting', '正在连接播放地址...');
                 const playableUrl = await getPlayableMediaUrl(initialUrl, initialHeader);
                 setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId });
-                setVod(targetDetail, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey);
-                setCurrentEpisodeIndex(epIdx, playableUrl);
+                setVod(targetDetail, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey, line.name, startPositionSeconds);
+                setCurrentEpisodeIndex(epIdx, playableUrl, startPositionSeconds);
                 setShowPlayer(true);
             }
             else {
@@ -363,7 +392,7 @@ export default function VodDetail() {
                 setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId });
                 setShowPlayer(true);
                 setPlaybackPhase('resolving', '正在解析播放地址...');
-                setVod(targetDetail, line.episodes, lineIdx, '__resolving__', initialHeader, targetSiteKey);
+                setVod(targetDetail, line.episodes, lineIdx, '__resolving__', initialHeader, targetSiteKey, line.name, startPositionSeconds);
                 // 异步解析
                 try {
                     const parseRes = await siteApi.superParse({
@@ -377,21 +406,35 @@ export default function VodDetail() {
                         const url = await getPlayableMediaUrl(parseRes.data.url, parseRes.data.header || initialHeader);
                         const header = parseRes.data.header || initialHeader;
                         const store = usePlayerStore.getState();
-                        setCurrentEpisodeIndex(epIdx, url);
+                        setCurrentEpisodeIndex(epIdx, url, startPositionSeconds);
                         store.play(url);
+                        if (startPositionSeconds > 0)
+                            store.setCurrentTime(startPositionSeconds);
                     }
                     else {
                         // 所有解析都失败
-                        setPlaybackError('解析完全失败');
+                        setPlaybackError(parseRes.error || '解析失败：未找到可播放地址', {
+                            stage: 'parse',
+                            errorKind: 'parse_failed',
+                            protocol: 'unknown',
+                            sourceId: `${targetSiteKey}::${targetVodId}`,
+                            nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+                        });
                         window.dispatchEvent(new CustomEvent('vod:playFailed', {
-                            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析完全失败', autoSwitch: true }
+                            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析失败：未找到可播放地址', autoSwitch: true }
                         }));
                     }
                 }
                 catch {
-                    setPlaybackError('解析异常');
+                    setPlaybackError('解析异常：无法完成播放地址解析', {
+                        stage: 'parse',
+                        errorKind: 'parse_failed',
+                        protocol: 'unknown',
+                        sourceId: `${targetSiteKey}::${targetVodId}`,
+                        nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+                    });
                     window.dispatchEvent(new CustomEvent('vod:playFailed', {
-                        detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常', autoSwitch: true }
+                        detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常：无法完成播放地址解析', autoSwitch: true }
                     }));
                 }
             }
@@ -404,14 +447,32 @@ export default function VodDetail() {
                 siteKey: targetSiteKey,
                 vodName: targetDetail?.vod_name || '',
                 vodPic: targetDetail?.vod_pic,
+                vodRemarks: targetDetail?.vod_remarks,
                 source: episode.name ? `${line.name} · ${episode.name}` : line.name,
-                progress: 0
+                progress: startPositionSeconds > 0 && resumeHistory?.duration
+                    ? Math.max(0, Math.min(100, Math.round((startPositionSeconds / resumeHistory.duration) * 100)))
+                    : 0,
+                episodeId: String(epIdx),
+                episodeName: episode.name || `第 ${epIdx + 1} 集`,
+                episodeIndex: epIdx,
+                sourceIndex: lineIdx,
+                sourceName: line.name,
+                urlIdentifier: episode.url.split('?')[0].slice(0, 240),
+                duration: resumeHistory?.duration || 0,
+                positionSeconds: startPositionSeconds,
+                completed: false
             }).catch(() => { });
         }
         catch (err) {
             setIsResolving(false);
             setLoadError(err?.message || '获取播放信息失败');
-            setPlaybackError(err?.message || '获取播放信息失败');
+            setPlaybackError(err?.message || '获取播放信息失败', {
+                stage: 'connect',
+                errorKind: 'unknown',
+                protocol: 'unknown',
+                sourceId: `${targetSiteKey}::${targetVodId}`,
+                nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
+            });
             window.dispatchEvent(new CustomEvent('vod:playFailed', {
                 detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: 'playerContent 失败', autoSwitch: true }
             }));
@@ -441,13 +502,24 @@ export default function VodDetail() {
     if (loadError && !detail) {
         return (_jsxs("div", { className: "h-full flex flex-col items-center justify-center p-8 text-center", children: [_jsx(AlertCircle, { className: "w-12 h-12 text-red-400 mb-4" }), _jsx("h2", { className: "text-lg font-semibold text-text-primary mb-2", children: "\u65E0\u6CD5\u52A0\u8F7D\u8BE6\u60C5" }), _jsx("p", { className: "text-sm text-text-muted mb-6", children: loadError }), _jsxs("div", { className: "flex gap-3", children: [_jsx("button", { onClick: () => window.history.back(), className: "px-4 py-2 border border-[#2a2a2a] text-text-secondary rounded-lg hover:bg-bg-hover", children: "\u8FD4\u56DE" }), _jsx("button", { onClick: () => window.location.reload(), className: "px-4 py-2 bg-accent text-bg-primary rounded-lg font-medium", children: "\u91CD\u65B0\u52A0\u8F7D" })] })] }));
     }
+    const resumeLineIndex = canResume(resumeHistory)
+        ? Math.min(Math.max(resumeHistory.sourceIndex || 0, 0), Math.max(0, lineSources.length - 1))
+        : -1;
+    const resumeEpisodeIndex = canResume(resumeHistory)
+        ? Math.min(Math.max(resumeHistory.episodeIndex || 0, 0), Math.max(0, (lineSources[resumeLineIndex]?.episodes.length || 1) - 1))
+        : -1;
+    const resumeEpisodeName = resumeEpisodeIndex >= 0
+        ? lineSources[resumeLineIndex]?.episodes[resumeEpisodeIndex]?.name || resumeHistory?.episodeName
+        : '';
     return (_jsxs("div", { className: "h-full overflow-y-auto scrollbar-dark", children: [showPlayer && (_jsxs("div", { className: "relative aspect-video bg-black", children: [_jsx(VideoPlayer, {}), _jsx("button", { onClick: () => setShowPlayer(false), className: "absolute top-3 left-3 z-30 p-2 bg-black/50 rounded-full text-white/80 hover:text-white", children: _jsx(ArrowLeft, { className: "w-5 h-5" }) }), allSourcesExhausted && (_jsxs("div", { className: "absolute inset-0 z-20 bg-black/85 flex flex-col items-center justify-center text-center p-6", children: [_jsx(AlertCircle, { className: "w-12 h-12 text-red-400 mb-3" }), _jsx("h3", { className: "text-lg font-semibold text-white mb-2", children: "\u6240\u6709\u6E90\u5747\u4E0D\u53EF\u7528" }), _jsx("p", { className: "text-sm text-white/70 mb-4", children: "\u5DF2\u5C1D\u8BD5\u591A\u4E2A\u6E90\uFF0C\u4ECD\u7136\u65E0\u6CD5\u64AD\u653E" }), _jsxs("div", { className: "flex gap-2", children: [_jsxs("button", { onClick: () => {
                                             if (activeLine)
                                                 handlePlay(activeLineIndex, currentEpisodeIndex || 0);
-                                        }, className: "flex items-center gap-2 px-4 py-2 bg-accent text-bg-primary rounded-lg font-medium hover:bg-accent-hover", children: [_jsx(RotateCw, { className: "w-4 h-4" }), "\u91CD\u8BD5\u5F53\u524D"] }), _jsxs("button", { onClick: switchToNextSource, className: "flex items-center gap-2 px-4 py-2 border border-white/30 text-white rounded-lg hover:bg-white/10", children: [_jsx(RefreshCw, { className: "w-4 h-4" }), "\u5207\u6362\u5176\u4ED6\u6E90"] })] })] }))] })), (sourceSwitchState !== 'idle' || sourceSwitchMessage) && (_jsxs("div", { className: "flex items-center gap-2 px-4 py-2 bg-bg-secondary border-b border-[#2a2a2a] text-xs", children: [sourceSwitchState === 'searching' || sourceSwitchState === 'switching' ? (_jsx(Loader2, { className: "w-3.5 h-3.5 animate-spin text-accent shrink-0" })) : (_jsx(Globe, { className: "w-3.5 h-3.5 text-text-muted shrink-0" })), _jsx("span", { className: "text-text-secondary truncate", children: sourceSwitchMessage || '加载中...' })] })), _jsxs("div", { className: "p-6", children: [_jsxs("div", { className: "flex gap-6", children: [_jsx("div", { className: "shrink-0 w-48", children: _jsx("img", { src: detail?.vod_pic, alt: detail?.vod_name, className: "w-full aspect-[2/3] object-cover rounded-lg bg-bg-tertiary", onError: (e) => { e.target.style.display = 'none'; } }) }), _jsxs("div", { className: "flex-1 min-w-0", children: [_jsx("h1", { className: "text-2xl font-semibold text-text-primary mb-3", children: detail?.vod_name }), _jsxs("div", { className: "space-y-1.5 text-sm text-text-secondary", children: [detail?.vod_year && _jsxs("p", { children: ["\u5E74\u4EFD\uFF1A", detail.vod_year] }), detail?.vod_area && _jsxs("p", { children: ["\u5730\u533A\uFF1A", detail.vod_area] }), detail?.type_name && _jsxs("p", { children: ["\u7C7B\u578B\uFF1A", detail.type_name] }), detail?.vod_director && _jsxs("p", { children: ["\u5BFC\u6F14\uFF1A", detail.vod_director] }), detail?.vod_actor && _jsxs("p", { children: ["\u6F14\u5458\uFF1A", detail.vod_actor] })] }), _jsxs("div", { className: "flex gap-3 mt-4 flex-wrap", children: [_jsxs("button", { onClick: () => {
+                                        }, className: "flex items-center gap-2 px-4 py-2 bg-accent text-bg-primary rounded-lg font-medium hover:bg-accent-hover", children: [_jsx(RotateCw, { className: "w-4 h-4" }), "\u91CD\u8BD5\u5F53\u524D"] }), _jsxs("button", { onClick: switchToNextSource, className: "flex items-center gap-2 px-4 py-2 border border-white/30 text-white rounded-lg hover:bg-white/10", children: [_jsx(RefreshCw, { className: "w-4 h-4" }), "\u5207\u6362\u5176\u4ED6\u6E90"] })] })] }))] })), (sourceSwitchState !== 'idle' || sourceSwitchMessage) && (_jsxs("div", { className: "flex items-center gap-2 px-4 py-2 bg-bg-secondary border-b border-[#2a2a2a] text-xs", children: [sourceSwitchState === 'searching' || sourceSwitchState === 'switching' ? (_jsx(Loader2, { className: "w-3.5 h-3.5 animate-spin text-accent shrink-0" })) : (_jsx(Globe, { className: "w-3.5 h-3.5 text-text-muted shrink-0" })), _jsx("span", { className: "text-text-secondary truncate", children: sourceSwitchMessage || '加载中...' })] })), _jsxs("div", { className: "p-6", children: [_jsxs("div", { className: "flex gap-6", children: [_jsx("div", { className: "shrink-0 w-48", children: _jsx("img", { src: detail?.vod_pic, alt: detail?.vod_name, className: "w-full aspect-[2/3] object-cover rounded-lg bg-bg-tertiary", onError: (e) => { e.target.style.display = 'none'; } }) }), _jsxs("div", { className: "flex-1 min-w-0", children: [_jsx("h1", { className: "text-2xl font-semibold text-text-primary mb-3", children: detail?.vod_name }), _jsxs("div", { className: "space-y-1.5 text-sm text-text-secondary", children: [detail?.vod_year && _jsxs("p", { children: ["\u5E74\u4EFD\uFF1A", detail.vod_year] }), detail?.vod_area && _jsxs("p", { children: ["\u5730\u533A\uFF1A", detail.vod_area] }), detail?.type_name && _jsxs("p", { children: ["\u7C7B\u578B\uFF1A", detail.type_name] }), detail?.vod_director && _jsxs("p", { children: ["\u5BFC\u6F14\uFF1A", detail.vod_director] }), detail?.vod_actor && _jsxs("p", { children: ["\u6F14\u5458\uFF1A", detail.vod_actor] })] }), _jsxs("div", { className: "flex gap-3 mt-4 flex-wrap", children: [canResume(resumeHistory) && resumeLineIndex >= 0 && resumeEpisodeIndex >= 0 && (_jsxs("button", { onClick: () => handlePlay(resumeLineIndex, resumeEpisodeIndex, resumeHistory.positionSeconds || 0), disabled: isResolving || lineSources.length === 0, className: "flex items-center gap-2 px-5 py-2 bg-accent hover:bg-accent-hover text-bg-primary rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed", children: [isResolving ? _jsx(Loader2, { className: "w-4 h-4 animate-spin" }) : _jsx(Play, { className: "w-4 h-4" }), "\u7EE7\u7EED ", resumeEpisodeName || resumeHistory.episodeName || '上次观看', " \u00B7 ", formatResumeTime(resumeHistory.positionSeconds)] })), _jsxs("button", { onClick: () => {
                                                     if (activeLine)
                                                         handlePlay(activeLineIndex, currentEpisodeIndex || 0);
-                                                }, disabled: isResolving || lineSources.length === 0, className: "flex items-center gap-2 px-5 py-2 bg-accent hover:bg-accent-hover text-bg-primary rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed", children: [isResolving ? _jsx(Loader2, { className: "w-4 h-4 animate-spin" }) : _jsx(Play, { className: "w-4 h-4" }), isResolving ? '解析中...' : '播放'] }), _jsxs("button", { onClick: handleToggleKeep, className: `flex items-center gap-2 px-5 py-2 rounded-lg border transition-colors ${isKept
+                                                }, disabled: isResolving || lineSources.length === 0, className: `flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${canResume(resumeHistory)
+                                                    ? 'border border-[#2a2a2a] text-text-secondary hover:text-accent hover:border-accent'
+                                                    : 'bg-accent hover:bg-accent-hover text-bg-primary'}`, children: [isResolving ? _jsx(Loader2, { className: "w-4 h-4 animate-spin" }) : _jsx(Play, { className: "w-4 h-4" }), isResolving ? '解析中...' : '播放'] }), _jsxs("button", { onClick: handleToggleKeep, className: `flex items-center gap-2 px-5 py-2 rounded-lg border transition-colors ${isKept
                                                     ? 'border-accent text-accent bg-accent-muted'
                                                     : 'border-[#2a2a2a] text-text-secondary hover:text-accent hover:border-accent'}`, children: [_jsx(Heart, { className: `w-4 h-4 ${isKept ? 'fill-accent' : ''}` }), isKept ? '已收藏' : '收藏'] })] }), detail?.vod_content && (_jsx("p", { className: "mt-4 text-sm text-text-muted leading-relaxed line-clamp-3", children: detail.vod_content.replace(/<[^>]+>/g, '') }))] })] }), lineSources.length > 0 && (_jsxs("div", { className: "mt-6", children: [_jsxs("div", { className: "flex items-center gap-2 mb-3", children: [_jsx(Globe, { className: "w-4 h-4 text-text-muted" }), _jsx("span", { className: "text-sm font-medium text-text-secondary", children: "\u591A\u7EBF\u8DEF\u7247\u6E90" }), alternativeSources.length > 0 && (_jsxs("span", { className: "text-xs text-text-muted ml-auto", children: [alternativeSources.length, " \u4E2A\u5907\u9009\u6E90"] }))] }), _jsx("div", { className: "flex gap-2 overflow-x-auto scrollbar-dark pb-1", children: lineSources.map((line, idx) => (_jsxs("button", { onClick: () => setActiveLineIndex(idx), className: `shrink-0 px-3 py-1.5 text-xs rounded-md transition-colors ${activeLineIndex === idx
                                         ? 'bg-accent/20 text-accent font-medium'

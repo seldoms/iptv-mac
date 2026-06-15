@@ -26,6 +26,17 @@ export interface AlternativeSource {
     vodRemarks?: string;
 }
 export type PlaybackPhase = 'idle' | 'resolving' | 'connecting' | 'buffering' | 'playing' | 'recovering' | 'failed';
+export interface PlaybackDiagnostic {
+    stage: 'parse' | 'connect' | 'manifest' | 'buffer' | 'media' | 'network' | 'unknown';
+    errorKind: 'parse_failed' | 'timeout' | 'http' | 'hls' | 'media' | 'unsupported' | 'unknown';
+    protocol?: 'hls' | 'dash' | 'native' | 'unknown';
+    httpStatus?: number;
+    elapsedMs?: number;
+    sourceId?: string;
+    attempt?: number;
+    sourceCount?: number;
+    nextAction?: string;
+}
 interface PlayerState {
     isPlaying: boolean;
     currentUrl: string;
@@ -40,6 +51,7 @@ interface PlayerState {
     episodes: Episode[];
     currentEpisodeIndex: number;
     currentSourceIndex: number;
+    currentSourceName: string;
     playHeader: Record<string, string> | null;
     currentSiteKey: string;
     playbackPhase: PlaybackPhase;
@@ -48,6 +60,7 @@ interface PlayerState {
     playbackStartedAt: number;
     playbackFirstFrameAt: number;
     playbackLastErrorAt: number;
+    playbackDiagnostic: PlaybackDiagnostic | null;
     /** 备选源队列（来自其他站点的同名 VOD） */
     alternativeSources: AlternativeSource[];
     /** 已失败的源 key 集合（siteKey + vodId） */
@@ -72,11 +85,11 @@ interface PlayerActions {
     toggleFullscreen: () => void;
     nextEpisode: () => void;
     prevEpisode: () => void;
-    setVod: (vod: VodDetail, episodes: Episode[], sourceIndex?: number, resolvedUrl?: string, header?: Record<string, string>, siteKey?: string) => void;
-    setCurrentEpisodeIndex: (index: number, resolvedUrl?: string) => void;
+    setVod: (vod: VodDetail, episodes: Episode[], sourceIndex?: number, resolvedUrl?: string, header?: Record<string, string>, siteKey?: string, sourceName?: string, startPositionSeconds?: number) => void;
+    setCurrentEpisodeIndex: (index: number, resolvedUrl?: string, startPositionSeconds?: number) => void;
     setCurrentSourceIndex: (index: number) => void;
     setPlaybackPhase: (phase: PlaybackPhase, message?: string) => void;
-    setPlaybackError: (message: string) => void;
+    setPlaybackError: (message: string, diagnostic?: Partial<PlaybackDiagnostic>) => void;
     markPlaybackFirstFrame: () => void;
     /** 设置备选源队列 */
     setAlternativeSources: (sources: AlternativeSource[]) => void;
