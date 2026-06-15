@@ -4,14 +4,7 @@ import { Heart, Trash2 } from 'lucide-react'
 import { keepApi } from '@/utils/ipc'
 import VodCard from '@/components/VodCard/VodCard'
 import { Vod } from '@/stores/useConfigStore'
-
-interface KeepItem {
-  vod_id: string
-  site_key: string
-  vod_name: string
-  vod_pic: string
-  created_at: number
-}
+import type { Keep as KeepItem } from '@shared/types'
 
 export default function Keep() {
   const navigate = useNavigate()
@@ -22,7 +15,7 @@ export default function Keep() {
     setIsLoading(true)
     try {
       const data = (await keepApi.list()) as KeepItem[]
-      setList(data.sort((a, b) => b.created_at - a.created_at))
+      setList(data.sort((a, b) => (b.createTime || 0) - (a.createTime || 0)))
     } catch {
       setList([])
     }
@@ -33,13 +26,13 @@ export default function Keep() {
     loadKeep()
   }, [])
 
-  const handleRemove = async (vodId: string) => {
-    await keepApi.delete(vodId)
-    setList((prev) => prev.filter((item) => item.vod_id !== vodId))
+  const handleRemove = async (siteKey: string, vodId: string) => {
+    await keepApi.delete(siteKey, vodId)
+    setList((prev) => prev.filter((item) => item.siteKey !== siteKey || item.vodId !== vodId))
   }
 
   const handleVodClick = (vod: Vod, item: KeepItem) => {
-    navigate(`/vod/${item.site_key}/${item.vod_id}`)
+    navigate(`/vod/${item.siteKey}/${item.vodId}`)
   }
 
   return (
@@ -69,12 +62,12 @@ export default function Keep() {
         ) : (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
             {list.map((item) => (
-              <div key={item.vod_id} className="group relative">
+              <div key={`${item.siteKey}:${item.vodId}`} className="group relative">
                 <VodCard
                   vod={{
-                    vod_id: item.vod_id,
-                    vod_name: item.vod_name,
-                    vod_pic: item.vod_pic,
+                    vod_id: item.vodId,
+                    vod_name: item.vodName,
+                    vod_pic: item.vodPic || '',
                     vod_remarks: ''
                   }}
                   onClick={(vod) => handleVodClick(vod, item)}
@@ -83,7 +76,7 @@ export default function Keep() {
                 <button
                   onClick={(e) => {
                     e.stopPropagation()
-                    handleRemove(item.vod_id)
+                    handleRemove(item.siteKey, item.vodId)
                   }}
                   className="absolute top-1 right-1 p-1 bg-black/60 rounded-full text-white/60 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
                 >

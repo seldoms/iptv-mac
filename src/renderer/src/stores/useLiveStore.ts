@@ -1,4 +1,6 @@
 import { create } from 'zustand'
+import type { EpgChannel, EpgProgram } from '@shared/types'
+import { invoke } from '@/utils/ipc'
 
 export interface Channel {
   name: string
@@ -7,6 +9,10 @@ export interface Channel {
   format?: string
   urls: string[]
   epgId?: string
+  urlHeaders?: Record<string, Record<string, string>>
+  epgUrl?: string
+  bestUrl?: string
+  latency?: number
 }
 
 export interface Group {
@@ -61,6 +67,7 @@ interface RefreshActions {
   setRefreshInterval: (minutes: number) => Promise<void>
   getRefreshStatus: () => Promise<void>
   getChannelTree: () => Promise<any>
+  applyRefreshProgress: (progress: NonNullable<RefreshState['refreshProgress']>) => void
 }
 
 const initialState: LiveState & RefreshState = {
@@ -80,6 +87,62 @@ const initialState: LiveState & RefreshState = {
   refreshInterval: 30
 }
 
+function findEpgChannel(channels: EpgChannel[], channelId: string): EpgChannel | undefined {
+  const target = channelId.trim().toLowerCase()
+  return channels.find((channel) =>
+    channel.id?.trim().toLowerCase() === target ||
+    channel.name.trim().toLowerCase() === target
+  )
+}
+
+function normalizePrograms(programs: EpgProgram[]): EpgData[] {
+  return programs.map((program) => ({
+    title: program.title,
+    start: program.start,
+    end: program.stop,
+    desc: program.desc
+  }))
+}
+
+function normalizeChannel(channel: any): Channel {
+  const urls = Array.isArray(channel.urls) ? channel.urls.filter(Boolean) : []
+  const baseHeaders: Record<string, string> = { ...(channel.header || {}) }
+  if (channel.ua) baseHeaders['User-Agent'] = channel.ua
+  if (channel.referer) baseHeaders.Referer = channel.referer
+  if (channel.origin) baseHeaders.Origin = channel.origin
+
+  const urlHeaders: Record<string, Record<string, string>> = { ...(channel.urlHeaders || {}) }
+  if (Object.keys(baseHeaders).length > 0) {
+    for (const url of urls) {
+      urlHeaders[url] = { ...baseHeaders, ...urlHeaders[url] }
+    }
+  }
+
+  const epgValue = typeof channel.epg === 'string' ? channel.epg : ''
+  const epgIsUrl = /^https?:\/\//i.test(epgValue)
+
+  return {
+    name: channel.name || '',
+    number: channel.number,
+    logo: channel.logo,
+    format: channel.format,
+    urls,
+    epgId: channel.epgId || channel.tvgId || (epgIsUrl ? '' : epgValue),
+    epgUrl: channel.epgUrl || (epgIsUrl ? epgValue : undefined),
+    bestUrl: channel.bestUrl,
+    latency: channel.latency,
+    urlHeaders: Object.keys(urlHeaders).length > 0 ? urlHeaders : undefined
+  }
+}
+
+export function normalizeLiveGroups(rawGroups: any[]): Group[] {
+  return rawGroups.map((group) => ({
+    name: group.name,
+    pass: group.pass,
+    channels: (group.channel || group.channels || []).map(normalizeChannel)
+  }))
+}
+
 export const useLiveStore = create<LiveState & LiveActions & RefreshState & RefreshActions>()((set, get) => ({
   ...initialState,
 
@@ -87,7 +150,7 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
     set({ isLoading: true, error: null })
     try {
       console.log('[LiveStore] loadLive 请求:', liveName)
-      const res = await window.api.invoke('live:load', liveName) as { success: boolean; data?: any[]; error?: string }
+      const res = await invoke('live:load', liveName) as { success: boolean; data?: any[]; error?: string }
       console.log('[LiveStore] loadLive 响应:', res.success, 'data length:', res.data?.length, 'error:', res.error)
       if (!res.success || !res.data || res.data.length === 0) {
         set({ isLoading: false, error: res.error || '直播源无可用频道' })
@@ -95,19 +158,7 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
       }
 
       // 主进程返回 Group[]，其中 channel 是单数形式，需要映射为 channels
-      const rawGroups: { name: string; pass?: string; channel?: any[] }[] = res.data
-      const groups: Group[] = rawGroups.map((g) => ({
-        name: g.name,
-        pass: g.pass,
-        channels: (g.channel || []).map((c: any) => ({
-          name: c.name || '',
-          number: c.number,
-          logo: c.logo,
-          format: c.format,
-          urls: c.urls || [],
-          epgId: c.epg || c.tvgId || ''
-        }))
-      }))
+      const groups = normalizeLiveGroups(res.data)
 
       console.log('[LiveStore] 解析后 groups:', groups.length, '总频道:', groups.reduce((s, g) => s + g.channels.length, 0))
 
@@ -130,26 +181,14 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
     set({ isLoading: true, error: null })
     try {
       console.log('[LiveStore] loadLiveByUrl 请求:', name || url, 'url:', url)
-      const res = await window.api.invoke('live:loadByUrl', url, name) as { success: boolean; data?: any[]; error?: string }
+      const res = await invoke('live:loadByUrl', url, name) as { success: boolean; data?: any[]; error?: string }
       console.log('[LiveStore] loadLiveByUrl 响应:', res.success, 'data length:', res.data?.length, 'error:', res.error)
       if (!res.success || !res.data || res.data.length === 0) {
         set({ isLoading: false, error: res.error || '直播源无可用频道' })
         return
       }
 
-      const rawGroups: { name: string; pass?: string; channel?: any[] }[] = res.data
-      const groups: Group[] = rawGroups.map((g) => ({
-        name: g.name,
-        pass: g.pass,
-        channels: (g.channel || []).map((c: any) => ({
-          name: c.name || '',
-          number: c.number,
-          logo: c.logo,
-          format: c.format,
-          urls: c.urls || [],
-          epgId: c.epg || c.tvgId || ''
-        }))
-      }))
+      const groups = normalizeLiveGroups(res.data)
 
       console.log('[LiveStore] 解析后 groups:', groups.length, '总频道:', groups.reduce((s, g) => s + g.channels.length, 0))
 
@@ -186,9 +225,20 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
   },
 
   fetchEpg: async (epgUrl: string, channelId: string) => {
+    if (!epgUrl || !channelId) {
+      set({ epgData: [] })
+      return
+    }
     try {
-      const data = await window.api.invoke('live:epg', epgUrl, channelId) as EpgData[]
-      set({ epgData: data })
+      const res = await invoke('live:epg', epgUrl, {
+        [channelId]: { id: channelId, name: channelId }
+      }) as { success: boolean; data?: EpgChannel[]; error?: string }
+      if (!res.success || !res.data) {
+        set({ epgData: [] })
+        return
+      }
+      const channel = findEpgChannel(res.data, channelId)
+      set({ epgData: channel ? normalizePrograms(channel.programs) : [] })
     } catch {
       set({ epgData: [] })
     }
@@ -206,10 +256,8 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
       message: '正在刷新...'
     }})
     try {
-      await window.api.invoke('live:refresh')
-      // 刷新完成后获取最新状态
-      await get().getRefreshStatus()
-      await get().getChannelTree()
+      // 后台执行刷新，进度通过 IPC 事件通知
+      invoke('live:refresh')
     } catch (e: any) {
       set({ isRefreshing: false, refreshProgress: null })
     }
@@ -217,7 +265,7 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
 
   setRefreshInterval: async (minutes: number) => {
     try {
-      const res = await window.api.invoke('live:setRefreshInterval', minutes) as { success: boolean; error?: string }
+      const res = await invoke('live:setRefreshInterval', minutes) as { success: boolean; error?: string }
       if (res.success) {
         set({ refreshInterval: minutes })
         await get().getRefreshStatus()
@@ -231,7 +279,7 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
 
   getRefreshStatus: async () => {
     try {
-      const status = await window.api.invoke('live:getRefreshStatus') as any
+      const status = await invoke('live:getRefreshStatus') as any
       set({
         isRefreshing: status.isRefreshing,
         lastRefreshTime: status.lastRefreshTime,
@@ -245,11 +293,18 @@ export const useLiveStore = create<LiveState & LiveActions & RefreshState & Refr
 
   getChannelTree: async () => {
     try {
-      const tree = await window.api.invoke('live:getChannelTree') as any
+      const tree = await invoke('live:getChannelTree') as any
       return tree
     } catch (e: any) {
       console.error('[LiveStore] 获取频道树失败:', e)
       return { countries: [] }
     }
+  },
+
+  applyRefreshProgress: (progress) => {
+    set({
+      refreshProgress: progress,
+      isRefreshing: progress.phase !== 'done' && progress.phase !== 'error'
+    })
   }
 }))

@@ -1,0 +1,8 @@
+#EXTM3U
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.com/key.bin",IV=0x1234567890abcdef
+#EXTINF:10.0,
+segment1.ts
+#EXTINF:10.0,
+/segments/segment2.ts
+#EXTINF:10.0,
+https://cdn.example.com/segments/segment3.ts

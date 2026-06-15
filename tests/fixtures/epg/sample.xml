@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="test">
+  <channel id="cctv1.example.com">
+    <display-name>CCTV-1</display-name>
+    <icon src="http://example.com/cctv1.png"/>
+  </channel>
+  <channel id="hunan.example.com">
+    <display-name>湖南卫视</display-name>
+  </channel>
+  <programme channel="cctv1.example.com" start="20260101000000 +0800" stop="20260101010000 +0800">
+    <title>新闻联播</title>
+    <desc>每日新闻</desc>
+  </programme>
+  <programme channel="cctv1.example.com" start="20260101010000 +0800" stop="20260101020000 +0800">
+    <title>焦点访谈</title>
+  </programme>
+  <programme channel="hunan.example.com" start="20260101000000 +0800" stop="20260101003000 +0800">
+    <title>湖南新闻</title>
+  </programme>
+</tv>

@@ -9,6 +9,7 @@ import {
   AlternativeSource
 } from '@/stores/usePlayerStore'
 import { historyApi, keepApi, siteApi } from '@/utils/ipc'
+import { getPlayableMediaUrl } from '@/utils/media'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
 
 /** 判断 URL 是否为视频流格式 */
@@ -34,10 +35,11 @@ export default function VodDetail() {
   const {
     currentVod, episodes, currentEpisodeIndex, currentSourceIndex,
     setVod, setCurrentEpisodeIndex, setCurrentSourceIndex,
-    alternativeSources, sourceSwitchState, sourceSwitchMessage,
+    alternativeSources, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
     setAlternativeSources, markCurrentSourceBroken,
     setSourceSwitchState, popNextAlternativeSource,
-    pickAlternativeSource, resetSourceSwitch
+    pickAlternativeSource, resetSourceSwitch,
+    setPlaybackPhase, setPlaybackError
   } = usePlayerStore()
 
   const [detail, setDetail] = useState<VodDetailType | null>(null)
@@ -56,6 +58,7 @@ export default function VodDetail() {
   const switchingRef = useRef(false)
   const failureHandledRef = useRef(false)
   const mountedRef = useRef(true)
+  const activeLine = lineSources[activeLineIndex]
 
   useEffect(() => {
     mountedRef.current = true
@@ -136,7 +139,11 @@ export default function VodDetail() {
       }
 
       setLineSources(parsedLines)
-      setActiveLineIndex(0)
+      // 优先选择含直链标识的线路（m3u8/mp4/mpd 等）
+      const bestLineIdx = parsedLines.findIndex((l) =>
+        /m3u8|mp4|mpd|flv|ts/i.test(l.name) && l.episodes.length > 0
+      )
+      setActiveLineIndex(bestLineIdx >= 0 ? bestLineIdx : 0)
       setIsLoading(false)
     } catch (err: any) {
       setLoadError(err?.message || '加载失败')
@@ -146,11 +153,11 @@ export default function VodDetail() {
 
   // 检查收藏
   useEffect(() => {
-    if (!vodId) return
-    keepApi.list().then((list: any[]) => {
-      setIsKept(list.some((item) => item.vod_id === vodId))
+    if (!vodId || !siteKey) return
+    keepApi.list().then((list: Array<{ siteKey: string; vodId: string }>) => {
+      setIsKept(list.some((item) => item.siteKey === siteKey && item.vodId === vodId))
     })
-  }, [vodId])
+  }, [siteKey, vodId])
 
   // ==================== 换源机制 ====================
   // 搜索所有站点的同名 VOD，构建备选源队列
@@ -264,8 +271,10 @@ export default function VodDetail() {
         }
 
         // 将新线路添加到线路列表
+        const prevCount = lineSources.length
         setLineSources(prev => [...prev, ...newLines])
-        setActiveLineIndex(lineSources.length) // 切换到新添加的第一个线路
+        const bestNewIdx = newLines.findIndex((l) => /m3u8|mp4|mpd|flv|ts/i.test(l.name) && l.episodes.length > 0)
+        setActiveLineIndex(prevCount + (bestNewIdx >= 0 ? bestNewIdx : 0))
         setDetail(vod)
         setSourceSwitchState('idle', `已切换到「${source.siteName}」`)
         setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
@@ -301,7 +310,7 @@ export default function VodDetail() {
         markCurrentSourceBroken(failedSiteKey, failedVodId)
       }
       setTimeout(() => { failureHandledRef.current = false }, 1000)
-      if (autoSwitch !== false) {
+      if (autoSwitch !== false && autoSwitchSource) {
         switchToNextSource()
       }
     }
@@ -309,7 +318,22 @@ export default function VodDetail() {
     return () => {
       window.removeEventListener('vod:playFailed', handlePlayFailed as EventListener)
     }
-  }, [markCurrentSourceBroken, switchToNextSource])
+  }, [autoSwitchSource, markCurrentSourceBroken, switchToNextSource])
+
+  useEffect(() => {
+    const handleRetry = () => {
+      if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0)
+    }
+    const handleNextSource = () => {
+      void switchToNextSource()
+    }
+    window.addEventListener('player:retry', handleRetry)
+    window.addEventListener('player:nextSource', handleNextSource)
+    return () => {
+      window.removeEventListener('player:retry', handleRetry)
+      window.removeEventListener('player:nextSource', handleNextSource)
+    }
+  }, [activeLine, activeLineIndex, currentEpisodeIndex, switchToNextSource])
 
   // 播放集数
   const handlePlay = async (lineIdx: number, epIdx: number) => {
@@ -317,103 +341,122 @@ export default function VodDetail() {
     if (!line || !line.episodes[epIdx]) return
 
     setIsResolving(true)
+    setPlaybackPhase('resolving', '正在获取播放信息...')
     setCurrentSourceIndex(lineIdx)
     setAllSourcesExhausted(false)
     setLoadError(null)
     failureHandledRef.current = false
 
     const episode = line.episodes[epIdx]
+    const targetDetail = detail
+    const targetSiteKey = line.siteKey
+    const targetVodId = line.vodId
+
     try {
       const playerRes = await siteApi.playerContent(line.siteKey, line.name, episode.url, [])
       const playerResult = playerRes.data || playerRes
+      setPlaybackPhase('resolving', '正在判断播放地址...')
 
-      const parseRes = await siteApi.superParse({
-        url: episode.url,
-        flag: line.name,
-        siteKey: line.siteKey,
-        playerResult
-      })
+      let initialUrl = ''
+      let initialHeader: Record<string, string> | undefined = playerResult.header
 
-      let resolvedUrl = ''
-      let resolvedHeader: Record<string, string> | undefined
+      // 尝试从 playerContent 结果中提取可播放的 URL
+      if (playerResult.playUrl && isVideoFormat(playerResult.playUrl)) {
+        initialUrl = playerResult.playUrl
+      } else if (playerResult.url && isVideoFormat(playerResult.url)) {
+        initialUrl = playerResult.url
+      } else if (playerResult.playUrl && playerResult.url) {
+        initialUrl = playerResult.playUrl + playerResult.url
+      } else if (playerResult.url) {
+        initialUrl = playerResult.url
+      }
 
-      if (parseRes.success) {
-        resolvedUrl = parseRes.data.url
-        resolvedHeader = parseRes.data.header
+      setIsResolving(false)
+
+      if (initialUrl && isVideoFormat(initialUrl)) {
+        // 直接可播放，立即开始
+        setPlaybackPhase('connecting', '正在连接播放地址...')
+        const playableUrl = await getPlayableMediaUrl(initialUrl, initialHeader)
+        setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId })
+        setVod(targetDetail!, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey)
+        setCurrentEpisodeIndex(epIdx, playableUrl)
+        setShowPlayer(true)
       } else {
-        if (playerResult.playUrl && isVideoFormat(playerResult.playUrl)) {
-          resolvedUrl = playerResult.playUrl
-          resolvedHeader = playerResult.header
-        } else if (playerResult.url && isVideoFormat(playerResult.url)) {
-          resolvedUrl = playerResult.url
-          resolvedHeader = playerResult.header
-        } else {
-          setIsResolving(false)
-          setLoadError('当前线路无法解析，将自动尝试其他源...')
+        // 需要解析，先展示播放器加载态
+        setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId })
+        setShowPlayer(true)
+        setPlaybackPhase('resolving', '正在解析播放地址...')
+        setVod(targetDetail!, line.episodes, lineIdx, '__resolving__', initialHeader, targetSiteKey)
+
+        // 异步解析
+        try {
+          const parseRes = await siteApi.superParse({
+            url: episode.url,
+            flag: line.name,
+            siteKey: targetSiteKey,
+            playerResult
+          })
+
+          if (parseRes.success && parseRes.data.url) {
+            setPlaybackPhase('connecting', '解析成功，正在连接...')
+            const url = await getPlayableMediaUrl(
+              parseRes.data.url,
+              parseRes.data.header || initialHeader
+            )
+            const header = parseRes.data.header || initialHeader
+            const store = usePlayerStore.getState()
+            setCurrentEpisodeIndex(epIdx, url)
+            store.play(url)
+          } else {
+            // 所有解析都失败
+            setPlaybackError('解析完全失败')
+            window.dispatchEvent(new CustomEvent('vod:playFailed', {
+              detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析完全失败', autoSwitch: true }
+            }))
+          }
+        } catch {
+          setPlaybackError('解析异常')
           window.dispatchEvent(new CustomEvent('vod:playFailed', {
-            detail: {
-              siteKey: line.siteKey,
-              vodId: line.vodId,
-              reason: '解析完全失败',
-              autoSwitch: true
-            }
+            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常', autoSwitch: true }
           }))
-          return
         }
       }
 
-      setCurrentPlaySource({ siteKey: line.siteKey, vodId: line.vodId })
-      setVod(detail!, line.episodes, lineIdx, resolvedUrl, resolvedHeader, line.siteKey)
-      setCurrentEpisodeIndex(epIdx, resolvedUrl)
-      setShowPlayer(true)
-
-      // 启动后立即异步搜索备选源
-      if (detail?.vod_name && line.isCurrent) {
-        fetchAlternativeSources(detail.vod_name)
+      // 搜索备选源
+      if (targetDetail?.vod_name && line.isCurrent) {
+        fetchAlternativeSources(targetDetail.vod_name)
       }
+
+      historyApi.add({
+        vodId: targetVodId,
+        siteKey: targetSiteKey,
+        vodName: targetDetail?.vod_name || '',
+        vodPic: targetDetail?.vod_pic,
+        source: episode.name ? `${line.name} · ${episode.name}` : line.name,
+        progress: 0
+      }).catch(() => {})
     } catch (err: any) {
       setIsResolving(false)
       setLoadError(err?.message || '获取播放信息失败')
+      setPlaybackError(err?.message || '获取播放信息失败')
       window.dispatchEvent(new CustomEvent('vod:playFailed', {
-        detail: {
-          siteKey: line.siteKey,
-          vodId: line.vodId,
-          reason: 'playerContent 失败',
-          autoSwitch: true
-        }
+        detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: 'playerContent 失败', autoSwitch: true }
       }))
-      return
-    } finally {
-      setIsResolving(false)
     }
-
-    historyApi.add({
-      vod_id: vodId,
-      site_key: siteKey,
-      vod_name: detail?.vod_name,
-      vod_pic: detail?.vod_pic,
-      source_name: line.name,
-      episode_name: episode.name,
-      episode_url: episode.url,
-      position: 0,
-      duration: 0,
-      updated_at: Date.now()
-    }).catch(() => {})
   }
 
   // 收藏
   const handleToggleKeep = async () => {
     if (!detail || !vodId || !siteKey) return
     if (isKept) {
-      await keepApi.delete(vodId)
+      await keepApi.delete(siteKey, vodId)
       setIsKept(false)
     } else {
       await keepApi.add({
-        vod_id: vodId,
-        site_key: siteKey,
-        vod_name: detail.vod_name,
-        vod_pic: detail.vod_pic,
-        created_at: Date.now()
+        vodId,
+        siteKey,
+        vodName: detail.vod_name,
+        vodPic: detail.vod_pic
       })
       setIsKept(true)
     }
@@ -451,8 +494,6 @@ export default function VodDetail() {
     )
   }
 
-  const activeLine = lineSources[activeLineIndex]
-
   return (
     <div className="h-full overflow-y-auto scrollbar-dark">
       {/* 播放器 */}
@@ -465,18 +506,6 @@ export default function VodDetail() {
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
-
-          {/* 换源状态提示 */}
-          {(sourceSwitchState !== 'idle' || sourceSwitchMessage) && (
-            <div className="absolute top-3 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 bg-accent/90 text-bg-primary rounded-full text-xs font-medium flex items-center gap-2 shadow-lg max-w-[80%] truncate">
-              {sourceSwitchState === 'searching' || sourceSwitchState === 'switching' ? (
-                <Loader2 className="w-3 h-3 animate-spin shrink-0" />
-              ) : (
-                <Globe className="w-3 h-3 shrink-0" />
-              )}
-              <span className="truncate">{sourceSwitchMessage || '加载中...'}</span>
-            </div>
-          )}
 
           {/* 所有源耗尽 */}
           {allSourcesExhausted && (
@@ -504,6 +533,18 @@ export default function VodDetail() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* 换源状态栏 */}
+      {(sourceSwitchState !== 'idle' || sourceSwitchMessage) && (
+        <div className="flex items-center gap-2 px-4 py-2 bg-bg-secondary border-b border-[#2a2a2a] text-xs">
+          {sourceSwitchState === 'searching' || sourceSwitchState === 'switching' ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-accent shrink-0" />
+          ) : (
+            <Globe className="w-3.5 h-3.5 text-text-muted shrink-0" />
+          )}
+          <span className="text-text-secondary truncate">{sourceSwitchMessage || '加载中...'}</span>
         </div>
       )}
 

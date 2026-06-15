@@ -1,0 +1,16 @@
+[
+  {
+    "name": "央视",
+    "channel": [
+      { "name": "CCTV-1", "urls": ["http://example.com/cctv1.m3u8"] },
+      { "name": "CCTV-2", "urls": ["http://example.com/cctv2.m3u8"] }
+    ]
+  },
+  {
+    "name": "卫视",
+    "channel": [
+      { "name": "湖南卫视", "urls": ["http://example.com/hunan.m3u8", "http://backup.com/hunan.m3u8"] },
+      { "name": "浙江卫视", "urls": ["http://example.com/zhejiang.m3u8"] }
+    ]
+  }
+]

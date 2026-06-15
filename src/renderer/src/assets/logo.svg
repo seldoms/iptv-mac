@@ -1,0 +1,25 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect x="112" y="144" width="288" height="196" rx="34" fill="#101820" stroke="url(#screenStroke)" stroke-width="18"/>
+  <path d="M232 209L314 257L232 305V209Z" fill="url(#play)"/>
+  <path d="M156 379H356" stroke="#5EEAD4" stroke-width="22" stroke-linecap="round"/>
+  <path d="M256 341V379" stroke="#5EEAD4" stroke-width="22" stroke-linecap="round"/>
+  <path d="M149 111C176 88 213 74 256 74C299 74 336 88 363 111" stroke="#FBBF24" stroke-width="18" stroke-linecap="round" opacity="0.95"/>
+  <path d="M183 121C202 108 227 100 256 100C285 100 310 108 329 121" stroke="#FDE68A" stroke-width="14" stroke-linecap="round" opacity="0.9"/>
+  <circle cx="386" cy="150" r="14" fill="#FBBF24"/>
+  <defs>
+    <linearGradient id="bg" x1="74" y1="42" x2="438" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172033"/>
+      <stop offset="0.48" stop-color="#0D1320"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="screenStroke" x1="112" y1="144" x2="400" y2="340" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#2DD4BF"/>
+    </linearGradient>
+    <linearGradient id="play" x1="232" y1="209" x2="314" y2="305" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDE68A"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+</svg>

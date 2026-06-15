@@ -1,6 +1,6 @@
 /**
  * IPTV 应用共享类型定义
- * 主进程与渲染进程共用
+ * React 前端共享类型
  */
 
 // ==================== Vod 配置相关 ====================
@@ -190,6 +190,19 @@ export interface VodConfig {
   hosts?: string[]
   flags?: string[]
   ads?: string[]
+}
+
+export interface ConfigInspection {
+  url: string
+  name: string
+  siteCount: number
+  visibleSiteCount: number
+  searchableSiteCount: number
+  unsupportedSiteCount: number
+  liveCount: number
+  parseCount: number
+  hasSpider: boolean
+  warnings: string[]
 }
 
 // ==================== Live 配置相关 ====================
@@ -411,6 +424,8 @@ export interface MergedChannel {
   category: string
   sortOrder: number
   originalGroups: string[]
+  urlHeaders?: Record<string, Record<string, string>> // URL -> headers 映射
+  epgUrl?: string         // EPG 节目单 URL
 }
 
 /** 分类后的频道 */

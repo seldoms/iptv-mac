@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { Home, Tv, Search, Clock, Heart, Settings, ChevronLeft, ChevronRight, ArrowLeft } from 'lucide-react'
+import AppLogo from '@/components/AppLogo/AppLogo'
 
 const navItems = [
   { icon: Home, label: '首页', path: '/' },
@@ -32,8 +33,8 @@ export default function Sidebar() {
     >
       {/* Logo - 可拖动区域，用于移动窗口 */}
       <div className="flex items-center justify-center h-20 pt-6 border-b border-[#2a2a2a]" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
-        <div className="w-8 h-8 rounded-lg bg-accent flex items-center justify-center" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          <Tv className="w-5 h-5 text-bg-primary" />
+        <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <AppLogo />
         </div>
       </div>
 

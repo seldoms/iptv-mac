@@ -1,0 +1,9 @@
+CCTV,#genre#
+ua=Mozilla/5.0 (compatible)
+referer=http://example.com
+CCTV-1,http://example.com/cctv1.m3u8
+CCTV-2,http://example.com/cctv2.m3u8
+
+港澳,#genre#
+# 注释行,忽略
+TVB Jade,http://example.com/tvb.m3u8

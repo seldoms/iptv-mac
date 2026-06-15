@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { invoke } from '@/utils/ipc'
 
 export interface Site {
   key: string
@@ -69,7 +70,7 @@ interface ConfigActions {
   fetchCategoryContent: (tid: string, pg: number, extend?: Record<string, string>) => Promise<void>
   setCurrentSiteKey: (key: string) => void
   setCategories: (cats: Category[]) => void
-  setFilters: (filters: Filter[]) => void
+  setFilters: (filters: Record<string, Filter[]>) => void
   reset: () => void
 }
 
@@ -96,36 +97,13 @@ function isVisibleSite(s: Site): boolean {
 }
 
 /**
- * 从多个配置中找到有可用站点的配置
- * 策略：遍历所有配置，找到第一个有 type=0/1/4 站点的配置
- */
-async function findConfigWithVisibleSites(
-  excludeUrl?: string
-): Promise<{ config: VodConfig; url: string } | null> {
-  const configList = await window.api.invoke('config:list') as { url: string; name: string }[]
-  for (const cfg of configList) {
-    if (cfg.url === excludeUrl) continue
-    try {
-      const res = await window.api.invoke('config:load', cfg.url) as { success: boolean; data?: VodConfig; error?: string }
-      if (res.success && res.data) {
-        const visibleSites = (res.data.sites || []).filter(isVisibleSite)
-        if (visibleSites.length > 0) {
-          return { config: res.data, url: cfg.url }
-        }
-      }
-    } catch { /* 忽略 */ }
-  }
-  return null
-}
-
-/**
  * 并行探测站点，返回第一个成功的
  */
 async function probeSites(
   siteKeys: string[]
 ): Promise<{ siteKey: string; result: any } | null> {
   if (siteKeys.length === 0) return null
-  const probeRes = await window.api.invoke('site:probe', siteKeys) as {
+  const probeRes = await invoke('site:probe', siteKeys) as {
     success: boolean; data?: { siteKey: string; result: any }; error?: string
   }
   if (probeRes.success && probeRes.data) {
@@ -138,9 +116,19 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
   ...initialState,
 
   loadConfig: async (url: string) => {
-    set({ isLoading: true, error: null, categories: [], filters: {}, homeVideos: [], categoryVideos: [] })
+    set({
+      isLoading: true,
+      error: null,
+      currentSiteKey: '',
+      categories: [],
+      filters: {},
+      homeVideos: [],
+      categoryVideos: [],
+      currentPage: 1,
+      hasMore: true
+    })
     try {
-      const res = await window.api.invoke('config:load', url) as { success: boolean; data?: VodConfig; error?: string }
+      const res = await invoke('config:load', url) as { success: boolean; data?: VodConfig; error?: string }
       if (!res.success || !res.data) {
         set({ isLoading: false, error: res.error || '加载配置失败' })
         return
@@ -181,40 +169,15 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
           })
         }
       } else {
-        // 当前配置没有可用站点，自动查找有站点的配置用于首页
-        console.log('[ConfigStore] 当前配置无可见站点，自动查找其他配置')
-        const altResult = await findConfigWithVisibleSites(url)
-        if (altResult) {
-          console.log('[ConfigStore] 找到有站点的配置:', altResult.url, '站点数:', altResult.config.sites.filter(isVisibleSite).length)
-          // 用新配置的站点数据用于首页，但保留原配置的直播源
-          const mergedConfig: VodConfig = {
-            ...altResult.config,
-            lives: config.lives || altResult.config.lives,
-            parses: config.parses || altResult.config.parses
-          }
-          set({ currentConfig: mergedConfig, sites: altResult.config.sites || [] })
-          if (!get().liveConfig && (altResult.config.lives?.length || 0) > 0) {
-            set({ liveConfig: altResult.config })
-          }
-
-          const altVisibleSites = altResult.config.sites.filter(isVisibleSite)
-          const probeResult = await probeSites(altVisibleSites.map(s => s.key))
-          if (probeResult) {
-            set({
-              currentSiteKey: probeResult.siteKey,
-              categories: probeResult.result.class || probeResult.result.types || [],
-              filters: probeResult.result.filters || {},
-              homeVideos: probeResult.result.list || [],
-              isLoading: false
-            })
-          } else {
-            set({ currentSiteKey: altVisibleSites[0].key, isLoading: false })
-          }
-        } else {
-          // 所有配置都没有可用站点
-          // 仍然保留当前配置（可能有直播源可用）
-          set({ isLoading: false, error: '当前配置没有可用的影视站点，请在设置中添加配置源' })
-        }
+        set({
+          currentSiteKey: '',
+          categories: [],
+          filters: {},
+          homeVideos: [],
+          categoryVideos: [],
+          isLoading: false,
+          error: hasLives ? null : '当前配置没有可用的影视站点，请切换配置源'
+        })
       }
     } catch (e: any) {
       console.error('[ConfigStore] loadConfig 失败:', e)
@@ -225,7 +188,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
   switchSite: async (siteKey: string) => {
     set({ currentSiteKey: siteKey, categories: [], filters: {}, homeVideos: [], categoryVideos: [], currentPage: 1, isLoading: true, error: null })
     try {
-      const res = await window.api.invoke('site:homeContent', siteKey, true) as { success: boolean; data?: any; error?: string }
+      const res = await invoke('site:homeContent', siteKey, true) as { success: boolean; data?: any; error?: string }
       if (res.success && res.data) {
         const result = res.data || {}
         set({
@@ -247,7 +210,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
     if (!currentSiteKey) return false
     set({ isLoading: true, error: null })
     try {
-      const res = await window.api.invoke('site:homeContent', currentSiteKey, true) as { success: boolean; data?: any; error?: string }
+      const res = await invoke('site:homeContent', currentSiteKey, true) as { success: boolean; data?: any; error?: string }
       if (!res.success) {
         set({ isLoading: false, error: res.error || '获取首页内容失败' })
         return false
@@ -269,7 +232,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
     if (!currentSiteKey) return
     set({ isLoading: true, error: null })
     try {
-      const res = await window.api.invoke('site:categoryContent', currentSiteKey, tid, String(pg), true, extend || {}) as { success: boolean; data?: any; error?: string }
+      const res = await invoke('site:categoryContent', currentSiteKey, tid, String(pg), true, extend || {}) as { success: boolean; data?: any; error?: string }
       const result = res.data || {}
       const newList = result.list || []
       set({
@@ -285,6 +248,6 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
 
   setCurrentSiteKey: (key: string) => set({ currentSiteKey: key }),
   setCategories: (cats: Category[]) => set({ categories: cats }),
-  setFilters: (filters: Filter[]) => set({ filters: filters }),
+  setFilters: (filters: Record<string, Filter[]>) => set({ filters }),
   reset: () => set(initialState)
 }))

@@ -2,8 +2,9 @@
 node_modules/
 
 # Build output
-out/
 dist/
+src-tauri/target/
+src-tauri/gen/
 
 # Data & Cache
 data/

@@ -4,9 +4,10 @@ interface VodCardProps {
   vod: Vod
   onClick: (vod: Vod) => void
   loading?: boolean
+  sourceName?: string
 }
 
-export default function VodCard({ vod, onClick, loading }: VodCardProps) {
+export default function VodCard({ vod, onClick, loading, sourceName }: VodCardProps) {
   if (loading) {
     return (
       <div className="flex flex-col gap-2 animate-pulse">
@@ -37,6 +38,12 @@ export default function VodCard({ vod, onClick, loading }: VodCardProps) {
         {vod.vod_remarks && (
           <span className="absolute top-1.5 right-1.5 px-1.5 py-0.5 text-[10px] font-medium bg-accent/90 text-bg-primary rounded">
             {vod.vod_remarks}
+          </span>
+        )}
+        {/* 来源角标 */}
+        {sourceName && (
+          <span className="absolute bottom-1.5 left-1.5 px-1.5 py-0.5 text-[10px] bg-black/70 text-white/80 rounded">
+            {sourceName}
           </span>
         )}
         {/* Hover 遮罩 */}

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState, useEffect } from 'react'
 import { ChevronRight, ChevronDown, Play } from 'lucide-react'
 
 interface Channel {
@@ -29,9 +29,31 @@ interface LiveTreeProps {
   currentChannelName?: string
 }
 
-export default function LiveTree({ tree, onChannelClick, currentChannelName }: LiveTreeProps) {
-  const [expandedCountries, setExpandedCountries] = useState<Set<string>>(new Set(['中国']))
+function LiveTree({ tree, onChannelClick, currentChannelName }: LiveTreeProps) {
+  const [expandedCountries, setExpandedCountries] = useState<Set<string>>(new Set())
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set())
+
+  // 自动展开第一个国家节点，以及每个已展开国家的第一个分类
+  useEffect(() => {
+    setExpandedCountries((prev) => {
+      const next = new Set(prev)
+      if (tree.countries.length > 0) {
+        next.add(tree.countries[0].name)
+      }
+      return next
+    })
+  }, [tree])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 自动展开每个已展开国家的第一个分类
+  useEffect(() => {
+    const initial = new Set<string>()
+    for (const country of tree.countries) {
+      if (expandedCountries.has(country.name) && country.categories.length > 0) {
+        initial.add(country.name + '-' + country.categories[0].name)
+      }
+    }
+    setExpandedCategories(initial)
+  }, [tree])  // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleCountry = (name: string) => {
     const next = new Set(expandedCountries)
@@ -57,7 +79,10 @@ export default function LiveTree({ tree, onChannelClick, currentChannelName }: L
   }
 
   return (
-    <div className="flex-1 overflow-y-auto scrollbar-dark py-2">
+    <div
+      className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-dark py-2"
+      data-testid="live-channel-tree"
+    >
       {tree.countries.map((country) => {
         const isCountryExpanded = expandedCountries.has(country.name)
         return (
@@ -85,7 +110,11 @@ export default function LiveTree({ tree, onChannelClick, currentChannelName }: L
                   const catKey = `${country.name}-${category.name}`
                   const isCatExpanded = expandedCategories.has(catKey)
                   return (
-                    <div key={catKey} className="mb-0.5">
+                    <div
+                      key={catKey}
+                      className="mb-0.5"
+                      style={{ contentVisibility: 'auto', containIntrinsicSize: '32px' }}
+                    >
                       <button
                         onClick={() => toggleCategory(country.name, category.name)}
                         className="w-full flex items-center gap-1.5 px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors"
@@ -104,12 +133,12 @@ export default function LiveTree({ tree, onChannelClick, currentChannelName }: L
                       {/* 频道列表 */}
                       {isCatExpanded && (
                         <div className="ml-4">
-                          {category.channels.map((channel) => {
+                          {category.channels.map((channel, channelIndex) => {
                             const isActive = channel.name === currentChannelName
                             return (
                               <button
-                                key={channel.name}
-                                onClick={() => onChannelClick({ ...channel })}
+                                key={`${channel.name}:${channel.urls?.[0] || 'no-url'}:${channelIndex}`}
+                                onClick={() => onChannelClick(channel)}
                                 className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left transition-colors ${
                                   isActive
                                     ? 'bg-accent-muted text-accent font-medium'
@@ -139,3 +168,5 @@ export default function LiveTree({ tree, onChannelClick, currentChannelName }: L
     </div>
   )
 }
+
+export default memo(LiveTree)

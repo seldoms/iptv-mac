@@ -1,0 +1,579 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { useRef, useEffect, useCallback, useState } from 'react';
+import Hls from 'hls.js';
+import dashjs from 'dashjs';
+import { usePlayerStore } from '@/stores/usePlayerStore';
+import DanmakuLayer from '@/components/DanmakuLayer/DanmakuLayer';
+import SubtitleLayer from '@/components/SubtitleLayer/SubtitleLayer';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, SkipBack, SkipForward, MessageSquare, PictureInPicture2, Loader2, ClipboardList, Copy, X, RotateCw, Shuffle } from 'lucide-react';
+import { windowApi } from '@/utils/ipc';
+import { redactHeaders, redactText } from '@/utils/redact';
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+const MAX_HLS_NETWORK_RECOVERY_ATTEMPTS = 3;
+const MAX_HLS_MEDIA_RECOVERY_ATTEMPTS = 2;
+const emptyStreamStats = {
+    bitrateKbps: null,
+    linkSpeedKbps: null,
+    updatedAt: 0
+};
+function formatThroughput(kbps) {
+    if (!kbps || !Number.isFinite(kbps) || kbps <= 0)
+        return '--';
+    if (kbps >= 1000)
+        return `${(kbps / 1000).toFixed(kbps >= 10000 ? 0 : 1)} Mbps`;
+    return `${Math.round(kbps)} Kbps`;
+}
+export default function VideoPlayer() {
+    const videoRef = useRef(null);
+    const containerRef = useRef(null);
+    const hlsRef = useRef(null);
+    const dashRef = useRef(null);
+    const hideTimerRef = useRef(0);
+    /** 加载启动时间，用于判断加载超时 */
+    const loadStartTimeRef = useRef(0);
+    /** 是否已触发过失败事件，防止重复触发 */
+    const failureReportedRef = useRef(false);
+    /** 加载超时定时器 ID */
+    const loadTimeoutRef = useRef(0);
+    /** 是否已实际开始播放（用 ref 而非 state，避免触发 effect 重跑） */
+    const hasPlaybackStartedRef = useRef(false);
+    /** 当前正在播放的 URL（用于判断是否需要重新加载） */
+    const loadedUrlRef = useRef('');
+    /** 上一个 HLS 分片加载完成时间，用于估算链路速度 */
+    const lastFragLoadedAtRef = useRef(0);
+    /** stalled 防抖定时器 - 持续停滞超过阈值才显示覆盖层 */
+    const stalledTimerRef = useRef(0);
+    // 用 ref 缓存 store 中的 siteKey/vodId，避免 reportPlayFailure 引用变化导致 effect 重跑
+    const currentSiteKeyRef = useRef('');
+    const currentVodIdRef = useRef('');
+    const { isPlaying, currentUrl, playKey, currentTime, duration, speed, volume, isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex, playHeader, currentSiteKey, currentVod, playbackPhase, playbackMessage, playbackError, playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, sourceSwitchState, sourceSwitchMessage, autoSwitchSource, setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume, toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode, setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource } = usePlayerStore();
+    // 同步 siteKey/vodId 到 ref（变化时不影响 effect）
+    useEffect(() => {
+        currentSiteKeyRef.current = currentSiteKey || '';
+        currentVodIdRef.current = currentVod?.vod_id || '';
+    }, [currentSiteKey, currentVod?.vod_id]);
+    const [showControls, setShowControls] = useState(true);
+    const [showSpeedMenu, setShowSpeedMenu] = useState(false);
+    const [showDiagnostics, setShowDiagnostics] = useState(false);
+    const [copyState, setCopyState] = useState('idle');
+    const [isDragging, setIsDragging] = useState(false);
+    const [isActualFullscreen, setIsActualFullscreen] = useState(false);
+    const [streamStats, setStreamStats] = useState(emptyStreamStats);
+    // ==================== 换源：触发失败事件 ====================
+    // 稳定的 ref 函数，不依赖外部 state 变化
+    const reportPlayFailureRef = useRef((reason) => {
+        if (failureReportedRef.current)
+            return;
+        failureReportedRef.current = true;
+        const siteKey = currentSiteKeyRef.current;
+        const vodId = currentVodIdRef.current;
+        console.error('[VideoPlayer] 播放失败:', reason, 'siteKey:', siteKey, 'vodId:', vodId);
+        usePlayerStore.getState().setPlaybackError(reason);
+        const detail = { siteKey, vodId, reason, autoSwitch: true };
+        window.dispatchEvent(new CustomEvent(siteKey || vodId ? 'vod:playFailed' : 'live:playFailed', { detail }));
+    });
+    // 清除加载超时的工具函数
+    const clearLoadTimeout = useCallback(() => {
+        if (loadTimeoutRef.current) {
+            clearTimeout(loadTimeoutRef.current);
+            loadTimeoutRef.current = 0;
+        }
+    }, []);
+    const clearStalledTimer = useCallback(() => {
+        if (stalledTimerRef.current) {
+            clearTimeout(stalledTimerRef.current);
+            stalledTimerRef.current = 0;
+        }
+    }, []);
+    const resetPlaybackPhase = useCallback(() => {
+        setPlaybackPhase('playing', '');
+    }, [setPlaybackPhase]);
+    const markPlaybackStarted = useCallback(() => {
+        if (hasPlaybackStartedRef.current)
+            return;
+        hasPlaybackStartedRef.current = true;
+        const video = videoRef.current;
+        console.log('[VideoPlayer] 首帧播放成功:', `time=${video?.currentTime.toFixed(2) || '0.00'}`, `size=${video?.videoWidth || 0}x${video?.videoHeight || 0}`);
+        markPlaybackFirstFrame();
+        clearLoadTimeout();
+        clearStalledTimer();
+    }, [clearLoadTimeout, clearStalledTimer, markPlaybackFirstFrame]);
+    // 进入精简模式
+    const handleEnterMiniMode = useCallback(async () => {
+        if (!currentUrl)
+            return;
+        const video = videoRef.current;
+        const savedTime = video?.currentTime || currentTime;
+        setIsPlaying(false);
+        await windowApi.savePlayerState({ url: currentUrl, header: playHeader || undefined, currentTime: savedTime });
+        await windowApi.enterMiniMode();
+    }, [currentUrl, playHeader, currentTime, setIsPlaying]);
+    // 初始化播放器 - 仅在 URL/header 变化时重跑
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video || !currentUrl)
+            return;
+        // 清理旧实例
+        hlsRef.current?.destroy();
+        dashRef.current?.reset();
+        hlsRef.current = null;
+        dashRef.current = null;
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        // 重置失败标记和播放标记
+        failureReportedRef.current = false;
+        hasPlaybackStartedRef.current = false;
+        lastFragLoadedAtRef.current = 0;
+        setStreamStats(emptyStreamStats);
+        loadStartTimeRef.current = Date.now();
+        setPlaybackPhase('connecting', '正在连接播放地址...');
+        clearLoadTimeout();
+        // 关键修复：重置 loadedUrlRef，确保新的播放会话能被正确处理
+        // 之前这里不重置导致同 URL 切换频道时无法触发重新加载
+        loadedUrlRef.current = currentUrl;
+        // 启动加载超时检测（25秒无任何播放进度视为失败）
+        loadTimeoutRef.current = window.setTimeout(() => {
+            if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+                console.error('[VideoPlayer] 加载超时（25秒）');
+                reportPlayFailureRef.current('加载超时（25秒）');
+            }
+        }, 25000);
+        let hlsRecoveryTimer = 0;
+        if (currentUrl.includes('.mpd')) {
+            // DASH
+            const player = dashjs.MediaPlayer().create();
+            player.initialize(video, currentUrl, true);
+            dashRef.current = player;
+        }
+        else if (Hls.isSupported()) {
+            let networkRecoveryAttempts = 0;
+            let mediaRecoveryAttempts = 0;
+            // 优先使用 HLS.js
+            const hls = new Hls({
+                // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
+                enableWorker: false,
+                xhrSetup: (xhr, _url) => {
+                    if (playHeader) {
+                        for (const [key, value] of Object.entries(playHeader)) {
+                            xhr.setRequestHeader(key, value);
+                        }
+                    }
+                }
+            });
+            hls.loadSource(currentUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                console.log('[VideoPlayer] HLS manifest 解析成功');
+                setPlaybackPhase('buffering', '清单已加载，正在缓冲...');
+                video.play().catch(() => { });
+            });
+            hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+                networkRecoveryAttempts = 0;
+                const now = performance.now();
+                const payloadBytes = data.payload?.byteLength || 0;
+                const elapsedMs = lastFragLoadedAtRef.current ? now - lastFragLoadedAtRef.current : 0;
+                const fragmentDuration = data.part?.duration || data.frag?.duration || 0;
+                const currentLevel = hls.levels[hls.currentLevel];
+                const levelBitrateKbps = currentLevel?.bitrate ? currentLevel.bitrate / 1000 : null;
+                const fragmentBitrateKbps = payloadBytes && fragmentDuration > 0
+                    ? (payloadBytes * 8) / fragmentDuration / 1000
+                    : null;
+                const hlsBandwidthKbps = hls.bandwidthEstimate ? hls.bandwidthEstimate / 1000 : null;
+                const linkSpeedKbps = payloadBytes && elapsedMs > 100
+                    ? (payloadBytes * 8) / (elapsedMs / 1000) / 1000
+                    : null;
+                lastFragLoadedAtRef.current = now;
+                setStreamStats((prev) => ({
+                    bitrateKbps: levelBitrateKbps || fragmentBitrateKbps || prev.bitrateKbps,
+                    linkSpeedKbps: hlsBandwidthKbps || linkSpeedKbps || prev.linkSpeedKbps,
+                    updatedAt: Date.now()
+                }));
+            });
+            hls.on(Hls.Events.ERROR, (_event, data) => {
+                console.error('[VideoPlayer] HLS错误:', data.type, data.details, data.fatal);
+                if (failureReportedRef.current)
+                    return;
+                if (!data.fatal &&
+                    video.currentTime <= 0 &&
+                    (data.details === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
+                        data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
+                        data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR)) {
+                    hls.stopLoad();
+                    reportPlayFailureRef.current(`HLS首帧加载失败: ${data.details}`);
+                    return;
+                }
+                if (!data.fatal)
+                    return;
+                switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR: {
+                        if (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR) {
+                            hls.stopLoad();
+                            reportPlayFailureRef.current('HLS主清单加载失败');
+                            return;
+                        }
+                        networkRecoveryAttempts++;
+                        if (networkRecoveryAttempts > MAX_HLS_NETWORK_RECOVERY_ATTEMPTS) {
+                            hls.stopLoad();
+                            reportPlayFailureRef.current(`HLS网络错误重试${MAX_HLS_NETWORK_RECOVERY_ATTEMPTS}次仍失败`);
+                            return;
+                        }
+                        if (hlsRecoveryTimer)
+                            return;
+                        const delay = networkRecoveryAttempts * 750;
+                        console.warn(`[VideoPlayer] HLS网络错误，第${networkRecoveryAttempts}次恢复，${delay}ms 后重试`);
+                        setPlaybackPhase('recovering', `网络波动，正在第 ${networkRecoveryAttempts} 次恢复...`);
+                        hlsRecoveryTimer = window.setTimeout(() => {
+                            hlsRecoveryTimer = 0;
+                            if (!failureReportedRef.current)
+                                hls.startLoad();
+                        }, delay);
+                        break;
+                    }
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        mediaRecoveryAttempts++;
+                        if (mediaRecoveryAttempts > MAX_HLS_MEDIA_RECOVERY_ATTEMPTS) {
+                            hls.stopLoad();
+                            reportPlayFailureRef.current(`HLS媒体错误重试${MAX_HLS_MEDIA_RECOVERY_ATTEMPTS}次仍失败`);
+                            return;
+                        }
+                        console.warn(`[VideoPlayer] HLS媒体错误，第${mediaRecoveryAttempts}次恢复`);
+                        setPlaybackPhase('recovering', `媒体错误，正在第 ${mediaRecoveryAttempts} 次恢复...`);
+                        hls.recoverMediaError();
+                        break;
+                    default:
+                        hls.stopLoad();
+                        reportPlayFailureRef.current(`HLS无法恢复: ${data.details}`);
+                }
+            });
+            hlsRef.current = hls;
+        }
+        else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari 原生 HLS
+            video.src = currentUrl;
+            video.play().catch(() => { });
+        }
+        else {
+            // 原生播放
+            video.src = currentUrl;
+            video.play().catch(() => { });
+        }
+        // 视频错误处理
+        const onError = () => {
+            const error = video.error;
+            console.error('[VideoPlayer] 视频播放错误:', error?.code, error?.message);
+            // 关键修复：3 秒后再次检查，如果视频已经成功播放（currentTime > 0 且未暂停），说明 HLS 已恢复，不应触发失败
+            setTimeout(() => {
+                if (failureReportedRef.current)
+                    return;
+                if (hasPlaybackStartedRef.current) {
+                    console.log('[VideoPlayer] video error 但已实际播放（HLS 恢复成功），忽略');
+                    return;
+                }
+                if (video.currentTime > 0 && !video.paused) {
+                    console.log('[VideoPlayer] video error 但视频在播放，忽略');
+                    markPlaybackStarted();
+                    return;
+                }
+                if (video.error) {
+                    reportPlayFailureRef.current(`视频错误: code=${error?.code}`);
+                }
+            }, 3000);
+            // 如果 HLS.js 正在使用但视频报错，尝试回退到原生播放
+            if (hlsRef.current && error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+                console.log('[VideoPlayer] 回退到原生播放');
+                hlsRef.current.destroy();
+                hlsRef.current = null;
+                video.src = currentUrl;
+                video.play().catch(() => { });
+            }
+        };
+        video.addEventListener('error', onError);
+        const onWaiting = () => {
+            if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+                setPlaybackPhase('buffering', '正在缓冲...');
+            }
+        };
+        const onCanPlay = () => {
+            if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+                setPlaybackPhase('buffering', '已获取媒体数据，准备播放...');
+            }
+        };
+        const onStalled = () => {
+            // 防抖：停滞超过 2.5 秒才显示覆盖层
+            clearStalledTimer();
+            stalledTimerRef.current = window.setTimeout(() => {
+                if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+                    setPlaybackPhase('recovering', '媒体加载停滞，正在等待恢复...');
+                }
+            }, 2500);
+        };
+        video.addEventListener('waiting', onWaiting);
+        video.addEventListener('canplay', onCanPlay);
+        video.addEventListener('stalled', onStalled);
+        return () => {
+            video.removeEventListener('error', onError);
+            video.removeEventListener('waiting', onWaiting);
+            video.removeEventListener('canplay', onCanPlay);
+            video.removeEventListener('stalled', onStalled);
+            hlsRef.current?.destroy();
+            dashRef.current?.reset();
+            hlsRef.current = null;
+            dashRef.current = null;
+            if (hlsRecoveryTimer)
+                clearTimeout(hlsRecoveryTimer);
+            clearLoadTimeout();
+            clearStalledTimer();
+        };
+        // 关键修复：依赖只有 currentUrl 和 playHeader，不再依赖 hasPlaybackStarted/reportPlayFailure
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [currentUrl, playHeader, playKey]);
+    // 同步播放状态
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video)
+            return;
+        if (isPlaying)
+            video.play().catch(() => { });
+        else
+            video.pause();
+    }, [isPlaying]);
+    // 同步音量/倍速
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video)
+            return;
+        video.volume = volume;
+        video.playbackRate = speed;
+    }, [volume, speed]);
+    // 视频事件
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video)
+            return;
+        const onTimeUpdate = () => {
+            setCurrentTime(video.currentTime);
+            if (video.currentTime > 0)
+                markPlaybackStarted();
+        };
+        const onDurationChange = () => setDuration(video.duration || 0);
+        const onPlay = () => setIsPlaying(true);
+        const onPause = () => setIsPlaying(false);
+        const onPlaying = () => {
+            if (video.currentTime > 0) {
+                markPlaybackStarted();
+                // 已开始播放时隐藏 stalled/buffering 覆盖层
+                clearStalledTimer();
+                if (playbackPhase === 'recovering' || playbackPhase === 'buffering') {
+                    resetPlaybackPhase();
+                }
+            }
+        };
+        const onEnded = () => {
+            if (currentEpisodeIndex < episodes.length - 1)
+                nextEpisode();
+            else
+                setIsPlaying(false);
+        };
+        video.addEventListener('timeupdate', onTimeUpdate);
+        video.addEventListener('durationchange', onDurationChange);
+        video.addEventListener('play', onPlay);
+        video.addEventListener('pause', onPause);
+        video.addEventListener('playing', onPlaying);
+        video.addEventListener('ended', onEnded);
+        return () => {
+            video.removeEventListener('timeupdate', onTimeUpdate);
+            video.removeEventListener('durationchange', onDurationChange);
+            video.removeEventListener('play', onPlay);
+            video.removeEventListener('pause', onPause);
+            video.removeEventListener('playing', onPlaying);
+            video.removeEventListener('ended', onEnded);
+        };
+    }, [currentEpisodeIndex, episodes.length, markPlaybackStarted, nextEpisode, setDuration, setCurrentTime, setIsPlaying]);
+    // 控制栏自动隐藏
+    const resetHideTimer = useCallback(() => {
+        setShowControls(true);
+        clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = window.setTimeout(() => {
+            if (isPlaying)
+                setShowControls(false);
+        }, 3000);
+    }, [isPlaying]);
+    // 全屏切换
+    const handleToggleFullscreen = useCallback(() => {
+        const container = containerRef.current;
+        if (!container)
+            return;
+        if (document.fullscreenElement) {
+            document.exitFullscreen();
+        }
+        else {
+            container.requestFullscreen();
+        }
+    }, []);
+    // 监听全屏变化
+    useEffect(() => {
+        const handler = () => setIsActualFullscreen(!!document.fullscreenElement);
+        document.addEventListener('fullscreenchange', handler);
+        return () => document.removeEventListener('fullscreenchange', handler);
+    }, []);
+    // 关键修复：监听页面可见性变化，切回时自动恢复播放
+    // 即使 backgroundThrottling=false，macOS 系统级切换仍可能让 video 暂停
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            const video = videoRef.current;
+            if (!video)
+                return;
+            if (document.visibilityState === 'visible') {
+                // 切回前台：如果应该播放却暂停了，自动恢复
+                if (isPlaying && video.paused && hasPlaybackStartedRef.current) {
+                    console.log('[VideoPlayer] 切回前台，恢复播放');
+                    video.play().catch((err) => {
+                        console.warn('[VideoPlayer] 自动恢复播放失败:', err);
+                    });
+                }
+                else if (isPlaying && video.paused && currentUrl) {
+                    // 还未开始播放但已加载 URL - 尝试重新触发 HLS 加载
+                    console.log('[VideoPlayer] 切回前台，重新开始加载');
+                    if (hlsRef.current) {
+                        try {
+                            hlsRef.current.startLoad();
+                        }
+                        catch { }
+                    }
+                    else {
+                        // 没有 HLS 实例（可能用原生 video），尝试直接 play
+                        video.play().catch(() => { });
+                    }
+                }
+            }
+        };
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        window.addEventListener('focus', handleVisibilityChange);
+        return () => {
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+            window.removeEventListener('focus', handleVisibilityChange);
+        };
+    }, [isPlaying, currentUrl]);
+    // 键盘快捷键
+    useEffect(() => {
+        const handleKeyDown = (e) => {
+            const video = videoRef.current;
+            if (!video)
+                return;
+            switch (e.key) {
+                case ' ':
+                    e.preventDefault();
+                    setIsPlaying(!isPlaying);
+                    break;
+                case 'ArrowLeft':
+                    video.currentTime = Math.max(0, video.currentTime - 10);
+                    break;
+                case 'ArrowRight':
+                    video.currentTime = Math.min(video.duration, video.currentTime + 10);
+                    break;
+                case 'ArrowUp':
+                    e.preventDefault();
+                    setVolume(Math.min(1, volume + 0.1));
+                    break;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    setVolume(Math.max(0, volume - 0.1));
+                    break;
+                case 'f':
+                    handleToggleFullscreen();
+                    break;
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [isPlaying, volume, handleToggleFullscreen, setIsPlaying, setVolume]);
+    // 进度条拖动
+    const handleProgressClick = (e) => {
+        const video = videoRef.current;
+        if (!video || !duration)
+            return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        video.currentTime = ratio * duration;
+    };
+    const formatTime = (s) => {
+        if (!s || isNaN(s))
+            return '00:00';
+        const m = Math.floor(s / 60);
+        const sec = Math.floor(s % 60);
+        return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+    };
+    const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+    const showPlaybackOverlay = playbackPhase !== 'idle' && playbackPhase !== 'playing';
+    const overlayText = playbackPhase === 'failed'
+        ? playbackError || playbackMessage || '播放失败'
+        : playbackMessage || (currentUrl === '__resolving__' ? '解析播放地址中...' : '加载中...');
+    const firstFrameMs = playbackStartedAt && playbackFirstFrameAt
+        ? Math.max(0, playbackFirstFrameAt - playbackStartedAt)
+        : null;
+    const elapsedMs = playbackStartedAt ? Math.max(0, Date.now() - playbackStartedAt) : 0;
+    const redactedUrl = currentUrl ? redactText(currentUrl) : '';
+    const redactedHeaders = redactHeaders(playHeader);
+    const bitrateText = formatThroughput(streamStats.bitrateKbps);
+    const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps);
+    const buildDiagnosticsText = () => {
+        const lines = [
+            'IPTV Mac 播放诊断',
+            `阶段: ${playbackPhase}`,
+            `状态: ${playbackMessage || '-'}`,
+            `错误: ${playbackError || '-'}`,
+            `站点: ${currentSiteKey || '-'}`,
+            `影片: ${currentVod?.vod_name || '-'}`,
+            `集数: ${episodes[currentEpisodeIndex]?.name || currentEpisodeIndex + 1 || '-'}`,
+            `线路索引: ${currentEpisodeIndex + 1}/${episodes.length || 0}`,
+            `首帧耗时: ${firstFrameMs == null ? '-' : `${firstFrameMs}ms`}`,
+            `当前耗时: ${elapsedMs}ms`,
+            `失败时间: ${playbackLastErrorAt ? new Date(playbackLastErrorAt).toISOString() : '-'}`,
+            `换源状态: ${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`,
+            `URL: ${redactedUrl || '-'}`,
+            `Headers: ${Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders) : '-'}`
+        ];
+        return lines.join('\n');
+    };
+    const handleCopyDiagnostics = async () => {
+        try {
+            const text = buildDiagnosticsText();
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+            }
+            else {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                textarea.style.position = 'fixed';
+                textarea.style.left = '-9999px';
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+            }
+            setCopyState('copied');
+            window.setTimeout(() => setCopyState('idle'), 1800);
+        }
+        catch {
+            setCopyState('failed');
+            window.setTimeout(() => setCopyState('idle'), 1800);
+        }
+    };
+    const handleRetryPlayback = () => {
+        window.dispatchEvent(new CustomEvent('player:retry'));
+    };
+    const handleNextSource = () => {
+        window.dispatchEvent(new CustomEvent('player:nextSource'));
+    };
+    return (_jsxs("div", { ref: containerRef, className: "relative w-full h-full bg-black group", onMouseMove: resetHideTimer, onMouseLeave: () => isPlaying && setShowControls(false), onDoubleClick: handleToggleFullscreen, children: [_jsx("video", { ref: videoRef, className: "w-full h-full object-contain", playsInline: true }), currentUrl && (_jsxs("div", { className: "pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u7801\u7387" }), _jsx("span", { className: "font-mono text-white", children: bitrateText })] }), _jsxs("div", { className: "mt-0.5 flex items-center justify-between gap-3", children: [_jsx("span", { className: "text-white/45", children: "\u901F\u5EA6" }), _jsx("span", { className: "font-mono text-white", children: linkSpeedText })] })] })), showPlaybackOverlay && (_jsxs("div", { className: "absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center", children: [playbackPhase === 'failed' ? (_jsx("div", { className: "flex h-10 w-10 items-center justify-center rounded-full border border-red-400/40 text-red-400", children: "!" })) : (_jsx(Loader2, { className: "w-8 h-8 animate-spin text-accent" })), _jsx("span", { className: "text-sm text-white/80", children: overlayText }), playbackPhase === 'failed' && (_jsx("span", { className: "max-w-md text-xs leading-5 text-white/50", children: "\u5E94\u7528\u4F1A\u5C1D\u8BD5\u81EA\u52A8\u6362\u6E90\uFF1B\u4E5F\u53EF\u4EE5\u5207\u6362\u7EBF\u8DEF\u6216\u91CD\u8BD5\u5F53\u524D\u96C6\u3002" }))] })), isDanmakuOn && _jsx(DanmakuLayer, {}), _jsx(SubtitleLayer, {}), _jsxs("div", { className: `absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-4 pb-3 pt-10 transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'}`, children: [_jsx("div", { className: "mb-2 cursor-pointer group/progress", onClick: handleProgressClick, children: _jsx("div", { className: "h-1 group-hover/progress:h-2 bg-white/20 rounded-full transition-all relative", children: _jsx("div", { className: "h-full bg-accent rounded-full relative", style: { width: `${progress}%` }, children: _jsx("div", { className: "absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-accent rounded-full opacity-0 group-hover/progress:opacity-100 transition-opacity" }) }) }) }), _jsxs("div", { className: "flex items-center justify-between", children: [_jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: prevEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipBack, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setIsPlaying(!isPlaying), className: "p-1 text-white hover:text-accent", children: isPlaying ? _jsx(Pause, { className: "w-5 h-5" }) : _jsx(Play, { className: "w-5 h-5" }) }), _jsx("button", { onClick: nextEpisode, className: "p-1 text-white/80 hover:text-white", children: _jsx(SkipForward, { className: "w-4 h-4" }) }), _jsxs("span", { className: "text-xs text-white/70 ml-2", children: [formatTime(currentTime), " / ", formatTime(duration)] })] }), _jsxs("div", { className: "flex items-center gap-3", children: [_jsx("button", { onClick: () => setVolume(volume > 0 ? 0 : 1), className: "p-1 text-white/80 hover:text-white", children: volume > 0 ? _jsx(Volume2, { className: "w-4 h-4" }) : _jsx(VolumeX, { className: "w-4 h-4" }) }), _jsx("input", { type: "range", min: 0, max: 1, step: 0.05, value: volume, onChange: (e) => setVolume(Number(e.target.value)), className: "w-16 h-1 accent-accent" }), _jsxs("div", { className: "relative", children: [_jsxs("button", { onClick: () => setShowSpeedMenu(!showSpeedMenu), className: "px-2 py-0.5 text-xs text-white/80 hover:text-white rounded border border-white/20", children: [speed, "x"] }), showSpeedMenu && (_jsx("div", { className: "absolute bottom-full right-0 mb-2 bg-bg-secondary rounded-lg shadow-xl border border-[#2a2a2a] py-1 min-w-[80px]", children: SPEEDS.map((s) => (_jsxs("button", { onClick: () => { setSpeed(s); setShowSpeedMenu(false); }, className: `w-full px-3 py-1.5 text-xs text-left hover:bg-bg-hover ${speed === s ? 'text-accent' : 'text-text-secondary'}`, children: [s, "x"] }, s))) }))] }), _jsx("button", { onClick: toggleDanmaku, className: `p-1 ${isDanmakuOn ? 'text-accent' : 'text-white/40 hover:text-white/70'}`, children: _jsx(MessageSquare, { className: "w-4 h-4" }) }), _jsx("button", { onClick: () => setShowDiagnostics(true), className: `p-1 ${playbackPhase === 'failed' ? 'text-red-400' : 'text-white/80 hover:text-white'}`, title: "\u64AD\u653E\u8BCA\u65AD", children: _jsx(ClipboardList, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleEnterMiniMode, className: "p-1 text-white/80 hover:text-white", title: "\u7CBE\u7B80\u6A21\u5F0F", children: _jsx(PictureInPicture2, { className: "w-4 h-4" }) }), _jsx("button", { onClick: handleToggleFullscreen, className: "p-1 text-white/80 hover:text-white", children: isActualFullscreen ? _jsx(Minimize, { className: "w-4 h-4" }) : _jsx(Maximize, { className: "w-4 h-4" }) })] })] })] }), showDiagnostics && (_jsxs("div", { className: "absolute inset-y-0 right-0 z-40 w-full max-w-sm border-l border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur", children: [_jsxs("div", { className: "flex items-center justify-between border-b border-white/10 px-4 py-3", children: [_jsxs("div", { className: "flex items-center gap-2", children: [_jsx(ClipboardList, { className: "w-4 h-4 text-accent" }), _jsx("h3", { className: "text-sm font-medium text-white", children: "\u64AD\u653E\u8BCA\u65AD" })] }), _jsx("button", { onClick: () => setShowDiagnostics(false), className: "p-1 text-white/60 hover:text-white", title: "\u5173\u95ED", children: _jsx(X, { className: "w-4 h-4" }) })] }), _jsxs("div", { className: "space-y-4 overflow-y-auto px-4 py-4 text-xs text-white/70 scrollbar-dark h-[calc(100%-49px)]", children: [_jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsx(DiagnosticMetric, { label: "\u9636\u6BB5", value: playbackPhase }), _jsx(DiagnosticMetric, { label: "\u9996\u5E27\u8017\u65F6", value: firstFrameMs == null ? '-' : `${firstFrameMs}ms` }), _jsx(DiagnosticMetric, { label: "\u5F53\u524D\u8017\u65F6", value: `${elapsedMs}ms` }), _jsx(DiagnosticMetric, { label: "\u97F3\u91CF/\u500D\u901F", value: `${Math.round(volume * 100)}% / ${speed}x` })] }), _jsxs(DiagnosticSection, { title: "\u72B6\u6001", children: [_jsx("p", { children: playbackMessage || '-' }), playbackError && _jsx("p", { className: "mt-2 text-red-300", children: playbackError }), _jsxs("label", { className: "mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3", children: [_jsx("span", { className: "text-white/60", children: "\u81EA\u52A8\u6362\u6E90" }), _jsx("input", { type: "checkbox", checked: autoSwitchSource, onChange: (event) => setAutoSwitchSource(event.target.checked), className: "h-4 w-4 accent-accent" })] })] }), _jsxs(DiagnosticSection, { title: "\u5185\u5BB9", children: [_jsx(DiagnosticRow, { label: "\u7AD9\u70B9", value: currentSiteKey || '-' }), _jsx(DiagnosticRow, { label: "\u5F71\u7247", value: currentVod?.vod_name || '-' }), _jsx(DiagnosticRow, { label: "\u96C6\u6570", value: episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1) }), _jsx(DiagnosticRow, { label: "\u6362\u6E90", value: `${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}` })] }), _jsx(DiagnosticSection, { title: "\u7EBF\u8DEF", children: _jsx("p", { className: "break-all font-mono text-[11px] leading-5 text-white/60", children: redactedUrl || '-' }) }), _jsx(DiagnosticSection, { title: "\u8BF7\u6C42\u5934", children: _jsx("pre", { className: "whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-white/60", children: Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders, null, 2) : '-' }) }), _jsxs("button", { onClick: handleCopyDiagnostics, className: "flex w-full items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg-primary hover:bg-accent-hover", children: [_jsx(Copy, { className: "w-4 h-4" }), copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制诊断信息'] }), _jsxs("div", { className: "grid grid-cols-2 gap-2", children: [_jsxs("button", { onClick: handleRetryPlayback, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(RotateCw, { className: "w-4 h-4" }), "\u91CD\u8BD5\u5F53\u524D"] }), _jsxs("button", { onClick: handleNextSource, className: "flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10", children: [_jsx(Shuffle, { className: "w-4 h-4" }), "\u5207\u6362\u7EBF\u8DEF"] })] })] })] }))] }));
+}
+function DiagnosticMetric({ label, value }) {
+    return (_jsxs("div", { className: "rounded-lg border border-white/10 bg-white/5 px-3 py-2", children: [_jsx("p", { className: "text-[11px] text-white/40", children: label }), _jsx("p", { className: "mt-1 truncate text-sm text-white", children: value })] }));
+}
+function DiagnosticSection({ title, children }) {
+    return (_jsxs("section", { children: [_jsx("h4", { className: "mb-2 text-[11px] font-medium text-white/40", children: title }), _jsx("div", { className: "rounded-lg border border-white/10 bg-white/5 p-3", children: children })] }));
+}
+function DiagnosticRow({ label, value }) {
+    return (_jsxs("div", { className: "flex items-start justify-between gap-3 py-1", children: [_jsx("span", { className: "shrink-0 text-white/40", children: label }), _jsx("span", { className: "min-w-0 break-all text-right text-white/70", children: value })] }));
+}

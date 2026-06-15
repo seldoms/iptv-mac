@@ -1,20 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Clock, Trash2, Play } from 'lucide-react'
+import { Clock, Trash2 } from 'lucide-react'
 import { historyApi } from '@/utils/ipc'
-
-interface HistoryItem {
-  vod_id: string
-  site_key: string
-  vod_name: string
-  vod_pic: string
-  source_name: string
-  episode_name: string
-  episode_url: string
-  position: number
-  duration: number
-  updated_at: number
-}
+import type { History as HistoryItem } from '@shared/types'
 
 export default function History() {
   const navigate = useNavigate()
@@ -25,7 +13,7 @@ export default function History() {
     setIsLoading(true)
     try {
       const data = (await historyApi.list()) as HistoryItem[]
-      setList(data.sort((a, b) => b.updated_at - a.updated_at))
+      setList(data.sort((a, b) => (b.updateTime || 0) - (a.updateTime || 0)))
     } catch {
       setList([])
     }
@@ -36,25 +24,20 @@ export default function History() {
     loadHistory()
   }, [])
 
-  const handleDelete = async (vodId: string) => {
-    await historyApi.delete(vodId)
-    setList((prev) => prev.filter((item) => item.vod_id !== vodId))
+  const handleDelete = async (siteKey: string, vodId: string) => {
+    await historyApi.delete(siteKey, vodId)
+    setList((prev) => prev.filter((item) => item.siteKey !== siteKey || item.vodId !== vodId))
   }
 
   const handleClearAll = async () => {
     for (const item of list) {
-      await historyApi.delete(item.vod_id)
+      await historyApi.delete(item.siteKey, item.vodId)
     }
     setList([])
   }
 
   const handleClick = (item: HistoryItem) => {
-    navigate(`/vod/${item.site_key}/${item.vod_id}`)
-  }
-
-  const formatProgress = (position: number, duration: number) => {
-    if (!duration) return 0
-    return Math.min(100, (position / duration) * 100)
+    navigate(`/vod/${item.siteKey}/${item.vodId}`)
   }
 
   const formatDate = (timestamp: number) => {
@@ -100,15 +83,15 @@ export default function History() {
           <div className="space-y-3">
             {list.map((item) => (
               <div
-                key={item.vod_id}
+                key={`${item.siteKey}:${item.vodId}`}
                 className="flex items-center gap-4 p-3 rounded-lg bg-bg-secondary hover:bg-bg-hover cursor-pointer transition-colors group"
                 onClick={() => handleClick(item)}
               >
                 {/* 封面 */}
                 <div className="shrink-0 w-16 h-22 rounded overflow-hidden bg-bg-tertiary">
                   <img
-                    src={item.vod_pic}
-                    alt={item.vod_name}
+                    src={item.vodPic}
+                    alt={item.vodName}
                     className="w-full h-full object-cover"
                     onError={(e) => {
                       ;(e.target as HTMLImageElement).style.display = 'none'
@@ -119,32 +102,32 @@ export default function History() {
                 {/* 信息 */}
                 <div className="flex-1 min-w-0">
                   <h3 className="text-sm font-medium text-text-primary truncate group-hover:text-accent transition-colors">
-                    {item.vod_name}
+                    {item.vodName}
                   </h3>
                   <p className="text-xs text-text-muted mt-1">
-                    {item.source_name} · {item.episode_name || '未知集数'}
+                    {item.source || '未知播放源'}
                   </p>
                   <div className="flex items-center gap-2 mt-2">
                     {/* 进度条 */}
                     <div className="flex-1 h-1 bg-bg-tertiary rounded-full overflow-hidden">
                       <div
                         className="h-full bg-accent rounded-full transition-all"
-                        style={{ width: `${formatProgress(item.position, item.duration)}%` }}
+                        style={{ width: `${Math.max(0, Math.min(100, item.progress || 0))}%` }}
                       />
                     </div>
                     <span className="text-[10px] text-text-muted shrink-0">
-                      {formatProgress(item.position, item.duration).toFixed(0)}%
+                      {Math.max(0, Math.min(100, item.progress || 0)).toFixed(0)}%
                     </span>
                   </div>
                 </div>
 
                 {/* 时间和操作 */}
                 <div className="shrink-0 flex flex-col items-end gap-2">
-                  <span className="text-[10px] text-text-muted">{formatDate(item.updated_at)}</span>
+                  <span className="text-[10px] text-text-muted">{formatDate((item.updateTime || 0) * 1000)}</span>
                   <button
                     onClick={(e) => {
                       e.stopPropagation()
-                      handleDelete(item.vod_id)
+                      handleDelete(item.siteKey, item.vodId)
                     }}
                     className="p-1 text-text-muted hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"
                   >

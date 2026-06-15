@@ -30,14 +30,14 @@ export default function LiveRefreshBar({
   // 格式化时间
   const formatTime = (timestamp: number) => {
     if (!timestamp) return '未刷新'
-    const date = new Date(timestamp * 1000)
+    const date = new Date(timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp)
     return `${date.getHours().toString().padStart(2, '0')}:${date.getMinutes().toString().padStart(2, '0')}`
   }
 
   return (
     <div className="border-b border-[#2a2a2a] px-3 py-2 bg-bg-secondary">
       {/* 顶部操作栏 */}
-      <div className="flex items-center justify-between mb-2">
+      <div className={`flex items-center justify-between gap-2 ${isRefreshing ? 'mb-2' : ''}`}>
         <div className="flex items-center gap-2">
           <button
             onClick={onRefresh}
@@ -59,8 +59,8 @@ export default function LiveRefreshBar({
           </button>
         </div>
 
-        <div className="text-[10px] text-text-muted">
-          上次刷新: {formatTime(lastRefreshTime)} · 间隔: {refreshInterval}分钟
+        <div className="text-[10px] text-text-muted truncate">
+          {formatTime(lastRefreshTime)} · {refreshInterval}分钟
         </div>
       </div>
 

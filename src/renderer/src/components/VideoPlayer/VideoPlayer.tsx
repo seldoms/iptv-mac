@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react'
+import type { ReactNode } from 'react'
 import Hls from 'hls.js'
 import dashjs from 'dashjs'
 import { usePlayerStore } from '@/stores/usePlayerStore'
@@ -14,11 +15,38 @@ import {
   SkipBack,
   SkipForward,
   MessageSquare,
-  PictureInPicture2
+  PictureInPicture2,
+  Loader2,
+  ClipboardList,
+  Copy,
+  X,
+  RotateCw,
+  Shuffle
 } from 'lucide-react'
 import { windowApi } from '@/utils/ipc'
+import { redactHeaders, redactText } from '@/utils/redact'
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
+const MAX_HLS_NETWORK_RECOVERY_ATTEMPTS = 3
+const MAX_HLS_MEDIA_RECOVERY_ATTEMPTS = 2
+
+interface StreamStats {
+  bitrateKbps: number | null
+  linkSpeedKbps: number | null
+  updatedAt: number
+}
+
+const emptyStreamStats: StreamStats = {
+  bitrateKbps: null,
+  linkSpeedKbps: null,
+  updatedAt: 0
+}
+
+function formatThroughput(kbps: number | null): string {
+  if (!kbps || !Number.isFinite(kbps) || kbps <= 0) return '--'
+  if (kbps >= 1000) return `${(kbps / 1000).toFixed(kbps >= 10000 ? 0 : 1)} Mbps`
+  return `${Math.round(kbps)} Kbps`
+}
 
 export default function VideoPlayer() {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -36,6 +64,10 @@ export default function VideoPlayer() {
   const hasPlaybackStartedRef = useRef<boolean>(false)
   /** 当前正在播放的 URL（用于判断是否需要重新加载） */
   const loadedUrlRef = useRef<string>('')
+  /** 上一个 HLS 分片加载完成时间，用于估算链路速度 */
+  const lastFragLoadedAtRef = useRef<number>(0)
+  /** stalled 防抖定时器 - 持续停滞超过阈值才显示覆盖层 */
+  const stalledTimerRef = useRef<number>(0)
 
   // 用 ref 缓存 store 中的 siteKey/vodId，避免 reportPlayFailure 引用变化导致 effect 重跑
   const currentSiteKeyRef = useRef<string>('')
@@ -44,9 +76,11 @@ export default function VideoPlayer() {
   const {
     isPlaying, currentUrl, playKey, currentTime, duration, speed, volume,
     isDanmakuOn, isFullscreen, episodes, currentEpisodeIndex,
-    playHeader, currentSiteKey, currentVod,
+    playHeader, currentSiteKey, currentVod, playbackPhase, playbackMessage, playbackError,
+    playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
     setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume,
-    toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode
+    toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode,
+    setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource
   } = usePlayerStore()
 
   // 同步 siteKey/vodId 到 ref（变化时不影响 effect）
@@ -57,8 +91,11 @@ export default function VideoPlayer() {
 
   const [showControls, setShowControls] = useState(true)
   const [showSpeedMenu, setShowSpeedMenu] = useState(false)
+  const [showDiagnostics, setShowDiagnostics] = useState(false)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [isDragging, setIsDragging] = useState(false)
   const [isActualFullscreen, setIsActualFullscreen] = useState(false)
+  const [streamStats, setStreamStats] = useState<StreamStats>(emptyStreamStats)
 
   // ==================== 换源：触发失败事件 ====================
   // 稳定的 ref 函数，不依赖外部 state 变化
@@ -68,9 +105,9 @@ export default function VideoPlayer() {
     const siteKey = currentSiteKeyRef.current
     const vodId = currentVodIdRef.current
     console.error('[VideoPlayer] 播放失败:', reason, 'siteKey:', siteKey, 'vodId:', vodId)
-    window.dispatchEvent(new CustomEvent('vod:playFailed', {
-      detail: { siteKey, vodId, reason, autoSwitch: true }
-    }))
+    usePlayerStore.getState().setPlaybackError(reason)
+    const detail = { siteKey, vodId, reason, autoSwitch: true }
+    window.dispatchEvent(new CustomEvent(siteKey || vodId ? 'vod:playFailed' : 'live:playFailed', { detail }))
   })
 
   // 清除加载超时的工具函数
@@ -81,12 +118,29 @@ export default function VideoPlayer() {
     }
   }, [])
 
-  // 标记已播放（取消超时）
+  const clearStalledTimer = useCallback(() => {
+    if (stalledTimerRef.current) {
+      clearTimeout(stalledTimerRef.current)
+      stalledTimerRef.current = 0
+    }
+  }, [])
+  const resetPlaybackPhase = useCallback(() => {
+    setPlaybackPhase('playing', '')
+  }, [setPlaybackPhase])
+
   const markPlaybackStarted = useCallback(() => {
     if (hasPlaybackStartedRef.current) return
     hasPlaybackStartedRef.current = true
+    const video = videoRef.current
+    console.log(
+      '[VideoPlayer] 首帧播放成功:',
+      `time=${video?.currentTime.toFixed(2) || '0.00'}`,
+      `size=${video?.videoWidth || 0}x${video?.videoHeight || 0}`
+    )
+    markPlaybackFirstFrame()
     clearLoadTimeout()
-  }, [clearLoadTimeout])
+    clearStalledTimer()
+  }, [clearLoadTimeout, clearStalledTimer, markPlaybackFirstFrame])
 
   // 进入精简模式
   const handleEnterMiniMode = useCallback(async () => {
@@ -108,11 +162,17 @@ export default function VideoPlayer() {
     dashRef.current?.reset()
     hlsRef.current = null
     dashRef.current = null
+    video.pause()
+    video.removeAttribute('src')
+    video.load()
 
     // 重置失败标记和播放标记
     failureReportedRef.current = false
     hasPlaybackStartedRef.current = false
+    lastFragLoadedAtRef.current = 0
+    setStreamStats(emptyStreamStats)
     loadStartTimeRef.current = Date.now()
+    setPlaybackPhase('connecting', '正在连接播放地址...')
     clearLoadTimeout()
 
     // 关键修复：重置 loadedUrlRef，确保新的播放会话能被正确处理
@@ -127,15 +187,21 @@ export default function VideoPlayer() {
       }
     }, 25000)
 
+    let hlsRecoveryTimer = 0
+
     if (currentUrl.includes('.mpd')) {
       // DASH
       const player = dashjs.MediaPlayer().create()
       player.initialize(video, currentUrl, true)
       dashRef.current = player
     } else if (Hls.isSupported()) {
+      let networkRecoveryAttempts = 0
+      let mediaRecoveryAttempts = 0
+
       // 优先使用 HLS.js
       const hls = new Hls({
-        enableWorker: true,
+        // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
+        enableWorker: false,
         xhrSetup: (xhr, _url) => {
           if (playHeader) {
             for (const [key, value] of Object.entries(playHeader)) {
@@ -148,51 +214,89 @@ export default function VideoPlayer() {
       hls.attachMedia(video)
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         console.log('[VideoPlayer] HLS manifest 解析成功')
-        markPlaybackStarted()
+        setPlaybackPhase('buffering', '清单已加载，正在缓冲...')
         video.play().catch(() => {})
+      })
+      hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+        networkRecoveryAttempts = 0
+        const now = performance.now()
+        const payloadBytes = data.payload?.byteLength || 0
+        const elapsedMs = lastFragLoadedAtRef.current ? now - lastFragLoadedAtRef.current : 0
+        const fragmentDuration = data.part?.duration || data.frag?.duration || 0
+        const currentLevel = hls.levels[hls.currentLevel]
+        const levelBitrateKbps = currentLevel?.bitrate ? currentLevel.bitrate / 1000 : null
+        const fragmentBitrateKbps = payloadBytes && fragmentDuration > 0
+          ? (payloadBytes * 8) / fragmentDuration / 1000
+          : null
+        const hlsBandwidthKbps = hls.bandwidthEstimate ? hls.bandwidthEstimate / 1000 : null
+        const linkSpeedKbps = payloadBytes && elapsedMs > 100
+          ? (payloadBytes * 8) / (elapsedMs / 1000) / 1000
+          : null
+
+        lastFragLoadedAtRef.current = now
+        setStreamStats((prev) => ({
+          bitrateKbps: levelBitrateKbps || fragmentBitrateKbps || prev.bitrateKbps,
+          linkSpeedKbps: hlsBandwidthKbps || linkSpeedKbps || prev.linkSpeedKbps,
+          updatedAt: Date.now()
+        }))
       })
       hls.on(Hls.Events.ERROR, (_event, data) => {
         console.error('[VideoPlayer] HLS错误:', data.type, data.details, data.fatal)
-        if (data.fatal) {
-          switch (data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              console.log('[VideoPlayer] HLS网络错误，尝试恢复...')
-              hls.startLoad()
-              setTimeout(() => {
-                if (failureReportedRef.current) return
-                if (hasPlaybackStartedRef.current) {
-                  console.log('[VideoPlayer] HLS 恢复成功，忽略')
-                  return
-                }
-                reportPlayFailureRef.current('HLS网络错误且无法恢复')
-              }, 1500)
-              break
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              console.log('[VideoPlayer] HLS媒体错误，尝试恢复...')
-              hls.recoverMediaError()
-              setTimeout(() => {
-                if (failureReportedRef.current) return
-                if (hasPlaybackStartedRef.current) {
-                  console.log('[VideoPlayer] HLS 恢复成功，忽略')
-                  return
-                }
-                reportPlayFailureRef.current('HLS媒体错误且无法恢复')
-              }, 1500)
-              break
-            default:
-              // 无法恢复，回退到原生播放
-              console.log('[VideoPlayer] HLS无法恢复，回退到原生播放')
-              hls.destroy()
-              hlsRef.current = null
-              video.src = currentUrl
-              video.play().catch(() => {})
-              setTimeout(() => {
-                if (failureReportedRef.current) return
-                if (hasPlaybackStartedRef.current) return
-                reportPlayFailureRef.current('HLS无法恢复，源可能无效')
-              }, 3000)
-              break
+        if (failureReportedRef.current) return
+
+        if (
+          !data.fatal &&
+          video.currentTime <= 0 &&
+          (
+            data.details === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
+            data.details === Hls.ErrorDetails.LEVEL_LOAD_ERROR ||
+            data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR
+          )
+        ) {
+          hls.stopLoad()
+          reportPlayFailureRef.current(`HLS首帧加载失败: ${data.details}`)
+          return
+        }
+
+        if (!data.fatal) return
+
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR: {
+            if (data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR) {
+              hls.stopLoad()
+              reportPlayFailureRef.current('HLS主清单加载失败')
+              return
+            }
+            networkRecoveryAttempts++
+            if (networkRecoveryAttempts > MAX_HLS_NETWORK_RECOVERY_ATTEMPTS) {
+              hls.stopLoad()
+              reportPlayFailureRef.current(`HLS网络错误重试${MAX_HLS_NETWORK_RECOVERY_ATTEMPTS}次仍失败`)
+              return
+            }
+            if (hlsRecoveryTimer) return
+            const delay = networkRecoveryAttempts * 750
+            console.warn(`[VideoPlayer] HLS网络错误，第${networkRecoveryAttempts}次恢复，${delay}ms 后重试`)
+            setPlaybackPhase('recovering', `网络波动，正在第 ${networkRecoveryAttempts} 次恢复...`)
+            hlsRecoveryTimer = window.setTimeout(() => {
+              hlsRecoveryTimer = 0
+              if (!failureReportedRef.current) hls.startLoad()
+            }, delay)
+            break
           }
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            mediaRecoveryAttempts++
+            if (mediaRecoveryAttempts > MAX_HLS_MEDIA_RECOVERY_ATTEMPTS) {
+              hls.stopLoad()
+              reportPlayFailureRef.current(`HLS媒体错误重试${MAX_HLS_MEDIA_RECOVERY_ATTEMPTS}次仍失败`)
+              return
+            }
+            console.warn(`[VideoPlayer] HLS媒体错误，第${mediaRecoveryAttempts}次恢复`)
+            setPlaybackPhase('recovering', `媒体错误，正在第 ${mediaRecoveryAttempts} 次恢复...`)
+            hls.recoverMediaError()
+            break
+          default:
+            hls.stopLoad()
+            reportPlayFailureRef.current(`HLS无法恢复: ${data.details}`)
         }
       })
       hlsRef.current = hls
@@ -237,13 +341,41 @@ export default function VideoPlayer() {
     }
     video.addEventListener('error', onError)
 
+    const onWaiting = () => {
+      if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+        setPlaybackPhase('buffering', '正在缓冲...')
+      }
+    }
+    const onCanPlay = () => {
+      if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+        setPlaybackPhase('buffering', '已获取媒体数据，准备播放...')
+      }
+    }
+    const onStalled = () => {
+      // 防抖：停滞超过 2.5 秒才显示覆盖层
+      clearStalledTimer()
+      stalledTimerRef.current = window.setTimeout(() => {
+        if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
+          setPlaybackPhase('recovering', '媒体加载停滞，正在等待恢复...')
+        }
+      }, 2500)
+    }
+    video.addEventListener('waiting', onWaiting)
+    video.addEventListener('canplay', onCanPlay)
+    video.addEventListener('stalled', onStalled)
+
     return () => {
       video.removeEventListener('error', onError)
+      video.removeEventListener('waiting', onWaiting)
+      video.removeEventListener('canplay', onCanPlay)
+      video.removeEventListener('stalled', onStalled)
       hlsRef.current?.destroy()
       dashRef.current?.reset()
       hlsRef.current = null
       dashRef.current = null
+      if (hlsRecoveryTimer) clearTimeout(hlsRecoveryTimer)
       clearLoadTimeout()
+      clearStalledTimer()
     }
   // 关键修复：依赖只有 currentUrl 和 playHeader，不再依赖 hasPlaybackStarted/reportPlayFailure
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -270,20 +402,22 @@ export default function VideoPlayer() {
     const video = videoRef.current
     if (!video) return
 
-    const onTimeUpdate = () => setCurrentTime(video.currentTime)
+    const onTimeUpdate = () => {
+      setCurrentTime(video.currentTime)
+      if (video.currentTime > 0) markPlaybackStarted()
+    }
     const onDurationChange = () => setDuration(video.duration || 0)
     const onPlay = () => setIsPlaying(true)
     const onPause = () => setIsPlaying(false)
     const onPlaying = () => {
-      // 实际开始播放（缓冲结束）
-      markPlaybackStarted()
-    }
-    const onLoadedMetadata = () => {
-      // metadata 加载完成也算"开始播放"
-      markPlaybackStarted()
-    }
-    const onCanPlay = () => {
-      markPlaybackStarted()
+      if (video.currentTime > 0) {
+        markPlaybackStarted()
+        // 已开始播放时隐藏 stalled/buffering 覆盖层
+        clearStalledTimer()
+        if (playbackPhase === 'recovering' || playbackPhase === 'buffering') {
+          resetPlaybackPhase()
+        }
+      }
     }
     const onEnded = () => {
       if (currentEpisodeIndex < episodes.length - 1) nextEpisode()
@@ -295,8 +429,6 @@ export default function VideoPlayer() {
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('playing', onPlaying)
-    video.addEventListener('loadedmetadata', onLoadedMetadata)
-    video.addEventListener('canplay', onCanPlay)
     video.addEventListener('ended', onEnded)
 
     return () => {
@@ -305,8 +437,6 @@ export default function VideoPlayer() {
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('playing', onPlaying)
-      video.removeEventListener('loadedmetadata', onLoadedMetadata)
-      video.removeEventListener('canplay', onCanPlay)
       video.removeEventListener('ended', onEnded)
     }
   }, [currentEpisodeIndex, episodes.length, markPlaybackStarted, nextEpisode, setDuration, setCurrentTime, setIsPlaying])
@@ -421,6 +551,69 @@ export default function VideoPlayer() {
   }
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
+  const showPlaybackOverlay = playbackPhase !== 'idle' && playbackPhase !== 'playing'
+  const overlayText = playbackPhase === 'failed'
+    ? playbackError || playbackMessage || '播放失败'
+    : playbackMessage || (currentUrl === '__resolving__' ? '解析播放地址中...' : '加载中...')
+  const firstFrameMs = playbackStartedAt && playbackFirstFrameAt
+    ? Math.max(0, playbackFirstFrameAt - playbackStartedAt)
+    : null
+  const elapsedMs = playbackStartedAt ? Math.max(0, Date.now() - playbackStartedAt) : 0
+  const redactedUrl = currentUrl ? redactText(currentUrl) : ''
+  const redactedHeaders = redactHeaders(playHeader)
+  const bitrateText = formatThroughput(streamStats.bitrateKbps)
+  const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps)
+
+  const buildDiagnosticsText = () => {
+    const lines = [
+      'IPTV Mac 播放诊断',
+      `阶段: ${playbackPhase}`,
+      `状态: ${playbackMessage || '-'}`,
+      `错误: ${playbackError || '-'}`,
+      `站点: ${currentSiteKey || '-'}`,
+      `影片: ${currentVod?.vod_name || '-'}`,
+      `集数: ${episodes[currentEpisodeIndex]?.name || currentEpisodeIndex + 1 || '-'}`,
+      `线路索引: ${currentEpisodeIndex + 1}/${episodes.length || 0}`,
+      `首帧耗时: ${firstFrameMs == null ? '-' : `${firstFrameMs}ms`}`,
+      `当前耗时: ${elapsedMs}ms`,
+      `失败时间: ${playbackLastErrorAt ? new Date(playbackLastErrorAt).toISOString() : '-'}`,
+      `换源状态: ${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`,
+      `URL: ${redactedUrl || '-'}`,
+      `Headers: ${Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders) : '-'}`
+    ]
+    return lines.join('\n')
+  }
+
+  const handleCopyDiagnostics = async () => {
+    try {
+      const text = buildDiagnosticsText()
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = text
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopyState('copied')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    } catch {
+      setCopyState('failed')
+      window.setTimeout(() => setCopyState('idle'), 1800)
+    }
+  }
+
+  const handleRetryPlayback = () => {
+    window.dispatchEvent(new CustomEvent('player:retry'))
+  }
+
+  const handleNextSource = () => {
+    window.dispatchEvent(new CustomEvent('player:nextSource'))
+  }
 
   return (
     <div
@@ -431,6 +624,38 @@ export default function VideoPlayer() {
       onDoubleClick={handleToggleFullscreen}
     >
       <video ref={videoRef} className="w-full h-full object-contain" playsInline />
+
+      {currentUrl && (
+        <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-white/45">码率</span>
+            <span className="font-mono text-white">{bitrateText}</span>
+          </div>
+          <div className="mt-0.5 flex items-center justify-between gap-3">
+            <span className="text-white/45">速度</span>
+            <span className="font-mono text-white">{linkSpeedText}</span>
+          </div>
+        </div>
+      )}
+
+      {/* 播放状态 */}
+      {showPlaybackOverlay && (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center">
+          {playbackPhase === 'failed' ? (
+            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-red-400/40 text-red-400">
+              !
+            </div>
+          ) : (
+            <Loader2 className="w-8 h-8 animate-spin text-accent" />
+          )}
+          <span className="text-sm text-white/80">{overlayText}</span>
+          {playbackPhase === 'failed' && (
+            <span className="max-w-md text-xs leading-5 text-white/50">
+              应用会尝试自动换源；也可以切换线路或重试当前集。
+            </span>
+          )}
+        </div>
+      )}
 
       {/* 弹幕层 */}
       {isDanmakuOn && <DanmakuLayer />}
@@ -518,6 +743,15 @@ export default function VideoPlayer() {
               <MessageSquare className="w-4 h-4" />
             </button>
 
+            {/* 诊断 */}
+            <button
+              onClick={() => setShowDiagnostics(true)}
+              className={`p-1 ${playbackPhase === 'failed' ? 'text-red-400' : 'text-white/80 hover:text-white'}`}
+              title="播放诊断"
+            >
+              <ClipboardList className="w-4 h-4" />
+            </button>
+
             {/* 精简模式 */}
             <button onClick={handleEnterMiniMode} className="p-1 text-white/80 hover:text-white" title="精简模式">
               <PictureInPicture2 className="w-4 h-4" />
@@ -530,6 +764,115 @@ export default function VideoPlayer() {
           </div>
         </div>
       </div>
+
+      {showDiagnostics && (
+        <div className="absolute inset-y-0 right-0 z-40 w-full max-w-sm border-l border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur">
+          <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <ClipboardList className="w-4 h-4 text-accent" />
+              <h3 className="text-sm font-medium text-white">播放诊断</h3>
+            </div>
+            <button
+              onClick={() => setShowDiagnostics(false)}
+              className="p-1 text-white/60 hover:text-white"
+              title="关闭"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="space-y-4 overflow-y-auto px-4 py-4 text-xs text-white/70 scrollbar-dark h-[calc(100%-49px)]">
+            <div className="grid grid-cols-2 gap-2">
+              <DiagnosticMetric label="阶段" value={playbackPhase} />
+              <DiagnosticMetric label="首帧耗时" value={firstFrameMs == null ? '-' : `${firstFrameMs}ms`} />
+              <DiagnosticMetric label="当前耗时" value={`${elapsedMs}ms`} />
+              <DiagnosticMetric label="音量/倍速" value={`${Math.round(volume * 100)}% / ${speed}x`} />
+            </div>
+
+            <DiagnosticSection title="状态">
+              <p>{playbackMessage || '-'}</p>
+              {playbackError && <p className="mt-2 text-red-300">{playbackError}</p>}
+              <label className="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
+                <span className="text-white/60">自动换源</span>
+                <input
+                  type="checkbox"
+                  checked={autoSwitchSource}
+                  onChange={(event) => setAutoSwitchSource(event.target.checked)}
+                  className="h-4 w-4 accent-accent"
+                />
+              </label>
+            </DiagnosticSection>
+
+            <DiagnosticSection title="内容">
+              <DiagnosticRow label="站点" value={currentSiteKey || '-'} />
+              <DiagnosticRow label="影片" value={currentVod?.vod_name || '-'} />
+              <DiagnosticRow label="集数" value={episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1)} />
+              <DiagnosticRow label="换源" value={`${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`} />
+            </DiagnosticSection>
+
+            <DiagnosticSection title="线路">
+              <p className="break-all font-mono text-[11px] leading-5 text-white/60">{redactedUrl || '-'}</p>
+            </DiagnosticSection>
+
+            <DiagnosticSection title="请求头">
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-white/60">
+                {Object.keys(redactedHeaders).length ? JSON.stringify(redactedHeaders, null, 2) : '-'}
+              </pre>
+            </DiagnosticSection>
+
+            <button
+              onClick={handleCopyDiagnostics}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-bg-primary hover:bg-accent-hover"
+            >
+              <Copy className="w-4 h-4" />
+              {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制诊断信息'}
+            </button>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={handleRetryPlayback}
+                className="flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10"
+              >
+                <RotateCw className="w-4 h-4" />
+                重试当前
+              </button>
+              <button
+                onClick={handleNextSource}
+                className="flex items-center justify-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-sm font-medium text-white/80 hover:bg-white/10"
+              >
+                <Shuffle className="w-4 h-4" />
+                切换线路
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DiagnosticMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2">
+      <p className="text-[11px] text-white/40">{label}</p>
+      <p className="mt-1 truncate text-sm text-white">{value}</p>
+    </div>
+  )
+}
+
+function DiagnosticSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section>
+      <h4 className="mb-2 text-[11px] font-medium text-white/40">{title}</h4>
+      <div className="rounded-lg border border-white/10 bg-white/5 p-3">{children}</div>
+    </section>
+  )
+}
+
+function DiagnosticRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-3 py-1">
+      <span className="shrink-0 text-white/40">{label}</span>
+      <span className="min-w-0 break-all text-right text-white/70">{value}</span>
     </div>
   )
 }

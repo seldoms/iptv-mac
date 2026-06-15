@@ -1,9 +1,10 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Search as SearchIcon, X, Loader2 } from 'lucide-react'
 import { useConfigStore, Vod } from '@/stores/useConfigStore'
 import { siteApi, cacheApi } from '@/utils/ipc'
 import VodCard from '@/components/VodCard/VodCard'
+import EmptyState from '@/components/EmptyState/EmptyState'
 
 interface SearchResult {
   siteKey: string
@@ -15,22 +16,23 @@ interface SearchResult {
 
 export default function Search() {
   const navigate = useNavigate()
-  const { sites, currentSiteKey } = useConfigStore()
+  const { currentConfig, sites } = useConfigStore()
   const [keyword, setKeyword] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
   const [searchHistory, setSearchHistory] = useState<string[]>([])
   const [isSearching, setIsSearching] = useState(false)
 
   // 加载搜索历史
-  useState(() => {
+  useEffect(() => {
     cacheApi.get('search_history').then((data: any) => {
       if (data) {
         try {
-          setSearchHistory(JSON.parse(data))
+          const parsed = JSON.parse(data)
+          if (Array.isArray(parsed)) setSearchHistory(parsed)
         } catch {}
       }
     })
-  })
+  }, [])
 
   const saveSearchHistory = async (kw: string) => {
     const newHistory = [kw, ...searchHistory.filter((h) => h !== kw)].slice(0, 20)
@@ -90,8 +92,30 @@ export default function Search() {
     if (e.key === 'Enter') doSearch(keyword)
   }
 
-  const handleVodClick = (vod: Vod, siteKey: string) => {
-    navigate(`/vod/${siteKey}/${vod.vod_id}`)
+  const searchableSites = sites.filter((s) => s.searchable !== 0)
+
+  if (!currentConfig) {
+    return (
+      <EmptyState
+        icon={SearchIcon}
+        title="还没有配置源"
+        description="导入配置后，搜索会在可用站点中并行查找内容。"
+        primaryLabel="去导入配置"
+        onPrimaryClick={() => navigate('/onboarding')}
+      />
+    )
+  }
+
+  if (searchableSites.length === 0) {
+    return (
+      <EmptyState
+        icon={SearchIcon}
+        title="没有可搜索站点"
+        description="当前配置源没有开启搜索能力的站点。可以切换配置源，或检查配置中的 searchable 字段。"
+        primaryLabel="切换配置"
+        onPrimaryClick={() => navigate('/settings')}
+      />
+    )
   }
 
   return (
@@ -155,33 +179,53 @@ export default function Search() {
             输入关键词搜索影片
           </div>
         ) : (
-          <div className="space-y-6">
-            {results.map((result) => (
-              <div key={result.siteKey}>
-                {/* 站点标题 */}
-                <div className="flex items-center gap-2 mb-3">
-                  <h3 className="text-sm font-medium text-text-primary">{result.siteName}</h3>
-                  {result.loading && <Loader2 className="w-3.5 h-3.5 text-accent animate-spin" />}
-                  {result.error && <span className="text-xs text-red-400">搜索失败</span>}
-                  {!result.loading && !result.error && result.videos.length === 0 && (
-                    <span className="text-xs text-text-muted">无结果</span>
-                  )}
-                </div>
+          <div>
+            {(() => {
+              const allVideos = results
+                .filter((r) => !r.loading && !r.error && r.videos.length > 0)
+                .flatMap((r) => r.videos.map((v) => ({ ...v, _siteKey: r.siteKey, _siteName: r.siteName })))
+              const pendingCount = results.filter((r) => r.loading).length
 
-                {/* 结果网格 */}
-                {result.videos.length > 0 && (
-                  <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
-                    {result.videos.map((vod) => (
-                      <VodCard
-                        key={vod.vod_id}
-                        vod={vod}
-                        onClick={(v) => handleVodClick(v, result.siteKey)}
-                      />
-                    ))}
+              return (
+                <>
+                  <div className="flex items-center gap-3 mb-4">
+                    <h3 className="text-sm font-medium text-text-primary">
+                      搜索结果
+                    </h3>
+                    {pendingCount > 0 && (
+                      <span className="inline-flex items-center gap-1.5 text-xs text-text-muted">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        {pendingCount} 个站点搜索中...
+                      </span>
+                    )}
+                    {pendingCount === 0 && (
+                      <span className="text-xs text-text-muted">
+                        共 {allVideos.length} 个结果
+                      </span>
+                    )}
                   </div>
-                )}
-              </div>
-            ))}
+
+                  {allVideos.length > 0 && (
+                    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
+                      {allVideos.map((v: any) => (
+                        <VodCard
+                          key={`${v._siteKey}:${v.vod_id}`}
+                          vod={v}
+                          sourceName={v._siteName}
+                          onClick={(vod) => navigate(`/vod/${v._siteKey}/${vod.vod_id}`)}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {pendingCount === 0 && allVideos.length === 0 && (
+                    <div className="flex items-center justify-center h-48 text-text-muted text-sm">
+                      未找到相关影片
+                    </div>
+                  )}
+                </>
+              )
+            })()}
           </div>
         )}
       </div>

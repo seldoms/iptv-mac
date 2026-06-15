@@ -30,6 +30,15 @@ export interface AlternativeSource {
   vodRemarks?: string
 }
 
+export type PlaybackPhase =
+  | 'idle'
+  | 'resolving'
+  | 'connecting'
+  | 'buffering'
+  | 'playing'
+  | 'recovering'
+  | 'failed'
+
 interface PlayerState {
   isPlaying: boolean
   currentUrl: string
@@ -46,6 +55,12 @@ interface PlayerState {
   currentSourceIndex: number
   playHeader: Record<string, string> | null
   currentSiteKey: string
+  playbackPhase: PlaybackPhase
+  playbackMessage: string
+  playbackError: string
+  playbackStartedAt: number
+  playbackFirstFrameAt: number
+  playbackLastErrorAt: number
 
   // ==================== 换源相关状态 ====================
   /** 备选源队列（来自其他站点的同名 VOD） */
@@ -83,6 +98,9 @@ interface PlayerActions {
   ) => void
   setCurrentEpisodeIndex: (index: number, resolvedUrl?: string) => void
   setCurrentSourceIndex: (index: number) => void
+  setPlaybackPhase: (phase: PlaybackPhase, message?: string) => void
+  setPlaybackError: (message: string) => void
+  markPlaybackFirstFrame: () => void
 
   // ==================== 换源相关 Actions ====================
   /** 设置备选源队列 */
@@ -119,6 +137,12 @@ const initialState: PlayerState = {
   currentSourceIndex: 0,
   playHeader: null,
   currentSiteKey: '',
+  playbackPhase: 'idle',
+  playbackMessage: '',
+  playbackError: '',
+  playbackStartedAt: 0,
+  playbackFirstFrameAt: 0,
+  playbackLastErrorAt: 0,
   alternativeSources: [],
   brokenSources: new Set(),
   sourceSwitchState: 'idle',
@@ -135,15 +159,44 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
 
   play: (url?: string) => {
     if (url) {
-      set((s) => ({ currentUrl: url, isPlaying: true, playKey: s.playKey + 1 }))
+      set((s) => ({
+        currentUrl: url,
+        currentTime: 0,
+        duration: 0,
+        isPlaying: true,
+        playbackPhase: 'connecting',
+        playbackMessage: '正在连接播放地址...',
+        playbackError: '',
+        playbackStartedAt: Date.now(),
+        playbackFirstFrameAt: 0,
+        playbackLastErrorAt: 0,
+        playKey: s.playKey + 1
+      }))
     } else {
-      set((s) => ({ isPlaying: true, playKey: s.playKey + 1 }))
+      set((s) => ({
+        isPlaying: true,
+        playbackPhase: s.currentUrl ? 'connecting' : s.playbackPhase,
+        playbackMessage: s.currentUrl ? '正在连接播放地址...' : s.playbackMessage,
+        playbackError: '',
+        playbackLastErrorAt: 0,
+        playKey: s.playKey + 1
+      }))
     }
   },
 
   pause: () => set({ isPlaying: false }),
 
-  stop: () => set({ isPlaying: false, currentUrl: '', currentTime: 0, duration: 0 }),
+  stop: () => set({
+    isPlaying: false,
+    currentUrl: '',
+    currentTime: 0,
+    duration: 0,
+    playbackPhase: 'idle',
+    playbackMessage: '',
+    playbackError: '',
+    playbackFirstFrameAt: 0,
+    playbackLastErrorAt: 0
+  }),
 
   setSpeed: (speed: number) => set({ speed }),
 
@@ -196,7 +249,13 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
       duration: 0,
       isPlaying: episodes.length > 0,
       playHeader: header || null,
-      currentSiteKey: siteKey || ''
+      currentSiteKey: siteKey || '',
+      playbackPhase: resolvedUrl === '__resolving__' ? 'resolving' : episodes.length > 0 ? 'connecting' : 'idle',
+      playbackMessage: resolvedUrl === '__resolving__' ? '解析播放地址中...' : episodes.length > 0 ? '正在连接播放地址...' : '',
+      playbackError: '',
+      playbackStartedAt: episodes.length > 0 ? Date.now() : 0,
+      playbackFirstFrameAt: 0,
+      playbackLastErrorAt: 0
     })
   },
 
@@ -207,12 +266,38 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
         currentEpisodeIndex: index,
         currentUrl: resolvedUrl || episodes[index].url,
         currentTime: 0,
-        isPlaying: true
+        isPlaying: true,
+        playbackPhase: resolvedUrl === '__resolving__' ? 'resolving' : 'connecting',
+        playbackMessage: resolvedUrl === '__resolving__' ? '解析播放地址中...' : '正在连接播放地址...',
+        playbackError: '',
+        playbackStartedAt: Date.now(),
+        playbackFirstFrameAt: 0,
+        playbackLastErrorAt: 0
       })
     }
   },
 
   setCurrentSourceIndex: (index: number) => set({ currentSourceIndex: index }),
+
+  setPlaybackPhase: (phase, message = '') => set({
+    playbackPhase: phase,
+    playbackMessage: message,
+    playbackError: phase === 'failed' ? get().playbackError : ''
+  }),
+
+  setPlaybackError: (message: string) => set({
+    playbackPhase: 'failed',
+    playbackMessage: '播放失败',
+    playbackError: message,
+    playbackLastErrorAt: Date.now()
+  }),
+
+  markPlaybackFirstFrame: () => set((state) => ({
+    playbackPhase: 'playing',
+    playbackMessage: '正在播放',
+    playbackFirstFrameAt: state.playbackFirstFrameAt || Date.now(),
+    playbackError: ''
+  })),
 
   // ==================== 换源 Actions ====================
   setAlternativeSources: (sources) => set({ alternativeSources: sources }),

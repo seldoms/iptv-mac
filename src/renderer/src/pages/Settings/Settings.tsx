@@ -11,10 +11,15 @@ import {
   Link,
   Check,
   AlertCircle,
+  Edit3,
+  Save,
+  X,
   Tv
 } from 'lucide-react'
-import { configApi, settingsApi } from '@/utils/ipc'
+import { configApi, invoke, localApi, on } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
+import type { ConfigInspection } from '@shared/types'
+ import { useNavigate } from 'react-router-dom'
 
 interface ConfigItem {
   url: string
@@ -24,14 +29,24 @@ interface ConfigItem {
 }
 
 export default function Settings() {
+  const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('config')
   const [configs, setConfigs] = useState<ConfigItem[]>([])
   const [currentUrl, setCurrentUrl] = useState('')
   const [newConfigUrl, setNewConfigUrl] = useState('')
   const [loading, setLoading] = useState(false)
+  const [inspectLoading, setInspectLoading] = useState(false)
+  const [inspection, setInspection] = useState<ConfigInspection | null>(null)
+  const [editingConfigUrl, setEditingConfigUrl] = useState('')
+  const [editingConfigName, setEditingConfigName] = useState('')
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [version, setVersion] = useState('1.0.0')
+  const [localServer, setLocalServer] = useState<{ url: string; token: string }>({ url: '', token: '' })
   const { loadConfig } = useConfigStore()
+
+  useEffect(() => {
+    localApi.getServerInfo().then(setLocalServer).catch(() => {})
+  }, [])
 
   // Live refresh state
   const [liveRefreshInterval, setLiveRefreshInterval] = useState(30)
@@ -51,7 +66,7 @@ export default function Settings() {
       }
     }
 
-    const cleanup = window.api.on('live:refreshProgress', handleProgress)
+    const cleanup = on('live:refreshProgress', handleProgress)
     loadLiveStatus()
 
     return cleanup as () => void
@@ -59,7 +74,7 @@ export default function Settings() {
 
   const loadLiveStatus = async () => {
     try {
-      const status = await window.api.invoke('live:getRefreshStatus') as any
+      const status = await invoke('live:getRefreshStatus') as any
       if (status) {
         setLiveRefreshInterval(status.interval || 30)
         setLiveStats({
@@ -77,7 +92,7 @@ export default function Settings() {
     if (liveRefreshing) return
     setLiveRefreshing(true)
     try {
-      await window.api.invoke('live:refresh')
+      await invoke('live:refresh')
     } catch (e) {
       setLiveRefreshing(false)
     }
@@ -85,7 +100,7 @@ export default function Settings() {
 
   const handleLiveIntervalSave = async () => {
     try {
-      const res = await window.api.invoke('live:setRefreshInterval', liveRefreshInterval) as { success: boolean; error?: string }
+      const res = await invoke('live:setRefreshInterval', liveRefreshInterval) as { success: boolean; error?: string }
       if (res.success) {
         showMessage('success', `刷新间隔已设置为 ${liveRefreshInterval} 分钟`)
         await loadLiveStatus()
@@ -121,19 +136,49 @@ export default function Settings() {
     setTimeout(() => setMessage(null), 3000)
   }
 
+  const inspectConfigUrl = async (url: string, options?: { silent?: boolean }): Promise<ConfigInspection | null> => {
+    if (!url) return null
+    setInspectLoading(true)
+    setInspection(null)
+    try {
+      const result = await configApi.inspect(url) as { success: boolean; error?: string; data?: ConfigInspection }
+      if (result?.success && result.data) {
+        setInspection(result.data)
+        if (!options?.silent) showMessage('success', '配置预检通过')
+        return result.data
+      }
+      if (!options?.silent) showMessage('error', result?.error || '配置预检失败')
+      return null
+    } catch (err) {
+      if (!options?.silent) showMessage('error', '配置预检失败: ' + String(err))
+      return null
+    } finally {
+      setInspectLoading(false)
+    }
+  }
+
+  const handleInspectConfig = async (): Promise<ConfigInspection | null> => {
+    return inspectConfigUrl(newConfigUrl.trim())
+  }
+
   // 添加配置
   const handleAddConfig = async () => {
     if (!newConfigUrl.trim()) return
     setLoading(true)
     try {
-      const result = await configApi.load(newConfigUrl.trim()) as { success: boolean; error?: string; data?: any }
+      const url = newConfigUrl.trim()
+      const currentInspection = inspection?.url === url ? inspection : await handleInspectConfig()
+      if (!currentInspection) return
+
+      const result = await configApi.load(url) as { success: boolean; error?: string; data?: any }
       if (result?.success) {
         setNewConfigUrl('')
-        setCurrentUrl(newConfigUrl.trim())
+        setInspection(null)
+        setCurrentUrl(url)
         // 刷新首页内容
-        await loadConfig(newConfigUrl.trim())
+        await loadConfig(url)
         await loadData()
-        showMessage('success', '配置添加成功')
+        showMessage('success', `配置添加成功：${currentInspection.visibleSiteCount} 个点播站点，${currentInspection.liveCount} 个直播源`)
       } else {
         showMessage('error', '加载配置失败: ' + (result?.error || '未知错误'))
       }
@@ -145,11 +190,83 @@ export default function Settings() {
   }
 
   // 删除配置
-  const handleDeleteConfig = async (url: string) => {
-    await configApi.remove(url)
-    if (url === currentUrl) setCurrentUrl('')
-    await loadData()
+ const handleDeleteConfig = async (config: ConfigItem) => {
+   const confirmed = window.confirm(`确定删除配置「${config.name}」吗？`)
+   if (!confirmed) return
+   const url = config.url
+   try {
+     const result = await configApi.remove(url) as { success: boolean; error?: string }
+     if (!result.success) {
+       showMessage('error', result.error || '删除失败')
+       return
+     }
+   } catch (err) {
+      showMessage('error', '后端删除失败: ' + String(err))
+     return
+   }
+   if (url === currentUrl) {
+     setCurrentUrl('')
+      useConfigStore.getState().reset()
+      useConfigStore.setState({
+        sites: [],
+        currentSiteKey: '',
+        categories: [],
+        filters: {},
+        homeVideos: [],
+        categoryVideos: [],
+        currentPage: 1,
+        hasMore: false,
+        isLoading: false,
+        error: null,
+      })
+   }
+   if (editingConfigUrl === url) {
+     setEditingConfigUrl('')
+     setEditingConfigName('')
+   }
+    const freshList = await configApi.list()
+    const freshUrl = await configApi.getCurrentUrl()
+    setConfigs(freshList || [])
+    setCurrentUrl(freshUrl || '')
     showMessage('success', '配置已删除')
+  }
+
+  const handleStartRename = (config: ConfigItem) => {
+    setEditingConfigUrl(config.url)
+    setEditingConfigName(config.name)
+  }
+
+  const handleCancelRename = () => {
+    setEditingConfigUrl('')
+    setEditingConfigName('')
+  }
+
+  const handleSaveRename = async (url: string) => {
+    const name = editingConfigName.trim()
+    if (!name) {
+      showMessage('error', '配置名称不能为空')
+      return
+    }
+    try {
+      const result = await configApi.rename(url, name) as { success: boolean; error?: string }
+      if (result.success) {
+        setEditingConfigUrl('')
+        setEditingConfigName('')
+        await loadData()
+        showMessage('success', '配置名称已更新')
+      } else {
+        showMessage('error', result.error || '重命名失败')
+      }
+    } catch (err) {
+      showMessage('error', '重命名失败: ' + String(err))
+    }
+  }
+
+  const handleInspectSavedConfig = async (config: ConfigItem) => {
+    const result = await inspectConfigUrl(config.url)
+    if (result) {
+      setNewConfigUrl(config.url)
+    }
   }
 
   // 切换配置
@@ -233,15 +350,26 @@ export default function Settings() {
                 <input
                   type="text"
                   value={newConfigUrl}
-                  onChange={(e) => setNewConfigUrl(e.target.value)}
+                  onChange={(e) => {
+                    setNewConfigUrl(e.target.value)
+                    setInspection(null)
+                  }}
                   placeholder="输入配置地址（JSON URL）..."
                   className="flex-1 px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent"
                   onKeyDown={(e) => e.key === 'Enter' && handleAddConfig()}
-                  disabled={loading}
+                  disabled={loading || inspectLoading}
                 />
                 <button
+                  onClick={handleInspectConfig}
+                  disabled={!newConfigUrl.trim() || loading || inspectLoading}
+                  className="flex items-center gap-1.5 px-4 py-2 border border-[#2a2a2a] hover:bg-bg-hover disabled:opacity-50 text-text-secondary text-sm font-medium rounded-lg transition-colors"
+                >
+                  <RefreshCw className={`w-4 h-4 ${inspectLoading ? 'animate-spin' : ''}`} />
+                  {inspectLoading ? '预检中...' : '预检'}
+                </button>
+                <button
                   onClick={handleAddConfig}
-                  disabled={!newConfigUrl.trim() || loading}
+                  disabled={!newConfigUrl.trim() || loading || inspectLoading}
                   className="flex items-center gap-1.5 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-bg-primary text-sm font-medium rounded-lg transition-colors"
                 >
                   <Plus className="w-4 h-4" /> {loading ? '加载中...' : '添加'}
@@ -250,6 +378,45 @@ export default function Settings() {
               <p className="text-xs text-text-muted mt-2">
                 输入 FongMi/TV 兼容的配置 JSON 地址，加载后即可浏览内容
               </p>
+              {inspection && (
+                <div className="mt-3 rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-text-primary truncate">{inspection.name}</p>
+                      <p className="text-xs text-text-muted truncate mt-0.5">{inspection.url}</p>
+                    </div>
+                    <span className="shrink-0 text-xs text-green-400">可导入</span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+                    <div className="rounded-md bg-bg-tertiary px-3 py-2">
+                      <p className="text-[11px] text-text-muted">点播站点</p>
+                      <p className="text-sm text-text-primary mt-1">{inspection.visibleSiteCount}/{inspection.siteCount}</p>
+                    </div>
+                    <div className="rounded-md bg-bg-tertiary px-3 py-2">
+                      <p className="text-[11px] text-text-muted">可搜索</p>
+                      <p className="text-sm text-text-primary mt-1">{inspection.searchableSiteCount}</p>
+                    </div>
+                    <div className="rounded-md bg-bg-tertiary px-3 py-2">
+                      <p className="text-[11px] text-text-muted">直播源</p>
+                      <p className="text-sm text-text-primary mt-1">{inspection.liveCount}</p>
+                    </div>
+                    <div className="rounded-md bg-bg-tertiary px-3 py-2">
+                      <p className="text-[11px] text-text-muted">解析器</p>
+                      <p className="text-sm text-text-primary mt-1">{inspection.parseCount}</p>
+                    </div>
+                  </div>
+                  {inspection.warnings.length > 0 && (
+                    <div className="mt-3 space-y-1">
+                      {inspection.warnings.map((warning) => (
+                        <div key={warning} className="flex items-start gap-2 text-xs text-yellow-300">
+                          <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                          <span>{warning}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div>
@@ -274,11 +441,58 @@ export default function Settings() {
                         }`}
                       >
                         <div className="flex-1 min-w-0">
-                          <p className={`text-sm truncate ${isActive ? 'text-accent' : 'text-text-primary'}`}>
-                            {config.name}
-                          </p>
+                          {editingConfigUrl === config.url ? (
+                            <input
+                              value={editingConfigName}
+                              onChange={(e) => setEditingConfigName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleSaveRename(config.url)
+                                if (e.key === 'Escape') handleCancelRename()
+                              }}
+                              className="w-full px-2 py-1 bg-bg-tertiary rounded-md text-sm text-text-primary outline-none focus:ring-1 focus:ring-accent"
+                              autoFocus
+                            />
+                          ) : (
+                            <p className={`text-sm truncate ${isActive ? 'text-accent' : 'text-text-primary'}`}>
+                              {config.name}
+                            </p>
+                          )}
                           <p className="text-xs text-text-muted truncate mt-0.5">{config.url}</p>
                         </div>
+                        {editingConfigUrl === config.url ? (
+                          <>
+                            <button
+                              onClick={() => handleSaveRename(config.url)}
+                              className="shrink-0 p-1.5 text-text-muted hover:text-green-400 transition-colors"
+                              title="保存名称"
+                            >
+                              <Save className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={handleCancelRename}
+                              className="shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors"
+                              title="取消编辑"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            onClick={() => handleStartRename(config)}
+                            className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors"
+                            title="重命名"
+                          >
+                            <Edit3 className="w-4 h-4" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleInspectSavedConfig(config)}
+                          disabled={inspectLoading || loading}
+                          className="shrink-0 p-1.5 text-text-muted hover:text-accent disabled:opacity-50 transition-colors"
+                          title="重新预检"
+                        >
+                          <AlertCircle className="w-4 h-4" />
+                        </button>
                         {!isActive && (
                           <button
                             onClick={() => handleSwitchConfig(config.url)}
@@ -292,7 +506,7 @@ export default function Settings() {
                           <span className="shrink-0 text-xs text-accent font-medium">当前</span>
                         )}
                         <button
-                          onClick={() => handleDeleteConfig(config.url)}
+                          onClick={() => handleDeleteConfig(config)}
                           className="shrink-0 p-1.5 text-text-muted hover:text-red-400 transition-colors"
                           title="删除"
                         >
@@ -515,7 +729,13 @@ export default function Settings() {
               </div>
               <div className="flex items-center justify-between py-2">
                 <span className="text-sm text-text-secondary">本地服务</span>
-                <span className="text-sm text-text-primary">http://127.0.0.1:9978</span>
+                <span className="text-sm text-text-primary">{localServer.url || '未启动'}</span>
+              </div>
+              <div className="flex items-start justify-between gap-6 py-2">
+                <span className="text-sm text-text-secondary">API Token</span>
+                <span className="text-xs text-text-primary font-mono break-all text-right">
+                  {localServer.token}
+                </span>
               </div>
             </div>
           </div>
