@@ -81,15 +81,17 @@ pub async fn json_parse(
 ) -> Result<Option<ParseResult>, AppError> {
     let client = crate::network::create_client()?;
 
-    // Validate parse_url is a safe absolute http/https URL
-    let base_parsed = url::Url::parse(parse_url)
+    // 使用 Url API 安全构建请求 URL，替代 raw format! 拼接
+    let mut parsed = url::Url::parse(parse_url)
         .map_err(|e| AppError::invalid_input("无效的解析地址").with_internal(e.to_string()))?;
-    match base_parsed.scheme() {
+    match parsed.scheme() {
         "http" | "https" => {}
         _ => return Err(AppError::invalid_input("不支持的解析协议")),
     }
-    // urlencoding::encode prevents URL injection in web_url (escapes ?#@ etc.)
-    let full_url = format!("{}{}", parse_url, urlencoding::encode(web_url));
+    // clear() 清空 parse_url 中已有的 "?url=" 片段，再用 append_pair 设置，
+    // append_pair 自动对 web_url 进行 percent-encoding，防止 URL 注入
+    parsed.query_pairs_mut().clear().append_pair("url", web_url);
+    let full_url = parsed.to_string();
 
     let mut req = client
         .get(&full_url)
@@ -277,12 +279,13 @@ pub async fn super_parse(
     // Level 2/3: Web sniff (not yet migrated)
     // Try playUrl fallback
     if let Some(pu) = play_url {
-        // Validate play_url as safe http/https before concatenation
-        if !pu.starts_with("http://") && !pu.starts_with("https://") {
-            return Ok(None);
-        }
+        // 安全拼接：对 result_url 进行 encoding，再验证最终 URL 合法
         let encoded = urlencoding::encode(&result_url);
-        let full_url = format!("{}{}", pu, encoded);
+        let concatenated = format!("{}{}", pu, encoded);
+        let full_url = match url::Url::parse(&concatenated) {
+            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u.to_string(),
+            _ => return Ok(None),
+        };
         if spider::is_video_format(&full_url) {
             let result = ParseResult {
                 url: full_url,
