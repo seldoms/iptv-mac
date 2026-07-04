@@ -33,10 +33,12 @@ const DEFAULT_ALPHA_PLAYBACK_SMOKE_MEDIA_URL: &str =
 pub struct AppState {
     pub database: Mutex<Database>,
     pub config_manager: Mutex<config::ConfigManager>,
+    pub current_config: Mutex<Option<(String, Value)>>,
     pub settings_path: PathBuf,
     pub settings: Mutex<Map<String, Value>>,
     pub player_state: Mutex<Option<Value>>,
     pub local_proxy: local_proxy::LocalProxyInfo,
+    pub data_dir: PathBuf,
 }
 
 fn load_settings(path: &PathBuf) -> Map<String, Value> {
@@ -117,8 +119,8 @@ fn inject_beta_continue_smoke_settings(settings: &mut Map<String, Value>) {
         return;
     }
 
-    let phase = std::env::var("IPTV_BETA_CONTINUE_SMOKE_PHASE")
-        .unwrap_or_else(|_| "seed".to_string());
+    let phase =
+        std::env::var("IPTV_BETA_CONTINUE_SMOKE_PHASE").unwrap_or_else(|_| "seed".to_string());
     let position_seconds = std::env::var("IPTV_BETA_CONTINUE_SMOKE_POSITION_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -142,7 +144,8 @@ fn inject_beta_continue_smoke_settings(settings: &mut Map<String, Value>) {
 
 pub fn build_live_tree(channels: Vec<Value>) -> Value {
     let mut countries: Vec<Value> = Vec::new();
-    let mut country_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut country_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut category_map: Vec<std::collections::HashMap<String, Vec<Value>>> = Vec::new();
 
     for ch in channels {
@@ -180,11 +183,21 @@ pub fn build_live_tree(channels: Vec<Value>) -> Value {
             .iter()
             .map(|(name, channels)| json!({ "name": name, "channels": channels }))
             .collect();
-        categories.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+        categories.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        });
         country_val["categories"] = Value::Array(categories);
     }
 
-    countries.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    countries.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
 
     json!({ "countries": countries })
 }
@@ -192,7 +205,8 @@ pub fn build_live_tree(channels: Vec<Value>) -> Value {
 // ==================== 兼容性 invoke_ipc 分发 ====================
 
 fn arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a Value, String> {
-    args.get(index).ok_or_else(|| format!("missing argument: {name}"))
+    args.get(index)
+        .ok_or_else(|| format!("missing argument: {name}"))
 }
 
 fn text_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> {
@@ -202,13 +216,17 @@ fn text_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> 
         .ok_or_else(|| format!("invalid argument: {name}"))
 }
 
+fn number_arg(args: &[Value], index: usize, name: &str) -> Result<f64, String> {
+    arg(args, index, name)?
+        .as_f64()
+        .ok_or_else(|| format!("invalid argument: {name}"))
+}
+
 /// 将 typed command 的 AppError 转为 invoke_ipc 的 Ok(json)
 fn to_json_result(result: Result<Value, AppError>) -> Value {
     match result {
         Ok(value) => value,
-        Err(error) => {
-            error.to_response()
-        }
+        Err(error) => error.to_response(),
     }
 }
 
@@ -221,15 +239,11 @@ fn invoke_ipc(
 ) -> Result<Value, String> {
     let result = match channel.as_str() {
         // Config
-        "config:getCurrent" => {
-            Ok(to_json_result(commands::handle_config_get_current(&state)))
-        }
-        "config:getCurrentUrl" => {
-            Ok(to_json_result(commands::handle_config_get_current_url(&state)))
-        }
-        "config:list" => {
-            Ok(to_json_result(commands::handle_config_list(&state)))
-        }
+        "config:getCurrent" => Ok(to_json_result(commands::handle_config_get_current(&state))),
+        "config:getCurrentUrl" => Ok(to_json_result(commands::handle_config_get_current_url(
+            &state,
+        ))),
+        "config:list" => Ok(to_json_result(commands::handle_config_list(&state))),
         "config:inspect" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
             Ok(to_json_result(commands::handle_config_inspect(&state, url)))
@@ -237,7 +251,9 @@ fn invoke_ipc(
         "config:load" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
             let name = args.get(1).and_then(Value::as_str).map(String::from);
-            Ok(to_json_result(commands::handle_config_load(&state, url, name)))
+            Ok(to_json_result(commands::handle_config_load(
+                &state, url, name,
+            )))
         }
         "config:remove" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
@@ -246,11 +262,15 @@ fn invoke_ipc(
         "config:rename" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
             let name = text_arg(&args, 1, "name").unwrap_or_default();
-            Ok(to_json_result(commands::handle_config_rename(&state, url, name)))
+            Ok(to_json_result(commands::handle_config_rename(
+                &state, url, name,
+            )))
         }
         "config:peekLives" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
-            Ok(to_json_result(commands::handle_config_peek_lives(&state, url)))
+            Ok(to_json_result(commands::handle_config_peek_lives(
+                &state, url,
+            )))
         }
 
         // History
@@ -261,12 +281,16 @@ fn invoke_ipc(
         "history:list" => {
             let limit = args.first().and_then(Value::as_i64);
             let offset = args.get(1).and_then(Value::as_i64);
-            Ok(to_json_result(commands::handle_history_list(&state, limit, offset)))
+            Ok(to_json_result(commands::handle_history_list(
+                &state, limit, offset,
+            )))
         }
         "history:delete" => {
             let site_key = text_arg(&args, 0, "siteKey")?;
             let vod_id = text_arg(&args, 1, "vodId")?;
-            Ok(to_json_result(commands::handle_history_delete(&state, site_key, vod_id)))
+            Ok(to_json_result(commands::handle_history_delete(
+                &state, site_key, vod_id,
+            )))
         }
 
         // Keep
@@ -282,7 +306,9 @@ fn invoke_ipc(
         "keep:delete" => {
             let site_key = text_arg(&args, 0, "siteKey")?;
             let vod_id = text_arg(&args, 1, "vodId")?;
-            Ok(to_json_result(commands::handle_keep_delete(&state, site_key, vod_id)))
+            Ok(to_json_result(commands::handle_keep_delete(
+                &state, site_key, vod_id,
+            )))
         }
 
         // Cache
@@ -293,7 +319,9 @@ fn invoke_ipc(
         "cache:set" => {
             let key = text_arg(&args, 0, "key")?;
             let value = text_arg(&args, 1, "value")?;
-            Ok(to_json_result(commands::handle_cache_set(&state, key, value)))
+            Ok(to_json_result(commands::handle_cache_set(
+                &state, key, value,
+            )))
         }
         "cache:del" => {
             let key = text_arg(&args, 0, "key")?;
@@ -303,7 +331,12 @@ fn invoke_ipc(
         // Settings
         "settings:get" => {
             let key = text_arg(&args, 0, "key")?;
-            Ok(state.settings.lock().get(&key).cloned().unwrap_or(Value::Null))
+            Ok(state
+                .settings
+                .lock()
+                .get(&key)
+                .cloned()
+                .unwrap_or(Value::Null))
         }
         "settings:set" => {
             let key = text_arg(&args, 0, "key")?;
@@ -323,45 +356,81 @@ fn invoke_ipc(
         // Window
         "window:savePlayerState" => {
             let player_state = arg(&args, 0, "state")?.clone();
-            Ok(to_json_result(commands::handle_window_save_player_state(&state, player_state)))
+            Ok(to_json_result(commands::handle_window_save_player_state(
+                &state,
+                player_state,
+            )))
         }
-        "window:getPlayerState" => {
-            Ok(state.player_state.lock().clone().unwrap_or(Value::Null))
+        "window:getPlayerState" => Ok(state.player_state.lock().clone().unwrap_or(Value::Null)),
+        "window:enterMiniMode" => Ok(to_json_result(commands::handle_window_enter_mini_mode(
+            &app,
+        ))),
+        "window:resizeMiniMode" => {
+            let width = number_arg(&args, 0, "width")?;
+            let height = number_arg(&args, 1, "height")?;
+            Ok(to_json_result(commands::handle_window_resize_mini_mode(
+                &app, width, height,
+            )))
         }
-        "window:enterMiniMode" => Ok(to_json_result(commands::handle_window_enter_mini_mode(&app))),
+        "window:setFullscreen" => {
+            let fullscreen = arg(&args, 0, "fullscreen")?
+                .as_bool()
+                .ok_or_else(|| "invalid argument: fullscreen".to_string())?;
+            Ok(to_json_result(commands::handle_window_set_fullscreen(
+                &app, fullscreen,
+            )))
+        }
         "window:exitMiniMode" => Ok(to_json_result(commands::handle_window_exit_mini_mode(&app))),
 
         // Live
         "live:load" => {
             let live_name = text_arg(&args, 0, "liveName").unwrap_or_default();
-            Ok(to_json_result(commands::handle_live_load(&state, live_name)))
+            Ok(to_json_result(commands::handle_live_load(
+                &state, live_name,
+            )))
         }
         "live:loadByUrl" => {
             let url = text_arg(&args, 0, "url").unwrap_or_default();
             let name = args.get(1).and_then(Value::as_str).map(String::from);
-            Ok(to_json_result(commands::handle_live_load_by_url(&state, url, name)))
+            Ok(to_json_result(commands::handle_live_load_by_url(
+                &state, url, name,
+            )))
         }
         "live:epg" => {
             let epg_url = text_arg(&args, 0, "epgUrl").unwrap_or_default();
             let channel_map = args.get(1).cloned();
-            Ok(to_json_result(commands::handle_live_epg(epg_url, channel_map)))
+            Ok(to_json_result(commands::handle_live_epg(
+                epg_url,
+                channel_map,
+            )))
         }
-        "live:refresh" => Ok(to_json_result(commands::handle_live_refresh(&state, Some(&app)))),
-        "live:getChannelTree" => Ok(to_json_result(commands::handle_live_get_channel_tree(&state))),
-        "live:getRefreshStatus" => Ok(to_json_result(commands::handle_live_get_refresh_status(&state))),
+        "live:refresh" => Ok(to_json_result(commands::handle_live_refresh(
+            &state,
+            Some(&app),
+        ))),
+        "live:getChannelTree" => Ok(to_json_result(commands::handle_live_get_channel_tree(
+            &state,
+        ))),
+        "live:getRefreshStatus" => Ok(to_json_result(commands::handle_live_get_refresh_status(
+            &state,
+        ))),
         "live:setRefreshInterval" => {
             let minutes = arg(&args, 0, "minutes")?
                 .as_i64()
                 .filter(|&m| (1..=1440).contains(&m))
                 .ok_or_else(|| "无效的刷新间隔，必须为 1-1440 分钟".to_string())?;
-            Ok(to_json_result(commands::handle_live_set_refresh_interval(&state, minutes)))
+            Ok(to_json_result(commands::handle_live_set_refresh_interval(
+                &state, minutes,
+            )))
         }
 
         // Site (Spider)
         "site:homeContent" => {
             let site_key = text_arg(&args, 0, "siteKey").unwrap_or_default();
             let filter = args.get(1).and_then(Value::as_bool).unwrap_or(false);
-            Ok(to_json_result(commands::handle_site_home_content(&state, site_key, filter)))
+            Ok(to_json_result(commands::handle_site_home_content(
+                &state, site_key, filter,
+            )))
         }
         "site:categoryContent" => {
             let site_key = text_arg(&args, 0, "siteKey").unwrap_or_default();
@@ -369,45 +438,77 @@ fn invoke_ipc(
             let pg = text_arg(&args, 2, "pg").unwrap_or_default();
             let filter = args.get(3).and_then(Value::as_bool).unwrap_or(false);
             let extend = args.get(4).cloned().unwrap_or(Value::Object(Map::new()));
-            Ok(to_json_result(commands::handle_site_category_content(&state, site_key, tid, pg, filter, extend)))
+            Ok(to_json_result(commands::handle_site_category_content(
+                &state, site_key, tid, pg, filter, extend,
+            )))
         }
         "site:detailContent" => {
             let site_key = text_arg(&args, 0, "siteKey").unwrap_or_default();
-            let ids: Vec<String> = args.get(1).and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let ids: Vec<String> = args
+                .get(1)
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            Ok(to_json_result(commands::handle_site_detail_content(&state, site_key, ids)))
+            Ok(to_json_result(commands::handle_site_detail_content(
+                &state, site_key, ids,
+            )))
         }
         "site:searchContent" => {
             let site_key = text_arg(&args, 0, "siteKey").unwrap_or_default();
             let keyword = text_arg(&args, 1, "key").unwrap_or_default();
             let quick = args.get(2).and_then(Value::as_bool).unwrap_or(false);
             let pg = args.get(3).and_then(Value::as_str).map(String::from);
-            Ok(to_json_result(commands::handle_site_search_content(&state, site_key, keyword, quick, pg)))
+            Ok(to_json_result(commands::handle_site_search_content(
+                &state, site_key, keyword, quick, pg,
+            )))
         }
         "site:playerContent" => {
             let site_key = text_arg(&args, 0, "siteKey").unwrap_or_default();
             let flag = text_arg(&args, 1, "flag").unwrap_or_default();
             let id = text_arg(&args, 2, "id").unwrap_or_default();
-            let vip_flags: Vec<String> = args.get(3).and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let vip_flags: Vec<String> = args
+                .get(3)
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            Ok(to_json_result(commands::handle_site_player_content(&state, site_key, flag, id, vip_flags)))
+            Ok(to_json_result(commands::handle_site_player_content(
+                &state, site_key, flag, id, vip_flags,
+            )))
         }
         "site:probe" => {
-            let site_keys: Vec<String> = args.get(0).and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            let site_keys: Vec<String> = args
+                .get(0)
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            Ok(to_json_result(commands::handle_site_probe(&state, site_keys)))
+            Ok(to_json_result(commands::handle_site_probe(
+                &state, site_keys,
+            )))
         }
         "site:superParse" => {
             let params = args.get(0).cloned().unwrap_or(Value::Null);
-            Ok(to_json_result(commands::handle_site_super_parse(&state, params)))
+            Ok(to_json_result(commands::handle_site_super_parse(
+                &state, params,
+            )))
         }
         "site:findAcrossSites" => {
             let keyword = text_arg(&args, 0, "keyword").unwrap_or_default();
             let options = args.get(1).cloned();
-            Ok(to_json_result(commands::handle_site_find_across_sites(&state, keyword, options)))
+            Ok(to_json_result(commands::handle_site_find_across_sites(
+                &state, keyword, options,
+            )))
         }
 
         // Local server
@@ -435,12 +536,20 @@ fn cmd_history_add(state: State<'_, AppState>, item: Value) -> Result<Value, Str
 }
 
 #[tauri::command]
-fn cmd_history_list(state: State<'_, AppState>, limit: Option<i64>, offset: Option<i64>) -> Result<Value, String> {
+fn cmd_history_list(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Value, String> {
     commands::handle_history_list(&state, limit, offset).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn cmd_history_delete(state: State<'_, AppState>, site_key: String, vod_id: String) -> Result<Value, String> {
+fn cmd_history_delete(
+    state: State<'_, AppState>,
+    site_key: String,
+    vod_id: String,
+) -> Result<Value, String> {
     commands::handle_history_delete(&state, site_key, vod_id).map_err(|e| e.to_string())
 }
 
@@ -450,12 +559,20 @@ fn cmd_keep_add(state: State<'_, AppState>, item: Value) -> Result<Value, String
 }
 
 #[tauri::command]
-fn cmd_keep_list(state: State<'_, AppState>, limit: Option<i64>, offset: Option<i64>) -> Result<Value, String> {
+fn cmd_keep_list(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Value, String> {
     commands::handle_keep_list(&state, limit, offset).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn cmd_keep_delete(state: State<'_, AppState>, site_key: String, vod_id: String) -> Result<Value, String> {
+fn cmd_keep_delete(
+    state: State<'_, AppState>,
+    site_key: String,
+    vod_id: String,
+) -> Result<Value, String> {
     commands::handle_keep_delete(&state, site_key, vod_id).map_err(|e| e.to_string())
 }
 
@@ -475,6 +592,32 @@ fn cmd_cache_del(state: State<'_, AppState>, key: String) -> Result<Value, Strin
 }
 
 #[tauri::command]
+async fn cmd_live_load(state: State<'_, AppState>, live_name: String) -> Result<Value, String> {
+    commands::handle_live_load_async(&state, live_name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_live_load_by_url(
+    state: State<'_, AppState>,
+    url: String,
+    name: Option<String>,
+) -> Result<Value, String> {
+    commands::handle_live_load_by_url_async(&state, url, name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_live_epg(epg_url: String, channel_map: Option<Value>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || commands::handle_live_epg(epg_url, channel_map))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn cmd_live_get_channel_tree(state: State<'_, AppState>) -> Result<Value, String> {
     commands::handle_live_get_channel_tree(&state).map_err(|e| e.to_string())
 }
@@ -485,7 +628,10 @@ fn cmd_live_get_refresh_status(state: State<'_, AppState>) -> Result<Value, Stri
 }
 
 #[tauri::command]
-fn cmd_live_set_refresh_interval(state: State<'_, AppState>, minutes: i64) -> Result<Value, String> {
+fn cmd_live_set_refresh_interval(
+    state: State<'_, AppState>,
+    minutes: i64,
+) -> Result<Value, String> {
     commands::handle_live_set_refresh_interval(&state, minutes).map_err(|e| e.to_string())
 }
 
@@ -495,7 +641,43 @@ fn cmd_live_refresh(state: State<'_, AppState>, app: tauri::AppHandle) -> Result
 }
 
 #[tauri::command]
-fn cmd_window_save_player_state(state: State<'_, AppState>, player_state: Value) -> Result<Value, String> {
+fn cmd_site_player_content(
+    state: State<'_, AppState>,
+    site_key: String,
+    flag: String,
+    id: String,
+    vip_flags: Vec<String>,
+) -> Result<Value, String> {
+    commands::handle_site_player_content(&state, site_key, flag, id, vip_flags)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_site_super_parse(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    commands::handle_site_super_parse(&state, params).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_site_find_across_sites(
+    state: State<'_, AppState>,
+    keyword: String,
+    options: Option<Value>,
+) -> Result<Value, String> {
+    commands::handle_site_find_across_sites_async(&state, keyword, options)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_local_get_server_info(state: State<'_, AppState>) -> Value {
+    json!(state.local_proxy.clone())
+}
+
+#[tauri::command]
+fn cmd_window_save_player_state(
+    state: State<'_, AppState>,
+    player_state: Value,
+) -> Result<Value, String> {
     commands::handle_window_save_player_state(&state, player_state).map_err(|e| e.to_string())
 }
 
@@ -536,7 +718,10 @@ mod tests {
         std::fs::write(&path, r#"{"theme": "dark", "language": "zh-CN"}"#).unwrap();
         let settings = load_settings(&path);
         assert_eq!(settings.get("theme").and_then(Value::as_str), Some("dark"));
-        assert_eq!(settings.get("language").and_then(Value::as_str), Some("zh-CN"));
+        assert_eq!(
+            settings.get("language").and_then(Value::as_str),
+            Some("zh-CN")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -581,6 +766,7 @@ mod tests {
         let state = AppState {
             database: Mutex::new(Database::open(":memory:".into()).unwrap()),
             config_manager: Mutex::new(config::ConfigManager::new(dir.clone())),
+            current_config: Mutex::new(None),
             settings_path: path.clone(),
             settings: Mutex::new(settings_map),
             player_state: Mutex::new(None),
@@ -588,6 +774,7 @@ mod tests {
                 url: "http://127.0.0.1:0".to_string(),
                 token: "test".to_string(),
             },
+            data_dir: dir.clone(),
         };
 
         persist_settings(&state).unwrap();
@@ -611,7 +798,8 @@ pub fn run() {
             let data_dir = debug_data_dir_override().unwrap_or(app.path().app_data_dir()?);
             fs::create_dir_all(&data_dir)?;
             let settings_path = data_dir.join("settings.json");
-            let database = Database::open(data_dir.join("iptv.db")).map_err(std::io::Error::other)?;
+            let database =
+                Database::open(data_dir.join("iptv.db")).map_err(std::io::Error::other)?;
             let local_proxy = local_proxy::start_local_proxy().map_err(std::io::Error::other)?;
             let mut settings = load_settings(&settings_path);
             inject_alpha_playback_smoke_settings(&mut settings);
@@ -620,14 +808,13 @@ pub fn run() {
             app.manage(AppState {
                 database: Mutex::new(database),
                 config_manager: Mutex::new(config::ConfigManager::new(data_dir.clone())),
+                current_config: Mutex::new(None),
                 settings: Mutex::new(settings),
                 settings_path,
                 player_state: Mutex::new(None),
                 local_proxy,
+                data_dir,
             });
-
-            // 启动自动刷新后台任务
-            commands::start_auto_refresh(app.handle().clone());
 
             Ok(())
         })
@@ -642,10 +829,17 @@ pub fn run() {
             cmd_cache_get,
             cmd_cache_set,
             cmd_cache_del,
+            cmd_live_load,
+            cmd_live_load_by_url,
+            cmd_live_epg,
             cmd_live_get_channel_tree,
             cmd_live_get_refresh_status,
             cmd_live_set_refresh_interval,
             cmd_live_refresh,
+            cmd_site_player_content,
+            cmd_site_super_parse,
+            cmd_site_find_across_sites,
+            cmd_local_get_server_info,
             cmd_window_save_player_state,
             cmd_window_get_player_state,
             cmd_window_enter_mini_mode,
