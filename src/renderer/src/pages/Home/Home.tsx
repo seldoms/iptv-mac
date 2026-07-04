@@ -19,7 +19,7 @@ function formatResumeTime(seconds = 0): string {
 export default function Home() {
   const navigate = useNavigate()
   const {
-    currentConfig, sites, currentSiteKey, categories, filters, homeVideos,
+    currentConfig, sites, currentSiteKey, contentSiteKey, pendingSiteKey, categories, filters, homeVideos,
     categoryVideos, currentPage, hasMore, isLoading, error,
     switchSite, fetchCategoryContent
   } = useConfigStore()
@@ -29,11 +29,17 @@ export default function Home() {
       const [showFilterPanel, setShowFilterPanel] = useState(false)
       const scrollContainerRef = useRef<HTMLDivElement>(null)
   const [showSiteSheet, setShowSiteSheet] = useState(false)
+  const siteSheetBtnRef = useRef<HTMLButtonElement>(null)
   const siteSheetRef = useRef<HTMLDivElement>(null)
+  const [siteSheetRect, setSiteSheetRect] = useState({ top: 0, left: 0 })
   const [continueItems, setContinueItems] = useState<HistoryItem[]>([])
 
-  // 只显示 HTTP API 类型的站点（type 0/1/4）
-  const visibleSites = sites.filter((s) => s.type === 0 || s.type === 1 || s.type === 4)
+  // 只显示可直接请求的 HTTP API 类型站点（type 0/1/4）
+  const visibleSites = sites.filter((s) =>
+    (s.type === 0 || s.type === 1 || s.type === 4) &&
+    s.hide !== 1 &&
+    Boolean(s.api?.trim())
+  )
 
   // 获取当前分类的可用筛选器
   const activeFilters = (filters && activeCategory && filters[activeCategory]) || []
@@ -80,6 +86,11 @@ export default function Home() {
 
       const handleSiteSheetClick = (key: string) => {
         if (key === currentSiteKey) {
+          const btn = siteSheetBtnRef.current
+          if (btn) {
+            const rect = btn.getBoundingClientRect()
+            setSiteSheetRect({ top: rect.bottom + 4, left: rect.left })
+          }
           setShowSiteSheet(prev => !prev)
         } else {
           handleSiteSwitch(key)
@@ -99,7 +110,7 @@ export default function Home() {
       }
 
   const handleVodClick = (vod: any) => {
-    navigate(`/vod/${currentSiteKey}/${vod.vod_id}`)
+    navigate(`/vod/${contentSiteKey || currentSiteKey}/${vod.vod_id}`)
   }
 
       // 无限滚动
@@ -180,6 +191,7 @@ export default function Home() {
           <div className="flex items-center px-4 py-2 gap-1 scrollbar-hidden overflow-x-auto">
             <div className="relative shrink-0">
               <button
+                ref={siteSheetBtnRef}
                 onClick={() => { setActiveCategory(''); setShowFilterPanel(false); handleSiteSheetClick(currentSiteKey) }}
                 className={`shrink-0 px-3 py-1 text-xs rounded-md transition-colors ${
                   !activeCategory
@@ -189,26 +201,6 @@ export default function Home() {
               >
                 首页
               </button>
-              {showSiteSheet && (
-                <div className="fixed inset-0 z-40" onClick={() => setShowSiteSheet(false)} />
-              )}
-              {showSiteSheet && (
-                <div className="absolute z-50 top-full left-0 mt-1 min-w-[180px] max-h-[360px] overflow-y-auto rounded-lg border border-[#2a2a2a] bg-bg-secondary shadow-xl py-1">
-                  {visibleSites.map((site) => (
-                    <button
-                      key={site.key}
-                      onClick={() => handleSiteSwitch(site.key)}
-                      className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                        currentSiteKey === site.key
-                          ? 'text-accent bg-accent/10'
-                          : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
-                      }`}
-                    >
-                      {site.name}
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
             {categories.map((cat) => (
               <button
@@ -263,6 +255,13 @@ export default function Home() {
       </div>
 
       {/* 错误提示 */}
+      {pendingSiteKey && (
+        <div className="shrink-0 flex items-center justify-center gap-2 px-4 py-2 bg-bg-secondary text-xs text-text-muted">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          正在切换到 {visibleSites.find((site) => site.key === pendingSiteKey)?.name || '新站点'}，当前内容可继续浏览
+        </div>
+      )}
+
       {error && !isLoading && (
         <div className="shrink-0 px-4 py-2 bg-red-500/10 text-red-400 text-xs text-center">
           {error}
@@ -317,7 +316,7 @@ export default function Home() {
           </section>
         )}
 
-        {isLoading && displayVideos.length === 0 ? (
+        {isLoading && displayVideos.length === 0 && !contentSiteKey ? (
           <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
             {Array.from({ length: 12 }).map((_, i) => (
               <VodCard key={i} vod={{ vod_id: '', vod_name: '', vod_pic: '', vod_remarks: '' }} onClick={() => {}} loading />
@@ -342,6 +341,32 @@ export default function Home() {
           </div>
         )}
       </div>
+
+      {/* 站点切换下拉菜单 - 放在 overflow 容器外避免被裁剪 */}
+      {showSiteSheet && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setShowSiteSheet(false)} />
+          <div
+            ref={siteSheetRef}
+            className="fixed z-50 min-w-[180px] max-h-[360px] overflow-y-auto rounded-lg border border-[#2a2a2a] bg-bg-secondary shadow-xl py-1"
+            style={{ top: siteSheetRect.top, left: siteSheetRect.left }}
+          >
+            {visibleSites.map((site) => (
+              <button
+                key={site.key}
+                onClick={() => handleSiteSwitch(site.key)}
+                className={`w-full text-left px-3 py-2 text-sm transition-colors ${
+                  currentSiteKey === site.key
+                    ? 'text-accent bg-accent/10'
+                    : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
+                }`}
+              >
+                {site.name}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
 }
