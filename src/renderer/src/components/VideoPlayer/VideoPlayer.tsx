@@ -898,7 +898,7 @@ export default function VideoPlayer() {
       `影片: ${currentVod?.vod_name || '-'}`,
       `集数: ${episodes[currentEpisodeIndex]?.name || currentEpisodeIndex + 1 || '-'}`,
       `线路索引: ${currentSourceIndex + 1}`,
-      `已失败源: ${brokenSources.size}`,
+      `已失败源: ${brokenSources.length}`,
       `备选源: ${alternativeSources.length}`,
       `首帧耗时: ${firstFrameMs == null ? '-' : `${firstFrameMs}ms`}`,
       `当前耗时: ${elapsedMs}ms`,
@@ -1164,7 +1164,7 @@ export default function VideoPlayer() {
               <DiagnosticRow label="集数" value={episodes[currentEpisodeIndex]?.name || String(currentEpisodeIndex + 1)} />
               <DiagnosticRow label="线路" value={String(currentSourceIndex + 1)} />
               <DiagnosticRow label="换源" value={`${sourceSwitchState}${sourceSwitchMessage ? ` - ${sourceSwitchMessage}` : ''}`} />
-              <DiagnosticRow label="已失败/备选" value={`${brokenSources.size}/${alternativeSources.length}`} />
+              <DiagnosticRow label="已失败/备选" value={`${brokenSources.length}/${alternativeSources.length}`} />
             </DiagnosticSection>
 
             <DiagnosticSection title="线路">

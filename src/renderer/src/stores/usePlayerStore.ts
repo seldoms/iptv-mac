@@ -79,8 +79,8 @@ interface PlayerState {
   // ==================== 换源相关状态 ====================
   /** 备选源队列（来自其他站点的同名 VOD） */
   alternativeSources: AlternativeSource[]
-  /** 已失败的源 key 集合（siteKey + vodId） */
-  brokenSources: Set<string>
+  /** 已失败的源 key 数组（siteKey + vodId） */
+  brokenSources: string[]
   /** 换源状态：idle / searching / switching */
   sourceSwitchState: 'idle' | 'searching' | 'switching'
   /** 换源提示信息（给用户看） */
@@ -162,7 +162,7 @@ const initialState: PlayerState = {
   playbackLastErrorAt: 0,
   playbackDiagnostic: null,
   alternativeSources: [],
-  brokenSources: new Set(),
+  brokenSources: [],
   sourceSwitchState: 'idle',
   sourceSwitchMessage: '',
   autoSwitchSource: true
@@ -333,8 +333,8 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
       sourceId: diagnostic.sourceId || (
         state.currentSiteKey && state.currentVod ? `${state.currentSiteKey}::${state.currentVod.vod_id}` : undefined
       ),
-      attempt: diagnostic.attempt ?? state.brokenSources.size + 1,
-      sourceCount: diagnostic.sourceCount ?? state.alternativeSources.length + state.brokenSources.size + 1,
+      attempt: diagnostic.attempt ?? state.brokenSources.length + 1,
+      sourceCount: diagnostic.sourceCount ?? state.alternativeSources.length + state.brokenSources.length + 1,
       nextAction: diagnostic.nextAction || (state.autoSwitchSource ? '自动尝试下一条可用线路' : '可手动重试或切换线路')
     }
   })),
@@ -351,14 +351,15 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
   setAlternativeSources: (sources) => set({ alternativeSources: sources }),
 
   markCurrentSourceBroken: (siteKey, vodId) => {
+    const key = makeSourceKey(siteKey, vodId)
     const { brokenSources, currentVod } = get()
-    const newBroken = new Set(brokenSources)
-    newBroken.add(makeSourceKey(siteKey, vodId))
+    const newBroken = [...brokenSources, key]
     // 同时标记当前 detail 页面正在播放的源为 broken（用 siteKey + currentVod.vod_id）
     if (currentVod) {
-      newBroken.add(makeSourceKey(siteKey, currentVod.vod_id))
+      const vodKey = makeSourceKey(siteKey, currentVod.vod_id)
+      if (!newBroken.includes(vodKey)) newBroken.push(vodKey)
     }
-    console.log('[PlayerStore] 标记源失败:', siteKey, vodId, '已失败数:', newBroken.size)
+    console.log('[PlayerStore] 标记源失败:', siteKey, vodId, '已失败数:', newBroken.length)
     set({ brokenSources: newBroken })
   },
 
@@ -375,7 +376,7 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
     while (alternativeSources.length > 0) {
       const next = alternativeSources[0]
       const key = makeSourceKey(next.siteKey, next.vodId)
-      if (!brokenSources.has(key)) {
+      if (!brokenSources.includes(key)) {
         // 弹出
         set({ alternativeSources: alternativeSources.slice(1) })
         return next
@@ -391,7 +392,7 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
     if (index < 0 || index >= alternativeSources.length) return null
     const target = alternativeSources[index]
     const key = makeSourceKey(target.siteKey, target.vodId)
-    if (brokenSources.has(key)) return null
+    if (brokenSources.includes(key)) return null
     // 从队列中移除该源
     const newQueue = [...alternativeSources.slice(0, index), ...alternativeSources.slice(index + 1)]
     set({ alternativeSources: newQueue })
@@ -400,7 +401,7 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
 
   resetSourceSwitch: () => set({
     alternativeSources: [],
-    brokenSources: new Set(),
+    brokenSources: [],
     sourceSwitchState: 'idle',
     sourceSwitchMessage: ''
   }),
