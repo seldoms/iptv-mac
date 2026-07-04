@@ -11,7 +11,6 @@ mod network;
 mod path_safety;
 mod spider;
 mod super_parse;
-mod types;
 
 use std::sync::LazyLock;
 use std::{fs, path::PathBuf, time::SystemTime};
