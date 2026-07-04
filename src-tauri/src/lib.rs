@@ -53,6 +53,10 @@ pub struct AppState {
     pub data_dir: PathBuf,
 }
 
+/// 加载设置。
+/// 注意：设置以明文 JSON 存储（`settings.json`），
+/// 不包含敏感数据（无 token/密码/密钥仅存储 UI 偏好和播放状态）。
+/// 如需存储敏感凭证，应使用数据库加密字段。
 fn load_settings(path: &PathBuf) -> Map<String, Value> {
     match fs::read_to_string(path) {
         Ok(text) => {
