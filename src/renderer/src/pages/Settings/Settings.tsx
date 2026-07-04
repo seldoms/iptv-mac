@@ -17,7 +17,7 @@ import {
   X,
   Tv
 } from 'lucide-react'
-import { configApi, invoke, localApi, on } from '@/utils/ipc'
+import { configApi, invoke, localApi, on, settingsApi } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
 import type { ConfigInspection } from '@shared/types'
 import { useNavigate } from 'react-router-dom'
@@ -64,9 +64,40 @@ export default function Settings() {
   const [localServer, setLocalServer] = useState<{ url: string; token: string }>({ url: '', token: '' })
   const { loadConfig } = useConfigStore()
 
+  // 播放/网络设置状态
+  const [dohUrl, setDohUrl] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [hostsText, setHostsText] = useState('')
+  const [adBlockEnabled, setAdBlockEnabled] = useState(false)
+  const [defaultSpeed, setDefaultSpeed] = useState('1')
+  const [danmakuEnabled, setDanmakuEnabled] = useState(true)
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
+
+  // 加载所有设置
   useEffect(() => {
     localApi.getServerInfo().then(setLocalServer).catch(() => {})
+    Promise.all([
+      settingsApi.get('dohUrl').catch(() => ''),
+      settingsApi.get('proxyUrl').catch(() => ''),
+      settingsApi.get('hostsText').catch(() => ''),
+      settingsApi.get('adBlockEnabled').catch(() => false),
+      settingsApi.get('defaultSpeed').catch(() => '1'),
+      settingsApi.get('danmakuEnabled').catch(() => true),
+    ]).then(([doh, proxy, hosts, ad, speed, danmaku]) => {
+      setDohUrl(doh as string || '')
+      setProxyUrl(proxy as string || '')
+      setHostsText(hosts as string || '')
+      setAdBlockEnabled(Boolean(ad))
+      setDefaultSpeed(speed as string || '1')
+      setDanmakuEnabled(Boolean(danmaku))
+      setSettingsLoaded(true)
+    })
   }, [])
+
+  // 保存设置（防抖简易版）
+  const saveSetting = (key: string, value: any) => {
+    settingsApi.set(key, value).catch(() => {})
+  }
 
   const [liveChecking, setLiveChecking] = useState(false)
   const [liveCheckProgress, setLiveCheckProgress] = useState<{
@@ -628,7 +659,12 @@ export default function Settings() {
           <div className="space-y-6 max-w-2xl">
             <div>
               <h3 className="text-sm font-medium text-text-primary mb-3">DNS over HTTPS</h3>
-              <select className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none">
+              <select
+                value={dohUrl}
+                onChange={(e) => { setDohUrl(e.target.value); saveSetting('dohUrl', e.target.value) }}
+                className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none"
+                disabled={!settingsLoaded}
+              >
                 <option value="">关闭</option>
                 <option value="https://dns.alidns.com/dns-query">阿里 DNS</option>
                 <option value="https://doh.pub/dns-query">腾讯 DNS</option>
@@ -639,17 +675,23 @@ export default function Settings() {
               <h3 className="text-sm font-medium text-text-primary mb-3">代理设置</h3>
               <input
                 type="text"
+                value={proxyUrl}
+                onChange={(e) => { setProxyUrl(e.target.value); saveSetting('proxyUrl', e.target.value) }}
                 placeholder="代理地址，如 http://127.0.0.1:7890"
                 className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent"
+                disabled={!settingsLoaded}
               />
               <p className="text-xs text-text-muted mt-1.5">支持 HTTP / HTTPS / SOCKS4 / SOCKS5 代理</p>
             </div>
             <div>
               <h3 className="text-sm font-medium text-text-primary mb-3">Hosts 覆盖</h3>
               <textarea
+                value={hostsText}
+                onChange={(e) => { setHostsText(e.target.value); saveSetting('hostsText', e.target.value) }}
                 placeholder="每行一条，格式：原始域名=目标域名或IP&#10;例：old.cdn.example.com=new.cdn.example.com"
                 rows={4}
                 className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent resize-none"
+                disabled={!settingsLoaded}
               />
             </div>
             <div className="flex items-center justify-between">
@@ -657,8 +699,11 @@ export default function Settings() {
                 <h3 className="text-sm font-medium text-text-primary">广告拦截</h3>
                 <p className="text-xs text-text-muted mt-0.5">拦截配置中 ads 域名列表的请求</p>
               </div>
-              <button className="w-10 h-6 rounded-full bg-bg-tertiary relative transition-colors">
-                <div className="w-4 h-4 rounded-full bg-text-muted absolute top-1 left-1 transition-all" />
+              <button
+                onClick={() => { setAdBlockEnabled(!adBlockEnabled); saveSetting('adBlockEnabled', !adBlockEnabled) }}
+                className={`w-10 h-6 rounded-full relative transition-colors ${adBlockEnabled ? 'bg-accent' : 'bg-bg-tertiary'}`}
+              >
+                <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-all ${adBlockEnabled ? 'right-1' : 'left-1'}`} />
               </button>
             </div>
           </div>
@@ -668,14 +713,13 @@ export default function Settings() {
         {activeTab === 'player' && (
           <div className="space-y-6 max-w-2xl">
             <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">默认解析器</h3>
-              <select className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none">
-                <option value="">系统默认</option>
-              </select>
-            </div>
-            <div>
               <h3 className="text-sm font-medium text-text-primary mb-3">默认倍速</h3>
-              <select className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none">
+              <select
+                value={defaultSpeed}
+                onChange={(e) => { setDefaultSpeed(e.target.value); saveSetting('defaultSpeed', e.target.value) }}
+                className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none"
+                disabled={!settingsLoaded}
+              >
                 <option value="0.5">0.5x</option>
                 <option value="0.75">0.75x</option>
                 <option value="1">1x（默认）</option>
@@ -689,17 +733,11 @@ export default function Settings() {
                 <h3 className="text-sm font-medium text-text-primary">弹幕默认开启</h3>
                 <p className="text-xs text-text-muted mt-0.5">播放时自动显示弹幕</p>
               </div>
-              <button className="w-10 h-6 rounded-full bg-accent relative">
-                <div className="w-4 h-4 rounded-full bg-white absolute top-1 right-1 transition-all" />
-              </button>
-            </div>
-            <div className="flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-medium text-text-primary">硬件加速</h3>
-                <p className="text-xs text-text-muted mt-0.5">使用 GPU 加速视频解码</p>
-              </div>
-              <button className="w-10 h-6 rounded-full bg-accent relative">
-                <div className="w-4 h-4 rounded-full bg-white absolute top-1 right-1 transition-all" />
+              <button
+                onClick={() => { setDanmakuEnabled(!danmakuEnabled); saveSetting('danmakuEnabled', !danmakuEnabled) }}
+                className={`w-10 h-6 rounded-full relative transition-colors ${danmakuEnabled ? 'bg-accent' : 'bg-bg-tertiary'}`}
+              >
+                <div className={`w-4 h-4 rounded-full bg-white absolute top-1 transition-all ${danmakuEnabled ? 'right-1' : 'left-1'}`} />
               </button>
             </div>
           </div>

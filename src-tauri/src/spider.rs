@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,12 @@ use serde_json::Value;
 use crate::error::AppError;
 
 type HttpResult<T> = std::result::Result<T, AppError>;
+
+// ==================== 正则编译缓存 ====================
+
+static RE_VIDEO_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)https?://[^\s]{12,}\.(?:m3u8|m3u|mp4|flv|hlv|f4v|mkv|avi|wmv|mov|webm|ts|m4s|mpd|aac|mp3|m4a)(?:\?.*)?$").unwrap()
+});
 
 // ==================== 类型定义 ====================
 
@@ -580,8 +587,7 @@ pub fn is_video_format(url: &str) -> bool {
     if url.is_empty() || url.starts_with("data:") || url.starts_with("blob:") {
         return false;
     }
-    let re = Regex::new(r"(?i)https?://[^\s]{12,}\.(?:m3u8|m3u|mp4|flv|hlv|f4v|mkv|avi|wmv|mov|webm|ts|m4s|mpd|aac|mp3|m4a)(?:\?.*)?$").unwrap();
-    if re.is_match(url) {
+    if RE_VIDEO_URL.is_match(url) {
         return true;
     }
     if url.contains("video/tos") {

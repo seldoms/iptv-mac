@@ -3,50 +3,75 @@ use serde_json::Value;
 use std::sync::LazyLock;
 
 /// 敏感 URL 查询参数名（大小写不敏感）
+#[allow(dead_code)]
 const SENSITIVE_PARAMS: &[&str] = &[
-    "token", "access_token", "refresh_token", "api_key", "apikey",
-    "secret", "signature", "sig", "sign", "session", "password", "passwd",
-    "auth", "authorization",
+    "token",
+    "access_token",
+    "refresh_token",
+    "api_key",
+    "apikey",
+    "secret",
+    "signature",
+    "sig",
+    "sign",
+    "session",
+    "password",
+    "passwd",
+    "auth",
+    "authorization",
 ];
 
 /// 敏感 header 名（大小写不敏感）
+#[allow(dead_code)]
 const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization", "cookie", "set-cookie", "x-api-key",
-    "token", "access-token", "refresh-token", "api-key",
-    "secret", "signature", "sig", "sign", "session",
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "token",
+    "access-token",
+    "refresh-token",
+    "api-key",
+    "secret",
+    "signature",
+    "sig",
+    "sign",
+    "session",
 ];
 
-static BEARER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(Bearer\s+)[A-Za-z0-9._\-+/~=]{8,}"#).unwrap()
-});
+static BEARER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(Bearer\s+)[A-Za-z0-9._\-+/~=]{8,}"#).unwrap());
 
-static COOKIE_VALUE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)((?:Cookie|Set-Cookie):\s*[^=]+=)[^;\r\n]{4,}"#).unwrap()
-});
+static COOKIE_VALUE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)((?:Cookie|Set-Cookie):\s*[^=]+=)[^;\r\n]{4,}"#).unwrap());
 
 static TOKEN_IN_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)([?&](?:token|api_key|secret|signature|sign|passwd|password)=)[^&]{4,}"#).unwrap()
+    Regex::new(r#"(?i)([?&](?:token|api_key|secret|signature|sign|passwd|password)=)[^&]{4,}"#)
+        .unwrap()
 });
 
 /// 脱敏 URL 中的 token/sign 等敏感查询参数
+#[allow(dead_code)]
 pub fn redact_url(text: &str) -> String {
-    TOKEN_IN_URL_RE.replace_all(text, |caps: &regex::Captures| {
-        format!("{}***", &caps[1])
-    }).to_string()
+    TOKEN_IN_URL_RE
+        .replace_all(text, |caps: &regex::Captures| format!("{}***", &caps[1]))
+        .to_string()
 }
 
 /// 脱敏 Authorization Bearer token
+#[allow(dead_code)]
 pub fn redact_bearer(text: &str) -> String {
-    BEARER_RE.replace_all(text, |caps: &regex::Captures| {
-        format!("{}***", &caps[1])
-    }).to_string()
+    BEARER_RE
+        .replace_all(text, |caps: &regex::Captures| format!("{}***", &caps[1]))
+        .to_string()
 }
 
 /// 脱敏 Cookie / Set-Cookie 的 value
+#[allow(dead_code)]
 pub fn redact_cookie(text: &str) -> String {
-    COOKIE_VALUE_RE.replace_all(text, |caps: &regex::Captures| {
-        format!("{}***", &caps[1])
-    }).to_string()
+    COOKIE_VALUE_RE
+        .replace_all(text, |caps: &regex::Captures| format!("{}***", &caps[1]))
+        .to_string()
 }
 
 /// 综合脱敏：URL token + Bearer + Cookie
@@ -57,6 +82,7 @@ pub fn redact_text(text: &str) -> String {
 }
 
 /// 递归脱敏 JSON Value 中的敏感字段
+#[allow(dead_code)]
 pub fn redact_value(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -79,6 +105,7 @@ pub fn redact_value(value: &Value) -> Value {
 }
 
 /// 格式化日志参数：字符串脱敏，对象递归脱敏
+#[allow(dead_code)]
 pub fn format_log_arg(arg: &Value) -> String {
     let redacted = redact_value(arg);
     if let Value::String(s) = redacted {
@@ -89,10 +116,12 @@ pub fn format_log_arg(arg: &Value) -> String {
 }
 
 /// 对 JSON Value 中的敏感字段进行 in-place 脱敏（用于日志输出）
+#[allow(dead_code)]
 pub fn redact_json_for_log(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            let sensitive_keys: Vec<String> = map.keys()
+            let sensitive_keys: Vec<String> = map
+                .keys()
                 .filter(|k| {
                     let kl = k.to_lowercase();
                     SENSITIVE_HEADERS.iter().any(|h| kl.contains(h))
