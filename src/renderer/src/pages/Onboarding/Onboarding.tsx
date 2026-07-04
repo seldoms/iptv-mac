@@ -1,10 +1,71 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlertCircle, Check, Link, Loader2, Radio, Search } from 'lucide-react'
+import { AlertCircle, Check, Link, Loader2, Radio, Search, Star } from 'lucide-react'
 import { configApi } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
 import AppLogo from '@/components/AppLogo/AppLogo'
 import type { ConfigInspection } from '@shared/types'
+
+// ==================== 内置推荐源 ====================
+// 来自 docs/TEST_SOURCES.md 中经 tvbox_probe 验证可用的源
+const DEFAULT_SOURCES = [
+  {
+    name: '多多影音',
+    url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json',
+    sites: 435,
+    lives: 1,
+    desc: '435 个点播站点 + 直播',
+  },
+  {
+    name: '心魔在线',
+    url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json',
+    sites: 151,
+    lives: 1,
+    desc: '151 个点播站点',
+  },
+  {
+    name: '高天流云',
+    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json',
+    sites: 298,
+    lives: 2,
+    desc: '298 个点播站点 + 直播',
+  },
+  {
+    name: '宝盒备用',
+    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json',
+    sites: 77,
+    lives: 1,
+    desc: '77 个点播站点 + 直播',
+  },
+  {
+    name: 'D佬线路',
+    url: 'http://rihou.cc:555/nzk/nzk0722.json',
+    sites: 37,
+    lives: 20,
+    desc: '37 个点播站点 + 20 直播源',
+  },
+  {
+    name: '小盒子单仓',
+    url: 'http://xhztv.top/xhz',
+    sites: 54,
+    lives: 1,
+    desc: '54 个点播站点 + 直播',
+  },
+  {
+    name: '香雅晴线',
+    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json',
+    sites: 48,
+    lives: 3,
+    desc: '48 个点播站点 + 直播',
+  },
+  {
+    name: '多多内置',
+    url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin',
+    sites: 91,
+    lives: 10,
+    desc: '91 个点播站点 + 10 直播源',
+  },
+]
 
 function compatibilityBadgeClass(compatibility: ConfigInspection['compatibility']) {
   if (compatibility === 'ready') return 'text-green-400'
@@ -31,6 +92,8 @@ export default function Onboarding() {
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [isInspecting, setIsInspecting] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
+  const [defaultIndex, setDefaultIndex] = useState<number | null>(null)
+  const importLockRef = useRef(false)
 
   const normalizedUrl = url.trim()
 
@@ -38,12 +101,13 @@ export default function Onboarding() {
     setMessage({ type, text })
   }
 
-  const inspect = async (): Promise<ConfigInspection | null> => {
-    if (!normalizedUrl) return null
+  const inspect = async (targetUrl?: string): Promise<ConfigInspection | null> => {
+    const inspectUrl = targetUrl || normalizedUrl
+    if (!inspectUrl) return null
     setIsInspecting(true)
     setInspection(null)
     try {
-      const result = await configApi.inspect(normalizedUrl) as { success: boolean; data?: ConfigInspection; error?: string }
+      const result = await configApi.inspect(inspectUrl) as { success: boolean; data?: ConfigInspection; error?: string }
       if (result.success && result.data) {
         setInspection(result.data)
         showMessage('success', '配置预检通过')
@@ -59,24 +123,35 @@ export default function Onboarding() {
     }
   }
 
-  const importConfig = async () => {
-    if (!normalizedUrl) return
+  const importConfig = async (targetUrl?: string) => {
+    if (importLockRef.current) return
+    importLockRef.current = true
+    try {
+      await doImport(targetUrl)
+    } finally {
+      importLockRef.current = false
+    }
+  }
+
+  const doImport = async (targetUrl?: string) => {
+    const importUrl = targetUrl || normalizedUrl
+    if (!importUrl) return
     setIsImporting(true)
     try {
-      const currentInspection = inspection?.url === normalizedUrl ? inspection : await inspect()
+      const currentInspection = inspection?.url === importUrl ? inspection : await inspect(importUrl)
       if (!currentInspection) return
       if (!currentInspection.canImport) {
         showMessage('error', '该配置暂不兼容：没有可用的 HTTP API 点播站点或直播源')
         return
       }
 
-      const result = await configApi.load(normalizedUrl) as { success: boolean; error?: string }
+      const result = await configApi.load(importUrl) as { success: boolean; error?: string }
       if (!result.success) {
         showMessage('error', result.error || '配置导入失败')
         return
       }
 
-      await loadConfig(normalizedUrl)
+      await loadConfig(importUrl)
       showMessage('success', '配置导入成功')
 
       if (hasUsableVodSites(currentInspection)) {
@@ -93,6 +168,37 @@ export default function Onboarding() {
     }
   }
 
+  const handleDefaultClick = async (index: number) => {
+    setDefaultIndex(index)
+    const source = DEFAULT_SOURCES[index]
+    setUrl(source.url)
+    setInspection(null)
+    setMessage(null)
+    // 自动预检
+    const insp = await inspect(source.url)
+    // 如果预检通过就自动导入
+    if (insp?.canImport) {
+      await importConfig(source.url)
+    }
+    setDefaultIndex(null)
+  }
+
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const pasted = e.clipboardData.getData('text').trim()
+    if (pasted) {
+      e.preventDefault()
+      setUrl(pasted)
+      setInspection(null)
+      setMessage(null)
+      // 粘贴的是 URL 时自动触发预检
+      if (/^https?:\/\//i.test(pasted)) {
+        setTimeout(() => inspect(pasted), 100)
+      }
+    }
+  }
+
+  const loading = isInspecting || isImporting
+
   return (
     <div className="h-full overflow-y-auto scrollbar-dark bg-bg-primary">
       <div className="mx-auto flex min-h-full max-w-3xl flex-col justify-center px-8 py-10">
@@ -100,43 +206,79 @@ export default function Onboarding() {
           <AppLogo className="mb-4 h-14 w-14" />
           <h1 className="text-2xl font-semibold text-text-primary">开始使用 IPTV Mac</h1>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-text-muted">
-            已内置一组可测试的点播和直播源，打开即可使用。也可以在这里导入自己的 TVBox/CatVod 配置或直播源直链。
+            选择一个推荐源，或粘贴 TVBox/CatVod 配置地址快速开始。
           </p>
         </div>
 
+        {/* 推荐源卡片 */}
+        <div className="mb-6">
+          <div className="mb-3 flex items-center gap-2">
+            <Star className="h-4 w-4 text-accent" />
+            <h2 className="text-sm font-medium text-text-primary">推荐订阅源</h2>
+            <span className="text-xs text-text-muted">点击即可使用</span>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {DEFAULT_SOURCES.map((source, index) => (
+              <button
+                key={source.url}
+                onClick={() => handleDefaultClick(index)}
+                disabled={loading}
+                className={`group rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3 text-left transition-all hover:border-accent/40 hover:bg-bg-hover disabled:opacity-60 ${
+                  defaultIndex === index ? 'border-accent/50 ring-1 ring-accent/30' : ''
+                }`}
+              >
+                <p className="truncate text-sm font-medium text-text-primary group-hover:text-accent transition-colors">
+                  {source.name}
+                </p>
+                <p className="mt-1 text-[11px] leading-relaxed text-text-muted">
+                  {source.desc}
+                </p>
+                {defaultIndex === index && (
+                  <div className="mt-2 flex items-center gap-1.5 text-xs text-accent">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    加载中...
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 手动输入 */}
         <div className="rounded-lg border border-[#2a2a2a] bg-bg-secondary p-4">
           <div className="mb-3 flex items-center gap-2">
             <Link className="h-4 w-4 text-accent" />
-            <h2 className="text-sm font-medium text-text-primary">导入配置地址</h2>
+            <h2 className="text-sm font-medium text-text-primary">或粘贴配置地址</h2>
           </div>
           <div className="flex gap-2">
             <input
               type="text"
               value={url}
               onChange={(event) => {
-                setUrl(event.target.value)
+                setUrl(event.target.value.trim())
                 setInspection(null)
                 setMessage(null)
               }}
+              onPaste={handlePaste}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') void importConfig()
+                if (event.key === 'Enter' && !loading) void importConfig()
               }}
               placeholder="https://example.com/config.json"
               className="min-w-0 flex-1 rounded-lg bg-bg-tertiary px-3 py-2 text-sm text-text-primary outline-none placeholder:text-text-muted focus:ring-1 focus:ring-accent"
-              disabled={isInspecting || isImporting}
+              disabled={loading}
               autoFocus
             />
             <button
-              onClick={inspect}
-              disabled={!normalizedUrl || isInspecting || isImporting}
+              onClick={() => inspect()}
+              disabled={!normalizedUrl || loading}
               className="inline-flex items-center gap-1.5 rounded-lg border border-[#2a2a2a] px-4 py-2 text-sm font-medium text-text-secondary transition-colors hover:bg-bg-hover disabled:opacity-50"
             >
               {isInspecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
               预检
             </button>
             <button
-              onClick={importConfig}
-              disabled={!normalizedUrl || isInspecting || isImporting || (inspection?.url === normalizedUrl && !inspection.canImport)}
+              onClick={() => importConfig()}
+              disabled={!normalizedUrl || loading || (inspection?.url === normalizedUrl && !inspection.canImport)}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-bg-primary transition-colors hover:bg-accent-hover disabled:opacity-50"
             >
               {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}

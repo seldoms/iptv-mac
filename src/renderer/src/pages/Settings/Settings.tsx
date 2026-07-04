@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Settings as SettingsIcon,
   Plus,
@@ -68,67 +68,33 @@ export default function Settings() {
     localApi.getServerInfo().then(setLocalServer).catch(() => {})
   }, [])
 
-  // Live refresh state
-  const [liveRefreshInterval, setLiveRefreshInterval] = useState(30)
-  const [liveRefreshing, setLiveRefreshing] = useState(false)
-  const [liveRefreshProgress, setLiveRefreshProgress] = useState<{
+  const [liveChecking, setLiveChecking] = useState(false)
+  const [liveCheckProgress, setLiveCheckProgress] = useState<{
     phase: string; current: number; total: number; message: string
   } | null>(null)
-  const [liveStats, setLiveStats] = useState<{ lastRefreshTime: number; totalChannels: number; aliveChannels: number } | null>(null)
 
-  // Load live refresh status
   useEffect(() => {
-    const handleProgress = (progress: any) => {
-      setLiveRefreshProgress(progress)
-      setLiveRefreshing(progress.phase !== 'done' && progress.phase !== 'error')
-      if (progress.phase === 'done') {
-        loadLiveStatus()
-      }
-    }
-
-    const cleanup = on('live:refreshProgress', handleProgress)
-    loadLiveStatus()
-
+    const cleanup = on('live:refreshProgress', (progress: any) => {
+      setLiveCheckProgress(progress)
+      setLiveChecking(progress.phase !== 'done' && progress.phase !== 'error')
+    })
     return cleanup as () => void
   }, [])
 
-  const loadLiveStatus = async () => {
-    try {
-      const status = await invoke('live:getRefreshStatus') as any
-      if (status) {
-        setLiveRefreshInterval(status.interval || 30)
-        setLiveStats({
-          lastRefreshTime: status.lastRefreshTime || 0,
-          totalChannels: 0,
-          aliveChannels: 0
-        })
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  const handleLiveRefresh = useCallback(async () => {
-    if (liveRefreshing) return
-    setLiveRefreshing(true)
+  const handleLiveCheck = async () => {
+    if (liveChecking) return
+    setLiveChecking(true)
+    setLiveCheckProgress({
+      phase: 'loading',
+      current: 0,
+      total: 0,
+      message: '正在批量测活...'
+    })
     try {
       await invoke('live:refresh')
-    } catch (e) {
-      setLiveRefreshing(false)
-    }
-  }, [liveRefreshing])
-
-  const handleLiveIntervalSave = async () => {
-    try {
-      const res = await invoke('live:setRefreshInterval', liveRefreshInterval) as { success: boolean; error?: string }
-      if (res.success) {
-        showMessage('success', `刷新间隔已设置为 ${liveRefreshInterval} 分钟`)
-        await loadLiveStatus()
-      } else {
-        showMessage('error', res.error || '设置失败')
-      }
     } catch (e: any) {
-      showMessage('error', '设置失败: ' + (e.message || '未知错误'))
+      setLiveChecking(false)
+      showMessage('error', '测活失败: ' + (e.message || '未知错误'))
     }
   }
 
@@ -218,6 +184,8 @@ export default function Settings() {
     useConfigStore.setState({
       sites: [],
       currentSiteKey: '',
+      contentSiteKey: '',
+      pendingSiteKey: '',
       categories: [],
       filters: {},
       homeVideos: [],
@@ -338,7 +306,7 @@ export default function Settings() {
 
   const tabs = [
     { key: 'config', label: '配置管理', icon: Link },
-    { key: 'live', label: '直播设置', icon: Tv },
+    { key: 'live', label: '直播测活', icon: Tv },
     { key: 'network', label: '网络设置', icon: Globe },
     { key: 'player', label: '播放设置', icon: Monitor },
     { key: 'about', label: '关于', icon: Info }
@@ -397,8 +365,16 @@ export default function Settings() {
                   type="text"
                   value={newConfigUrl}
                   onChange={(e) => {
-                    setNewConfigUrl(e.target.value)
+                    setNewConfigUrl(e.target.value.trim())
                     setInspection(null)
+                  }}
+                  onPaste={(e) => {
+                    const pasted = e.clipboardData.getData('text').trim()
+                    if (pasted) {
+                      e.preventDefault()
+                      setNewConfigUrl(pasted)
+                      setInspection(null)
+                    }
                   }}
                   placeholder="输入配置地址（JSON URL）..."
                   className="flex-1 px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent"
@@ -596,38 +572,36 @@ export default function Settings() {
           </div>
         )}
 
-        {/* 直播设置 */}
+        {/* 直播测活 */}
         {activeTab === 'live' && (
           <div className="space-y-6 max-w-2xl">
-            {/* 手动刷新 */}
             <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">频道刷新</h3>
+              <h3 className="text-sm font-medium text-text-primary mb-3">批量测活</h3>
               <div className="flex items-center gap-3">
                 <button
-                  onClick={handleLiveRefresh}
-                  disabled={liveRefreshing}
+                  onClick={handleLiveCheck}
+                  disabled={liveChecking}
                   className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                    liveRefreshing
+                    liveChecking
                       ? 'bg-accent-muted text-text-muted cursor-not-allowed'
                       : 'bg-accent text-white hover:bg-accent-hover'
                   }`}
                 >
-                  <RefreshCw className={`w-4 h-4 ${liveRefreshing ? 'animate-spin' : ''}`} />
-                  {liveRefreshing ? '刷新中...' : '立即刷新'}
+                  <RefreshCw className={`w-4 h-4 ${liveChecking ? 'animate-spin' : ''}`} />
+                  {liveChecking ? '测活中...' : '开始测活'}
                 </button>
                 <span className="text-xs text-text-muted">
-                  刷新将测试所有直播源的 URL 连通性，去重选优后按 国家-类别-频道 分类
+                  手动测试直播线路连通性，不会自动切换当前选择的配置源。
                 </span>
               </div>
 
-              {/* 刷新进度 */}
-              {liveRefreshing && liveRefreshProgress && (
+              {liveCheckProgress && (
                 <div className="mt-3 space-y-1">
                   <div className="flex items-center justify-between text-xs text-text-muted">
-                    <span>{liveRefreshProgress.message}</span>
+                    <span>{liveCheckProgress.message || '正在处理...'}</span>
                     <span>
-                      {liveRefreshProgress.total > 0
-                        ? Math.round((liveRefreshProgress.current / liveRefreshProgress.total) * 100)
+                      {liveCheckProgress.total > 0
+                        ? Math.round((liveCheckProgress.current / liveCheckProgress.total) * 100)
                         : 0}%
                     </span>
                   </div>
@@ -636,8 +610,8 @@ export default function Settings() {
                       className="h-full bg-accent transition-all duration-300"
                       style={{
                         width: `${
-                          liveRefreshProgress.total > 0
-                            ? Math.round((liveRefreshProgress.current / liveRefreshProgress.total) * 100)
+                          liveCheckProgress.total > 0
+                            ? Math.round((liveCheckProgress.current / liveCheckProgress.total) * 100)
                             : 0
                         }%`
                       }}
@@ -645,52 +619,6 @@ export default function Settings() {
                   </div>
                 </div>
               )}
-            </div>
-
-            {/* 刷新间隔 */}
-            <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">自动刷新间隔</h3>
-              <div className="flex items-center gap-2">
-                <input
-                  type="number"
-                  value={liveRefreshInterval}
-                  onChange={(e) => setLiveRefreshInterval(parseInt(e.target.value) || 30)}
-                  min={1}
-                  max={1440}
-                  className="w-20 px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary text-center outline-none focus:ring-1 focus:ring-accent border border-[#2a2a2a]"
-                />
-                <span className="text-sm text-text-secondary">分钟</span>
-                <button
-                  onClick={handleLiveIntervalSave}
-                  className="px-4 py-2 bg-accent text-white rounded-lg text-sm font-medium hover:bg-accent-hover transition-colors"
-                >
-                  保存
-                </button>
-              </div>
-              <p className="text-xs text-text-muted mt-2">
-                后台将自动定时刷新直播源，测试 URL 连通性并更新频道列表
-              </p>
-            </div>
-
-            {/* 刷新状态 */}
-            <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">刷新状态</h3>
-              <div className="space-y-2 text-sm">
-                <div className="flex items-center justify-between py-2 px-3 bg-bg-secondary rounded-lg border border-[#2a2a2a]">
-                  <span className="text-text-secondary">上次刷新时间</span>
-                  <span className="text-text-primary">
-                    {liveStats?.lastRefreshTime
-                      ? new Date(liveStats.lastRefreshTime * 1000).toLocaleString('zh-CN')
-                      : '尚未刷新'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between py-2 px-3 bg-bg-secondary rounded-lg border border-[#2a2a2a]">
-                  <span className="text-text-secondary">当前状态</span>
-                  <span className={liveRefreshing ? 'text-accent' : 'text-green-400'}>
-                    {liveRefreshing ? '刷新中' : '空闲'}
-                  </span>
-                </div>
-              </div>
             </div>
           </div>
         )}
