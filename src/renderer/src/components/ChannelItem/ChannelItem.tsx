@@ -6,7 +6,17 @@ interface ChannelItemProps {
   onClick: (channel: Channel) => void
 }
 
+/** 将延时（毫秒）转为颜色类和标签 */
+function latencyIndicator(ms: number | undefined): { className: string; label: string } {
+  if (ms === undefined || ms === null) return { className: '', label: '' }
+  if (ms < 80) return { className: 'text-green-400', label: `${ms}ms` }
+  if (ms < 200) return { className: 'text-yellow-400', label: `${ms}ms` }
+  return { className: 'text-red-400', label: `${ms}ms` }
+}
+
 export default function ChannelItem({ channel, isActive, onClick }: ChannelItemProps) {
+  const latency = latencyIndicator(channel.latency)
+
   return (
     <button
       onClick={() => onClick(channel)}
@@ -41,12 +51,16 @@ export default function ChannelItem({ channel, isActive, onClick }: ChannelItemP
         </div>
       )}
 
-      {/* 名称和EPG */}
-      <div className="flex-1 min-w-0">
+      {/* 名称 + 延时 */}
+      <div className="flex-1 min-w-0 flex items-center gap-2">
         <p className={`text-sm truncate ${isActive ? 'font-medium' : ''}`}>
           {channel.name}
         </p>
-        {/* EPG 信息由父组件传入或通过 store 获取 */}
+        {latency.label && (
+          <span className={`shrink-0 text-[10px] font-mono ${latency.className}`}>
+            {latency.label}
+          </span>
+        )}
       </div>
 
       {/* 活跃指示器 */}
