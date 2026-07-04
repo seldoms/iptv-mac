@@ -14,7 +14,6 @@ pub fn create_client() -> Result<Client, AppError> {
     ClientBuilder::new()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(DEFAULT_TIMEOUT)
-        .danger_accept_invalid_certs(true)
         .gzip(true)
         .build()
         .map_err(|e| AppError::network_error("创建 HTTP client 失败").with_internal(e.to_string()))
