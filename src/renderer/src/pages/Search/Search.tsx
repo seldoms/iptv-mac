@@ -22,15 +22,17 @@ export default function Search() {
   const [searchHistory, setSearchHistory] = useState<string[]>([])
   const [isSearching, setIsSearching] = useState(false)
 
-  // 加载搜索历史
+  // 加载搜索历史（带大小和格式校验）
   useEffect(() => {
     cacheApi.get('search_history').then((data: any) => {
-      if (data) {
-        try {
-          const parsed = JSON.parse(data)
-          if (Array.isArray(parsed)) setSearchHistory(parsed)
-        } catch {}
-      }
+      if (!data || typeof data !== 'string') return
+      if (data.length > 100 * 1024) return // 拒绝超过 100KB 的缓存
+      try {
+        const parsed = JSON.parse(data)
+        if (Array.isArray(parsed) && parsed.every((s): s is string => typeof s === 'string')) {
+          setSearchHistory(parsed.slice(0, 20))
+        }
+      } catch { /* 无效缓存，静默忽略 */ }
     })
   }, [])
 
