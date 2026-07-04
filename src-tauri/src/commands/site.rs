@@ -19,12 +19,42 @@ fn load_current_config(state: &State<'_, AppState>) -> Result<(String, Value), A
         .map(|url| url.to_string())
         .ok_or_else(|| AppError::not_found("无当前配置"))?;
 
+    if let Some((cached_url, cached_config)) = state.current_config.lock().as_ref() {
+        if cached_url == &config_url {
+            return Ok((config_url, cached_config.clone()));
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
     let mgr = state.config_manager.lock();
     let config = rt
         .block_on(mgr.load_from_url(&config_url))
         .map_err(|_| AppError::not_found("配置加载失败"))?;
+    *state.current_config.lock() = Some((config_url.clone(), config.clone()));
+    Ok((config_url, config))
+}
+
+async fn load_current_config_async(
+    state: &State<'_, AppState>,
+) -> Result<(String, Value), AppError> {
+    let config_url = state
+        .config_manager
+        .lock()
+        .get_current_url()
+        .map(|url| url.to_string())
+        .ok_or_else(|| AppError::not_found("无当前配置"))?;
+
+    if let Some((cached_url, cached_config)) = state.current_config.lock().as_ref() {
+        if cached_url == &config_url {
+            return Ok((config_url, cached_config.clone()));
+        }
+    }
+
+    let config = crate::config::load_config_from_url(&config_url, Some(&state.data_dir))
+        .await
+        .map_err(|_| AppError::not_found("配置加载失败"))?;
+    *state.current_config.lock() = Some((config_url.clone(), config.clone()));
     Ok((config_url, config))
 }
 
@@ -272,7 +302,7 @@ pub fn handle_site_super_parse(
 }
 
 /// site:findAcrossSites
-pub fn handle_site_find_across_sites(
+pub async fn handle_site_find_across_sites_async(
     state: &State<'_, AppState>,
     keyword: String,
     options: Option<Value>,
@@ -304,7 +334,7 @@ pub fn handle_site_find_across_sites(
         .unwrap_or(DEFAULT_ACROSS_SITE_TIMEOUT_MS)
         .clamp(1_000, 30_000);
 
-    let (config_url, config) = load_current_config(state)?;
+    let (config_url, config) = load_current_config_async(state).await?;
     let sites = config
         .get("sites")
         .and_then(Value::as_array)
@@ -332,12 +362,10 @@ pub fn handle_site_find_across_sites(
         return Ok(json!({ "success": true, "data": [] }));
     }
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
     let total_timeout = Duration::from_millis(timeout_ms);
     let per_site_timeout = Duration::from_millis(timeout_ms.min(8_000));
     let keyword_for_tasks = keyword.clone();
-    let search_result = rt.block_on(tokio::time::timeout(total_timeout, async move {
+    let search_result = tokio::time::timeout(total_timeout, async move {
         let mut handles = Vec::new();
         for (site_key, site_name, spider) in candidates {
             let keyword = keyword_for_tasks.clone();
@@ -378,7 +406,8 @@ pub fn handle_site_find_across_sites(
             }
         }
         found
-    }));
+    })
+    .await;
 
     let mut found = match search_result {
         Ok(items) => items,
@@ -421,6 +450,16 @@ pub fn handle_site_find_across_sites(
     found.truncate(limit);
 
     Ok(json!({ "success": true, "data": found }))
+}
+
+pub fn handle_site_find_across_sites(
+    state: &State<'_, AppState>,
+    keyword: String,
+    options: Option<Value>,
+) -> Result<Value, AppError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
+    rt.block_on(handle_site_find_across_sites_async(state, keyword, options))
 }
 
 fn normalize_title(value: &str) -> String {

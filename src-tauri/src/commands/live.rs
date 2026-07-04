@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
-use tauri::{Emitter, State};
 use tauri::Manager;
+use tauri::{Emitter, State};
 
 use crate::config::ConfigItem;
 use crate::database::Database;
@@ -93,7 +93,10 @@ pub fn handle_live_set_refresh_interval(
 }
 
 /// 加载直播源（从当前配置获取 URL 并解析）
-pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Result<Value, AppError> {
+pub async fn handle_live_load_async(
+    state: &State<'_, AppState>,
+    live_name: String,
+) -> Result<Value, AppError> {
     let config_url = state
         .config_manager
         .lock()
@@ -101,13 +104,23 @@ pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Resul
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::not_found("无当前配置"))?;
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
-    let config = {
-        let mgr = state.config_manager.lock();
-        rt.block_on(mgr.load_from_url(&config_url))
-            .map_err(|_| AppError::not_found("配置加载失败"))?
+    let config = if let Some((cached_url, cached_config)) = state.current_config.lock().as_ref() {
+        if cached_url == &config_url {
+            cached_config.clone()
+        } else {
+            Value::Null
+        }
+    } else {
+        Value::Null
+    };
+    let config = if config.is_null() {
+        let config = crate::config::load_config_from_url(&config_url, Some(&state.data_dir))
+            .await
+            .map_err(|_| AppError::not_found("配置加载失败"))?;
+        *state.current_config.lock() = Some((config_url.clone(), config.clone()));
+        config
+    } else {
+        config
     };
 
     // 查找匹配的直播源
@@ -128,8 +141,8 @@ pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Resul
 
     // 下载并解析
     let client = crate::network::create_client()?;
-    let content = rt
-        .block_on(crate::network::http_get(&client, &url))
+    let content = crate::network::http_get(&client, &url)
+        .await
         .map_err(|e| AppError::network_error(format!("下载直播源失败: {}", e)))?;
 
     let groups = live::parse_live_content(&content);
@@ -144,22 +157,35 @@ pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Resul
     Ok(serde_json::json!({ "success": true, "data": groups }))
 }
 
+pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Result<Value, AppError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
+    rt.block_on(handle_live_load_async(state, live_name))
+}
+
 /// 按 URL 直接加载直播源
-pub fn handle_live_load_by_url(
+pub async fn handle_live_load_by_url_async(
     _state: &State<'_, AppState>,
     url: String,
     _name: Option<String>,
 ) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
     let client = crate::network::create_client()?;
-    let content = rt
-        .block_on(crate::network::http_get(&client, &url))
+    let content = crate::network::http_get(&client, &url)
+        .await
         .map_err(|e| AppError::network_error(format!("下载直播源失败: {}", e)))?;
 
     let groups = live::parse_live_content(&content);
     Ok(serde_json::json!({ "success": true, "data": groups }))
+}
+
+pub fn handle_live_load_by_url(
+    state: &State<'_, AppState>,
+    url: String,
+    name: Option<String>,
+) -> Result<Value, AppError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
+    rt.block_on(handle_live_load_by_url_async(state, url, name))
 }
 
 /// Emit a refresh progress event via Tauri
@@ -196,14 +222,23 @@ pub fn handle_live_refresh(
     // 克隆数据供后台线程使用
     let app_handle = app.cloned();
     let config_items = state.config_manager.lock().list().to_vec();
-    let current_url = state.config_manager.lock().get_current_url().map(|s| s.to_string());
+    let current_url = state
+        .config_manager
+        .lock()
+        .get_current_url()
+        .map(|s| s.to_string());
 
     // 后台线程执行刷新，不阻塞 UI
     std::thread::spawn(move || {
         if let Err(e) = run_live_refresh_background(config_items, current_url, app_handle.clone()) {
             eprintln!("[live:refresh] 后台刷新失败: {}", e);
-            emit_progress(app_handle.as_ref(), "error", 0, 0,
-                Some(&format!("刷新失败: {}", e)));
+            emit_progress(
+                app_handle.as_ref(),
+                "error",
+                0,
+                0,
+                Some(&format!("刷新失败: {}", e)),
+            );
         }
         LIVE_REFRESH_RUNNING.store(false, Ordering::SeqCst);
     });
@@ -239,7 +274,8 @@ fn run_live_refresh_background(
     }
 
     // 获取数据库路径
-    let data_dir = app.as_ref()
+    let data_dir = app
+        .as_ref()
         .and_then(|h| h.path().app_data_dir().ok())
         .ok_or_else(|| AppError::internal("无法获取数据目录"))?;
 
@@ -247,11 +283,12 @@ fn run_live_refresh_background(
         .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
 
     // 打开独立数据库连接
-    let mut database = Database::open(data_dir.join("iptv.db"))
-        .map_err(|e| AppError::database_error(e))?;
+    let mut database =
+        Database::open(data_dir.join("iptv.db")).map_err(|e| AppError::database_error(e))?;
 
     // 更新状态为 refreshing
-    database.update_refresh_status(&serde_json::json!({ "status": "refreshing" }))
+    database
+        .update_refresh_status(&serde_json::json!({ "status": "refreshing" }))
         .map_err(|e| AppError::database_error(e))?;
 
     let channels = rt.block_on(load_all_live_channels_from_urls(&urls, app_ref))?;
@@ -264,9 +301,11 @@ fn run_live_refresh_background(
             0,
             Some("无可用的直播频道，请检查配置中是否包含直播源"),
         );
-        database.update_refresh_status(
-            &serde_json::json!({ "status": "idle", "totalChannels": 0, "aliveChannels": 0 }),
-        ).map_err(|e| AppError::database_error(e))?;
+        database
+            .update_refresh_status(
+                &serde_json::json!({ "status": "idle", "totalChannels": 0, "aliveChannels": 0 }),
+            )
+            .map_err(|e| AppError::database_error(e))?;
         return Err(AppError::not_found(
             "无可用直播源，请先添加包含 lives 的配置或直播源直链",
         ));
@@ -326,15 +365,18 @@ fn run_live_refresh_background(
         .filter(|minutes| (1..=1440).contains(minutes))
         .unwrap_or(30);
 
-    database.save_live_channels(&db_channels)
+    database
+        .save_live_channels(&db_channels)
         .map_err(|e| AppError::database_error(e))?;
-    database.update_refresh_status(&serde_json::json!({
-        "status": "idle",
-        "lastRefreshTime": now,
-        "nextRefreshTime": now + refresh_interval_minutes * 60,
-        "totalChannels": total_urls,
-        "aliveChannels": alive,
-    })).map_err(|e| AppError::database_error(e))?;
+    database
+        .update_refresh_status(&serde_json::json!({
+            "status": "idle",
+            "lastRefreshTime": now,
+            "nextRefreshTime": now + refresh_interval_minutes * 60,
+            "totalChannels": total_urls,
+            "aliveChannels": alive,
+        }))
+        .map_err(|e| AppError::database_error(e))?;
 
     emit_progress(
         app_ref,
@@ -602,19 +644,25 @@ fn best_alive_results(mut results: Vec<live::TestResult>) -> Vec<live::TestResul
 }
 
 /// 获取 EPG
-pub fn handle_live_epg(epg_url: String, channel_map: Option<Value>) -> Result<Value, AppError> {
+pub async fn handle_live_epg_async(
+    epg_url: String,
+    channel_map: Option<Value>,
+) -> Result<Value, AppError> {
     if epg_url.is_empty() {
         return Ok(serde_json::json!({ "success": true, "data": [] }));
     }
-
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
 
     let channel_map: Option<HashMap<String, Value>> = channel_map
         .and_then(|v| v.as_object().cloned())
         .map(|obj| obj.into_iter().collect());
 
-    let channels = rt.block_on(crate::epg::get_epg_data(&epg_url, channel_map.as_ref()))?;
+    let channels = crate::epg::get_epg_data(&epg_url, channel_map.as_ref()).await?;
 
     Ok(serde_json::json!({ "success": true, "data": channels }))
+}
+
+pub fn handle_live_epg(epg_url: String, channel_map: Option<Value>) -> Result<Value, AppError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
+    rt.block_on(handle_live_epg_async(epg_url, channel_map))
 }
