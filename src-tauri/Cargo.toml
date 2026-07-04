@@ -25,6 +25,7 @@ url = "2"
 urlencoding = "2"
 flate2 = "1"
 quick-xml = "0.36"
+rand = "0.8"
 
 [profile.release]
 codegen-units = 1
