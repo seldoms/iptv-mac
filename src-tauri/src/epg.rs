@@ -160,6 +160,8 @@ fn format_xmltv_time(time: &str) -> String {
 
 // ==================== 缓存 ====================
 
+const MAX_EPG_CACHE_ENTRIES: usize = 50;
+
 struct EpgCache {
     channels: Vec<EpgChannel>,
     load_time: u64,
@@ -280,9 +282,20 @@ async fn load_xmltv_epg(url: &str) -> Result<Vec<EpgChannel>, AppError> {
 
     let channels = parse_xmltv(&xml_content);
 
-    // 写入缓存
+    // 写入缓存（带 LRU 驱逐）
     let mut cache = get_cache();
-    cache.get_or_insert_with(HashMap::new).insert(
+    let cache_map = cache.get_or_insert_with(HashMap::new);
+    if cache_map.len() >= MAX_EPG_CACHE_ENTRIES && !cache_map.contains_key(&cache_key) {
+        // 删除最旧的条目（min load_time）
+        if let Some(oldest_key) = cache_map
+            .iter()
+            .min_by_key(|(_, entry)| entry.load_time)
+            .map(|(k, _)| k.clone())
+        {
+            cache_map.remove(&oldest_key);
+        }
+    }
+    cache_map.insert(
         cache_key,
         EpgCache {
             channels: channels.clone(),
