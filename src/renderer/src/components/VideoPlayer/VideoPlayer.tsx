@@ -32,6 +32,7 @@ const MAX_HLS_NETWORK_RECOVERY_ATTEMPTS = 3
 const MAX_HLS_MEDIA_RECOVERY_ATTEMPTS = 2
 const MAX_HLS_DEBUG_EVENTS = 20
 const HISTORY_SAVE_INTERVAL_MS = 15_000
+const LOAD_TIMEOUT_MS = 25000
 
 declare global {
   interface Window {
@@ -414,7 +415,7 @@ export default function VideoPlayer() {
         console.error('[VideoPlayer] 加载超时（25秒）')
         reportPlayFailureRef.current('加载超时（25秒）')
       }
-    }, 25000)
+    }, LOAD_TIMEOUT_MS)
 
     let hlsRecoveryTimer = 0
 
