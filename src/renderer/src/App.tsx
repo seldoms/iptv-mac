@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom'
+import ErrorBoundary from './components/ErrorBoundary'
 import Sidebar from './components/Sidebar/Sidebar'
 import MiniPlayer from './components/MiniPlayer/MiniPlayer'
 import Home from './pages/Home/Home'
@@ -28,16 +29,21 @@ export default function App() {
   const navigate = useNavigate()
   const location = useLocation()
   const didAutoLoad = useRef(false)
+  const [miniMode, setMiniMode] = useState(isMiniMode)
   const [smokeConfig, setSmokeConfig] = useState<AlphaPlaybackSmokeConfig | null>(null)
   const [betaContinueSmokeConfig, setBetaContinueSmokeConfig] = useState<BetaContinueSmokeConfig | null>(null)
 
-  // 精简模式：只渲染 MiniPlayer
-  if (isMiniMode()) {
-    return <MiniPlayer />
-  }
+  useEffect(() => {
+    const handleMiniModeChanged = (event: Event) => {
+      setMiniMode(Boolean((event as CustomEvent<boolean>).detail))
+    }
+    window.addEventListener('app:miniModeChanged', handleMiniModeChanged)
+    return () => window.removeEventListener('app:miniModeChanged', handleMiniModeChanged)
+  }, [])
 
   // 启动时自动加载上次使用的配置
   useEffect(() => {
+    if (miniMode) return
     if (didAutoLoad.current) return
     didAutoLoad.current = true
 
@@ -60,7 +66,7 @@ export default function App() {
       }
     }
     autoLoad()
-  }, [loadConfig, location.pathname, navigate])
+  }, [loadConfig, location.pathname, miniMode, navigate])
 
   useEffect(() => {
     let cancelled = false
@@ -88,6 +94,10 @@ export default function App() {
     return <BetaContinueSmoke config={betaContinueSmokeConfig} />
   }
 
+  if (miniMode) {
+    return <MiniPlayer />
+  }
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg-primary">
       <Sidebar />
@@ -97,16 +107,18 @@ export default function App() {
           <span className="text-[10px] text-text-muted select-none">IPTV</span>
         </div>
         <div className="flex-1 overflow-hidden">
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/vod/:siteKey/:vodId" element={<VodDetail />} />
-            <Route path="/live" element={<Live />} />
-            <Route path="/search" element={<Search />} />
-            <Route path="/history" element={<History />} />
-            <Route path="/keep" element={<Keep />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/onboarding" element={<Onboarding />} />
-          </Routes>
+          <ErrorBoundary>
+            <Routes>
+              <Route path="/" element={<Home />} />
+              <Route path="/vod/:siteKey/:vodId" element={<VodDetail />} />
+              <Route path="/live" element={<Live />} />
+              <Route path="/search" element={<Search />} />
+              <Route path="/history" element={<History />} />
+              <Route path="/keep" element={<Keep />} />
+              <Route path="/settings" element={<Settings />} />
+              <Route path="/onboarding" element={<Onboarding />} />
+            </Routes>
+          </ErrorBoundary>
         </div>
       </main>
     </div>
