@@ -94,12 +94,8 @@ export default function App() {
     return <BetaContinueSmoke config={betaContinueSmokeConfig} />
   }
 
-  if (miniMode) {
-    return <MiniPlayer />
-  }
-
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-bg-primary">
+    <div className={`h-screen w-screen overflow-hidden bg-bg-primary ${miniMode ? 'hidden' : ''}`}>
       <Sidebar />
       <main className="flex-1 flex flex-col overflow-hidden">
         {/* 顶部拖动条 - 用于移动窗口 */}
