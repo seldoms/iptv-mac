@@ -30,9 +30,7 @@ export default function History() {
   }
 
   const handleClearAll = async () => {
-    for (const item of list) {
-      await historyApi.delete(item.siteKey, item.vodId)
-    }
+    await Promise.all(list.map((item) => historyApi.delete(item.siteKey, item.vodId)))
     setList([])
   }
 
