@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback, useState } from 'react'
 import Hls from 'hls.js'
 import dashjs from 'dashjs'
 import { windowApi } from '@/utils/ipc'
+import { usePlayerStore } from '@/stores/usePlayerStore'
 import {
   Play,
   Pause,
@@ -12,11 +13,49 @@ import {
   GripHorizontal
 } from 'lucide-react'
 
+function getMiniWindowSize(videoWidth: number, videoHeight: number) {
+  if (!videoWidth || !videoHeight) return null
+  const aspect = videoWidth / videoHeight
+  if (!Number.isFinite(aspect) || aspect <= 0) return null
+
+  const screenWidth = window.screen?.availWidth || 1280
+  const screenHeight = window.screen?.availHeight || 800
+  const maxWidth = Math.min(640, Math.max(360, screenWidth * 0.48))
+  const maxHeight = Math.min(520, Math.max(240, screenHeight * 0.55))
+  const minWidth = aspect < 1 ? 220 : 320
+  const minHeight = aspect < 1 ? 320 : 180
+
+  let width = maxWidth
+  let height = width / aspect
+  if (height > maxHeight) {
+    height = maxHeight
+    width = height * aspect
+  }
+  if (width < minWidth) {
+    width = minWidth
+    height = width / aspect
+  }
+  if (height < minHeight) {
+    height = minHeight
+    width = height * aspect
+  }
+
+  width = Math.min(width, screenWidth - 48)
+  height = Math.min(height, screenHeight - 72)
+
+  return {
+    width: Math.round(width),
+    height: Math.round(height)
+  }
+}
+
 export default function MiniPlayer() {
+  const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const dashRef = useRef<dashjs.MediaPlayerClass | null>(null)
   const hideTimerRef = useRef<number>(0)
+  const lastResizeRef = useRef('')
 
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentUrl, setCurrentUrl] = useState('')
@@ -66,7 +105,7 @@ export default function MiniPlayer() {
       dashRef.current = player
     } else if (Hls.isSupported()) {
       const hls = new Hls({
-        enableWorker: true,
+        enableWorker: false,
         xhrSetup: (xhr, _url) => {
           if (playHeader) {
             for (const [key, value] of Object.entries(playHeader)) {
@@ -158,12 +197,24 @@ export default function MiniPlayer() {
 
     const onTimeUpdate = () => setCurrentTime(video.currentTime)
     const onDurationChange = () => setDuration(video.duration || 0)
+    const onLoadedMetadata = () => {
+      setDuration(video.duration || 0)
+      const size = getMiniWindowSize(video.videoWidth, video.videoHeight)
+      if (!size) return
+      const key = `${size.width}x${size.height}`
+      if (lastResizeRef.current === key) return
+      lastResizeRef.current = key
+      windowApi.resizeMiniMode(size.width, size.height).catch((err) => {
+        console.warn('[MiniPlayer] 自动调整窗口尺寸失败:', err)
+      })
+    }
     const onPlay = () => setIsPlaying(true)
     const onPause = () => setIsPlaying(false)
     const onEnded = () => setIsPlaying(false)
 
     video.addEventListener('timeupdate', onTimeUpdate)
     video.addEventListener('durationchange', onDurationChange)
+    video.addEventListener('loadedmetadata', onLoadedMetadata)
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('ended', onEnded)
@@ -171,6 +222,7 @@ export default function MiniPlayer() {
     return () => {
       video.removeEventListener('timeupdate', onTimeUpdate)
       video.removeEventListener('durationchange', onDurationChange)
+      video.removeEventListener('loadedmetadata', onLoadedMetadata)
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('ended', onEnded)
@@ -187,9 +239,47 @@ export default function MiniPlayer() {
   }, [isPlaying])
 
   // 退出精简模式
-  const handleExitMiniMode = useCallback(() => {
-    windowApi.exitMiniMode()
+  const handleExitMiniMode = useCallback(async () => {
+    const video = videoRef.current
+    const currentTime = video?.currentTime || 0
+    if (video) {
+      const playerStore = usePlayerStore.getState()
+      playerStore.setCurrentTime(currentTime)
+      playerStore.setIsPlaying(!video.paused)
+    }
+    if (currentUrl) {
+      await windowApi.savePlayerState({
+        url: currentUrl,
+        header: playHeader || undefined,
+        currentTime
+      }).catch(() => {})
+    }
+    await windowApi.exitMiniMode().catch(() => {})
+    const url = new URL(window.location.href)
+    url.searchParams.delete('mode')
+    window.history.replaceState(null, '', url.toString())
+    window.dispatchEvent(new CustomEvent('app:miniModeChanged', { detail: false }))
+  }, [currentUrl, playHeader])
+
+  const handleToggleFullscreen = useCallback(async () => {
+    const container = containerRef.current
+    if (!container) return
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+      } else {
+        await container.requestFullscreen()
+      }
+    } catch {
+      await windowApi.setFullscreen(!document.fullscreenElement).catch(() => {})
+    }
   }, [])
+
+  const handleDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement
+    if (target.closest('button,input')) return
+    handleToggleFullscreen()
+  }, [handleToggleFullscreen])
 
   // 进度条点击
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -231,9 +321,11 @@ export default function MiniPlayer() {
 
   return (
     <div
+      ref={containerRef}
       className="relative w-full h-full bg-black group"
       onMouseMove={resetHideTimer}
       onMouseLeave={() => isPlaying && setShowControls(false)}
+      onDoubleClick={handleDoubleClick}
     >
       <video ref={videoRef} className="w-full h-full object-contain" />
 
