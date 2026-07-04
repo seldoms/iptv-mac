@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::LazyLock,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,6 +12,37 @@ use serde_json::Value;
 use crate::error::AppError;
 
 const EPG_REFRESH_INTERVAL: u64 = 6 * 60 * 60; // 6 小时（秒）
+const MAX_XMLTV_DECOMPRESSED_BYTES: u64 = 200 * 1024 * 1024; // 200MB decompressed limit
+
+// ==================== 正则编译缓存 ====================
+
+static RE_CHANNEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<channel\s+id="([^"]*)"[^>]*>([\s\S]*?)</channel>"#).unwrap()
+});
+static RE_DISPLAY_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<display-name[^>]*>([^<]*)</display-name>"#).unwrap()
+});
+static RE_ICON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<icon\s+src="([^"]*)""#).unwrap()
+});
+static RE_PROGRAMME_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<programme\s+([^>]*)>([\s\S]*?)</programme>"#).unwrap()
+});
+static RE_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:\s|^)start="([^"]*)""#).unwrap()
+});
+static RE_STOP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:\s|^)stop="([^"]*)""#).unwrap()
+});
+static RE_PROG_CHANNEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:\s|^)channel="([^"]*)""#).unwrap()
+});
+static RE_TITLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<title[^>]*>([^<]*)</title>"#).unwrap()
+});
+static RE_DESC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<desc[^>]*>([^<]*)</desc>"#).unwrap()
+});
 
 // ==================== 类型 ====================
 
@@ -39,59 +71,55 @@ pub fn parse_xmltv(xml: &str) -> Vec<EpgChannel> {
     let mut channel_map: HashMap<String, usize> = HashMap::new();
 
     // 解析 <channel id="xxx">...</channel>
-    let channel_re = Regex::new(r#"<channel\s+id="([^"]*)"[^>]*>([\s\S]*?)</channel>"#).unwrap();
-    for cap in channel_re.captures_iter(xml) {
+    for cap in RE_CHANNEL.captures_iter(xml) {
         let id = cap[1].to_string();
         let content = &cap[2];
 
-        let name_re = Regex::new(r#"<display-name[^>]*>([^<]*)</display-name>"#).unwrap();
-        let name = name_re
+        let name = RE_DISPLAY_NAME
             .captures(content)
             .map(|m| m[1].trim().to_string())
             .unwrap_or_else(|| id.clone());
 
-        let logo_re = Regex::new(r#"<icon\s+src="([^"]*)""#).unwrap();
-        let logo = logo_re.captures(content).map(|m| m[1].to_string());
+        let logo = RE_ICON.captures(content).map(|m| m[1].to_string());
 
         let idx = channels.len();
-        channels.push(EpgChannel { id: id.clone(), name, logo, programs: Vec::new() });
+        channels.push(EpgChannel {
+            id: id.clone(),
+            name,
+            logo,
+            programs: Vec::new(),
+        });
         channel_map.insert(id, idx);
     }
 
     // 解析 <programme> 块
-    let block_re = Regex::new(
-        r#"<programme\s+([^>]*)>([\s\S]*?)</programme>"#,
-    )
-    .unwrap();
-
-    let start_re = Regex::new(r#"(?:\s|^)start="([^"]*)""#).unwrap();
-    let stop_re = Regex::new(r#"(?:\s|^)stop="([^"]*)""#).unwrap();
-    let channel_re = Regex::new(r#"(?:\s|^)channel="([^"]*)""#).unwrap();
-
-    for cap in block_re.captures_iter(xml) {
+    for cap in RE_PROGRAMME_BLOCK.captures_iter(xml) {
         let attrs_str = &cap[1];
         let content = &cap[2];
 
-        let start = start_re.captures(attrs_str)
+        let start = RE_START
+            .captures(attrs_str)
             .map(|m| format_xmltv_time(&m[1]))
             .unwrap_or_default();
-        let stop = stop_re.captures(attrs_str)
+        let stop = RE_STOP
+            .captures(attrs_str)
             .map(|m| format_xmltv_time(&m[1]))
             .unwrap_or_default();
-        let channel_id = channel_re.captures(attrs_str)
+        let channel_id = RE_PROG_CHANNEL
+            .captures(attrs_str)
             .map(|m| m[1].to_string())
             .unwrap_or_default();
 
-        if channel_id.is_empty() { continue; }
+        if channel_id.is_empty() {
+            continue;
+        }
 
-        let title_re = Regex::new(r#"<title[^>]*>([^<]*)</title>"#).unwrap();
-        let title = title_re
+        let title = RE_TITLE
             .captures(content)
             .map(|m| m[1].trim().to_string())
             .unwrap_or_default();
 
-        let desc_re = Regex::new(r#"<desc[^>]*>([^<]*)</desc>"#).unwrap();
-        let desc = desc_re.captures(content).map(|m| m[1].trim().to_string());
+        let desc = RE_DESC.captures(content).map(|m| m[1].trim().to_string());
 
         if let Some(&idx) = channel_map.get(&channel_id) {
             channels[idx].programs.push(EpgProgram {
@@ -161,7 +189,11 @@ pub async fn get_epg_data(
         return Ok(Vec::new());
     }
 
-    let urls: Vec<&str> = epg_url.split(',').map(|u| u.trim()).filter(|u| !u.is_empty()).collect();
+    let urls: Vec<&str> = epg_url
+        .split(',')
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .collect();
     let mut all_channels: Vec<EpgChannel> = Vec::new();
     let mut name_index: HashMap<String, usize> = HashMap::new();
 
@@ -227,11 +259,19 @@ async fn load_xmltv_epg(url: &str) -> Result<Vec<EpgChannel>, AppError> {
         }
 
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
         let mut text = String::new();
+        // 限制解压后大小，防止 zip bomb DoS 攻击
         decoder
+            .take(MAX_XMLTV_DECOMPRESSED_BYTES)
             .read_to_string(&mut text)
             .map_err(|e| AppError::parse_error("EPG 解压失败").with_internal(e.to_string()))?;
+        // 检查是否被 take() 截断（文件超过 200MB）
+        if text.len() as u64 >= MAX_XMLTV_DECOMPRESSED_BYTES {
+            return Err(AppError::network_error(
+                "EPG 文件解压后超过 200MB 限制，已中止",
+            ));
+        }
         text
     } else {
         let client = crate::network::create_client()?;
@@ -242,8 +282,13 @@ async fn load_xmltv_epg(url: &str) -> Result<Vec<EpgChannel>, AppError> {
 
     // 写入缓存
     let mut cache = get_cache();
-    cache.get_or_insert_with(HashMap::new)
-         .insert(cache_key, EpgCache { channels: channels.clone(), load_time: now });
+    cache.get_or_insert_with(HashMap::new).insert(
+        cache_key,
+        EpgCache {
+            channels: channels.clone(),
+            load_time: now,
+        },
+    );
 
     Ok(channels)
 }
@@ -277,22 +322,36 @@ async fn load_api_epg(
                     arr.iter()
                         .map(|p| EpgProgram {
                             channel: name.to_string(),
-                            title: p.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
-                            start: p.get("start").and_then(Value::as_str).unwrap_or("").to_string(),
-                            stop: p.get("stop").and_then(Value::as_str).unwrap_or("").to_string(),
+                            title: p
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            start: p
+                                .get("start")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            stop: p
+                                .get("stop")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
                             desc: p.get("desc").and_then(Value::as_str).map(String::from),
                         })
                         .collect()
                 } else if let Some(progs) = data.get("programs").and_then(Value::as_array) {
                     progs
                         .iter()
-                        .map(|p| serde_json::from_value(p.clone()).unwrap_or_else(|_| EpgProgram {
-                            channel: name.to_string(),
-                            title: String::new(),
-                            start: String::new(),
-                            stop: String::new(),
-                            desc: None,
-                        }))
+                        .map(|p| {
+                            serde_json::from_value(p.clone()).unwrap_or_else(|_| EpgProgram {
+                                channel: name.to_string(),
+                                title: String::new(),
+                                start: String::new(),
+                                stop: String::new(),
+                                desc: None,
+                            })
+                        })
                         .collect()
                 } else {
                     Vec::new()
@@ -381,7 +440,12 @@ fn format_now(timestamp: u64) -> String {
 
     format!(
         "{:04}{:02}{:02}{:02}{:02}{:02}",
-        y, m, remaining_days + 1, hours, minutes, seconds
+        y,
+        m,
+        remaining_days + 1,
+        hours,
+        minutes,
+        seconds
     )
 }
 
@@ -467,10 +531,7 @@ mod tests {
             format_xmltv_time("20260312140000 +0800"),
             "2026-03-12 14:00:00"
         );
-        assert_eq!(
-            format_xmltv_time("20260312140000"),
-            "2026-03-12 14:00:00"
-        );
+        assert_eq!(format_xmltv_time("20260312140000"), "2026-03-12 14:00:00");
     }
 
     #[test]
