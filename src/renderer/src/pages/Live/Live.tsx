@@ -7,7 +7,7 @@ import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
 import { Loader2, Radio, Search } from 'lucide-react'
 import { getPlayableMediaUrl } from '@/utils/media'
 import EmptyState from '@/components/EmptyState/EmptyState'
-import { cacheApi } from '@/utils/ipc'
+import { cacheApi, invoke, on } from '@/utils/ipc'
 import { useNavigate } from 'react-router-dom'
 
 const LAST_LIVE_SOURCE_KEY = 'iptv:last-live-source'
@@ -57,11 +57,53 @@ export default function Live() {
 
   const [searchKeyword, setSearchKeyword] = useState('')
   const [selectedLiveIndex, setSelectedLiveIndex] = useState(0)
+  const [sortMode, setSortMode] = useState<'name' | 'latency'>('name')
+  const [speedTesting, setSpeedTesting] = useState(false)
+  const [speedTestProgress, setSpeedTestProgress] = useState<{ current: number; total: number; message: string } | null>(null)
 
   const liveSources = useMemo(
     () => (livesConfig?.lives || []).filter((live) => live.name && live.url),
     [livesConfig?.lives]
   )
+
+  // 用 ref 保持 speed test 回调的实时引用
+  const selectedLiveIndexRef = useRef(selectedLiveIndex)
+  selectedLiveIndexRef.current = selectedLiveIndex
+  const loadLiveRef = useRef(loadLive)
+  loadLiveRef.current = loadLive
+  const liveSourcesRef = useRef(liveSources)
+  liveSourcesRef.current = liveSources
+  const speedTestingRef = useRef(speedTesting)
+  speedTestingRef.current = speedTesting
+
+  // 进入直播页时自动触发后台测速
+  useEffect(() => {
+    const cleanup = on('live:refreshProgress', (progress: any) => {
+      setSpeedTestProgress(progress)
+      if (progress.phase === 'done' || progress.phase === 'error') {
+        setSpeedTesting(false)
+        setSpeedTestProgress(null)
+        // 重新加载当前直播源以获取测速结果（latency/bestUrl 会更新）
+        const srcs = liveSourcesRef.current
+        const idx = selectedLiveIndexRef.current
+        const live = srcs[Math.min(idx, srcs.length - 1)]
+        if (live) loadLiveRef.current(live.name)
+      }
+    })
+    return cleanup as () => void
+  }, [])
+
+  useEffect(() => {
+    // 页面加载后自动触发测速（不阻塞 UI）
+    const timer = setTimeout(() => {
+      if (liveSources.length > 0 && !speedTestingRef.current) {
+        setSpeedTesting(true)
+        setSpeedTestProgress({ current: 0, total: 0, message: '正在后台测速...' })
+        invoke('live:refresh').catch(() => setSpeedTesting(false))
+      }
+    }, 5000) // 延迟 5 秒，让用户先看到频道
+    return () => clearTimeout(timer)
+  }, [liveSources.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const buildPlaybackQueue = useCallback((channel: Channel): { urls: string[]; headers: Array<Record<string, string> | undefined> } => {
     const candidates: Array<{ url: string; best: boolean; headers?: Record<string, string> }> = []
@@ -246,10 +288,19 @@ export default function Live() {
     const keyword = searchKeyword.trim().toLowerCase()
     const isVisible = (channel: Channel) =>
       (!keyword || channel.name.toLowerCase().includes(keyword))
-    return keyword
+    const filtered = keyword
       ? groups.flatMap((group) => group.channels.filter(isVisible))
       : channels.filter(isVisible)
-  }, [channels, groups, searchKeyword])
+    // 排序
+    if (sortMode === 'latency') {
+      return [...filtered].sort((a, b) => {
+        const aLat = a.latency ?? 9999
+        const bLat = b.latency ?? 9999
+        return aLat - bLat
+      })
+    }
+    return filtered
+  }, [channels, groups, searchKeyword, sortMode])
 
   if (!currentConfig && !liveConfig) {
     return (
@@ -269,10 +320,32 @@ export default function Live() {
       <div className="flex-1 min-h-0 flex">
         {/* 左侧 - 当前源频道 */}
         <div className="w-56 min-h-0 shrink-0 border-r border-[#2a2a2a] flex flex-col">
-          <div className="px-3 py-2 border-b border-[#2a2a2a]">
-            <span className="text-xs text-text-secondary font-medium">
-              {searchKeyword ? `搜索: ${searchKeyword}` : currentGroup || '频道列表'}
-            </span>
+          <div className="px-3 py-2 border-b border-[#2a2a2a] space-y-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-text-secondary font-medium">
+                {searchKeyword ? `搜索: ${searchKeyword}` : currentGroup || '频道列表'}
+              </span>
+              <button
+                onClick={() => setSortMode(sortMode === 'name' ? 'latency' : 'name')}
+                className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+                  sortMode === 'latency'
+                    ? 'text-accent bg-accent/20'
+                    : 'text-text-muted hover:text-text-secondary'
+                }`}
+                title={sortMode === 'name' ? '按延时排序' : '按名称排序'}
+              >
+                {sortMode === 'name' ? '名称 ↕' : '延时 ↕'}
+              </button>
+            </div>
+            {/* 后台测速进度 */}
+            {speedTesting && speedTestProgress && (
+              <div className="flex items-center gap-1.5">
+                <Loader2 className="w-2.5 h-2.5 animate-spin text-accent shrink-0" />
+                <span className="text-[10px] text-text-muted truncate">
+                  {speedTestProgress.message || '测速中...'}
+                </span>
+              </div>
+            )}
           </div>
 
           {liveSources.length > 1 && (
@@ -382,8 +455,7 @@ export default function Live() {
             <div className="shrink-0 px-4 py-2 bg-bg-secondary border-t border-[#2a2a2a]">
               <div className="flex items-center gap-4 text-xs">
                 {epgData.slice(0, 3).map((epg, idx) => (
-                  // eslint-disable-next-line react/no-array-index-key
-                  <div key={`${epg.channel}:${epg.start}:${epg.title}`} className="flex items-center gap-1.5">
+                  <div key={`${epg.start}:${epg.title}`} className="flex items-center gap-1.5">
                     <span className="text-text-muted">{epg.start.slice(11, 16)}</span>
                     <span className={idx === 0 ? 'text-accent' : 'text-text-secondary'}>
                       {epg.title}
