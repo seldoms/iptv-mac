@@ -22,6 +22,18 @@ import { useConfigStore } from '@/stores/useConfigStore'
 import type { ConfigInspection } from '@shared/types'
 import { useNavigate } from 'react-router-dom'
 
+// ==================== 内置推荐源 ====================
+const DEFAULT_SOURCES = [
+  { name: '多多影音', url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json', sites: 435, lives: 1, desc: '435 个点播站点 + 直播' },
+  { name: '心魔在线', url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json', sites: 151, lives: 1, desc: '151 个点播站点' },
+  { name: '高天流云', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json', sites: 298, lives: 2, desc: '298 个点播站点 + 直播' },
+  { name: '宝盒备用', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json', sites: 77, lives: 1, desc: '77 个点播站点 + 直播' },
+  { name: 'D佬线路', url: 'http://rihou.cc:555/nzk/nzk0722.json', sites: 37, lives: 20, desc: '37 个点播站点 + 20 直播源' },
+  { name: '小盒子单仓', url: 'http://xhztv.top/xhz', sites: 54, lives: 1, desc: '54 个点播站点 + 直播' },
+  { name: '香雅晴线', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json', sites: 48, lives: 3, desc: '48 个点播站点 + 直播' },
+  { name: '多多内置', url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin', sites: 91, lives: 10, desc: '91 个点播站点 + 10 直播源' },
+]
+
 interface ConfigItem {
   url: string
   name: string
@@ -480,10 +492,38 @@ export default function Settings() {
             <div>
               <h3 className="text-sm font-medium text-text-primary mb-3">配置列表</h3>
               {configs.length === 0 ? (
-                <div className="py-8 text-center">
-                  <Link className="w-10 h-10 text-text-muted mx-auto mb-3" />
-                  <p className="text-sm text-text-muted">暂无配置</p>
-                  <p className="text-xs text-text-muted mt-1">在上方输入配置地址添加</p>
+                <div>
+                  <div className="py-6 text-center">
+                    <Link className="w-10 h-10 text-text-muted mx-auto mb-3" />
+                    <p className="text-sm text-text-muted">暂无配置</p>
+                    <p className="text-xs text-text-muted mt-1">推荐选一个内置源快速开始</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mt-3">
+                    {DEFAULT_SOURCES.map((src) => (
+                      <button
+                        key={src.url}
+                        onClick={async () => {
+                          setNewConfigUrl(src.url)
+                          const insp = await inspectConfigUrl(src.url, { silent: true })
+                          if (insp?.canImport) {
+                            const result = await configApi.load(src.url) as { success: boolean; error?: string }
+                            if (result.success) {
+                              setNewConfigUrl('')
+                              setInspection(null)
+                              setCurrentUrl(src.url)
+                              await loadConfig(src.url)
+                              await loadData()
+                              showMessage('success', `${src.name} 已添加`)
+                            }
+                          }
+                        }}
+                        className="rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3 text-left transition-all hover:border-accent/40 hover:bg-bg-hover"
+                      >
+                        <p className="text-sm font-medium text-text-primary truncate">{src.name}</p>
+                        <p className="text-[11px] text-text-muted mt-1">{src.desc}</p>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-2">

@@ -122,7 +122,9 @@ export default function Home() {
     }
   }, [isLoading, hasMore, activeCategory, currentPage, selectedFilters])
 
-  const displayVideos = activeCategory && activeCategory !== '首页' ? categoryVideos : homeVideos
+  const displayVideos = activeCategory && activeCategory !== '首页'
+  ? (categoryVideos.length > 0 ? categoryVideos : homeVideos)
+  : homeVideos
 
   if (!currentConfig) {
     return (
