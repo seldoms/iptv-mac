@@ -174,30 +174,37 @@ export default function Live() {
       })
   }, [currentChannel, playLiveUrl, setPlaybackError, setSourceSwitchState])
 
+  // 用 useRef 稳定回调引用，避免 useEffect 频繁重建事件监听
+  const autoSwitchSourceRef = useRef(autoSwitchSource)
+  autoSwitchSourceRef.current = autoSwitchSource
+  const switchToNextLiveLineRef = useRef(switchToNextLiveLine)
+  switchToNextLiveLineRef.current = switchToNextLiveLine
+  const playLiveUrlRef = useRef(playLiveUrl)
+  playLiveUrlRef.current = playLiveUrl
+
   useEffect(() => {
     const handlePlayFailed = () => {
-      if (autoSwitchSource) switchToNextLiveLine()
+      if (autoSwitchSourceRef.current) switchToNextLiveLineRef.current()
     }
-
     window.addEventListener('live:playFailed', handlePlayFailed)
     return () => window.removeEventListener('live:playFailed', handlePlayFailed)
-  }, [autoSwitchSource, switchToNextLiveLine])
+  }, [])
 
   useEffect(() => {
     const handleRetry = () => {
       const queue = channelPlaybackQueueRef.current
       const headersQueue = channelHeadersQueueRef.current
       const url = queue[channelUrlIndexRef.current]
-      if (url) void playLiveUrl(url, headersQueue[channelUrlIndexRef.current])
+      if (url) void playLiveUrlRef.current(url, headersQueue[channelUrlIndexRef.current])
     }
-    const handleNextSource = () => switchToNextLiveLine()
+    const handleNextSource = () => switchToNextLiveLineRef.current()
     window.addEventListener('player:retry', handleRetry)
     window.addEventListener('player:nextSource', handleNextSource)
     return () => {
       window.removeEventListener('player:retry', handleRetry)
       window.removeEventListener('player:nextSource', handleNextSource)
     }
-  }, [playLiveUrl, switchToNextLiveLine])
+  }, [])
 
   useEffect(() => {
     const ch = currentChannel as Channel & { epgUrl?: string }
@@ -206,25 +213,34 @@ export default function Live() {
     }
   }, [currentChannel, fetchEpg])
 
+  const channelsRef = useRef(channels)
+  channelsRef.current = channels
+  const currentChannelRef = useRef(currentChannel)
+  currentChannelRef.current = currentChannel
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (e.key === 'ArrowUp' && e.metaKey) {
         e.preventDefault()
-        const idx = channels.findIndex((c) => c.name === currentChannel?.name)
-        if (idx > 0) switchChannel(channels[idx - 1])
+        const chs = channelsRef.current
+        const cur = currentChannelRef.current
+        const idx = chs.findIndex((c) => c.name === cur?.name)
+        if (idx > 0) switchChannel(chs[idx - 1])
       } else if (e.key === 'ArrowDown' && e.metaKey) {
         e.preventDefault()
-        const idx = channels.findIndex((c) => c.name === currentChannel?.name)
-        if (idx < channels.length - 1) switchChannel(channels[idx + 1])
+        const chs = channelsRef.current
+        const cur = currentChannelRef.current
+        const idx = chs.findIndex((c) => c.name === cur?.name)
+        if (idx < chs.length - 1) switchChannel(chs[idx + 1])
       }
     },
-    [channels, currentChannel]
+    [switchChannel]
   )
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [handleKeyDown])
+  }, [handleKeyDown]) // handleKeyDown 依赖 useRef，引用稳定
 
   const displayChannels = useMemo(() => {
     const keyword = searchKeyword.trim().toLowerCase()
