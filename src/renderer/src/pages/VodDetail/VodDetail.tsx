@@ -726,7 +726,7 @@ export default function VodDetail() {
               <div className="mt-3 grid grid-cols-6 sm:grid-cols-8 md:grid-cols-10 lg:grid-cols-12 gap-2">
                 {activeLine.episodes.map((ep, idx) => (
                   <button
-                    key={`${ep.name}-${idx}`}
+                    key={ep.url}
                     onClick={() => handlePlay(activeLineIndex, idx)}
                     disabled={isResolving}
                     className={`px-2 py-1.5 text-xs rounded-md truncate transition-colors disabled:opacity-50 ${
