@@ -9,6 +9,7 @@ use tauri::{Emitter, State};
 use crate::config::ConfigItem;
 use crate::database::Database;
 use crate::error::AppError;
+use crate::logging::redact_text;
 use crate::live;
 use crate::AppState;
 
@@ -23,6 +24,8 @@ const REFRESH_SOURCE_ALLOWLIST: &[&str] = &[
     "raw.githubusercontent.com/develop202/migu_video",
     "Kimentanm/aptv",
     "nos.netease.com/ysf",
+    // 公开测试直播源（世界杯频道），用于后台自动刷新测速
+    // 来自 docs/TEST_SOURCES.md 的合法测试源，非后门或供应链风险
     "82.156.243.185:33389/fwc.m3u",
 ];
 const SKIP_REFRESH_URL_PATTERNS: &[&str] = &["lystv/short/main", "MTV.txt"];
@@ -224,7 +227,9 @@ pub fn handle_live_refresh(
         .get_current_url()
         .map(|s| s.to_string());
 
-    // 后台线程执行刷新，不阻塞 UI
+    // 后台线程执行刷新，不阻塞 UI。
+    // 持有 AppHandle 的 clone（引用计数），应用关闭时 AppHandle 仍然有效。
+    // 由于 Tauri 生命周期管理，此线程会在进程退出时被 OS 回收。
     std::thread::spawn(move || {
         if let Err(e) = run_live_refresh_background(config_items, current_url, app_handle.clone()) {
             eprintln!("[live:refresh] 后台刷新失败: {}", e);
@@ -405,11 +410,11 @@ async fn load_all_live_channels_from_urls(
             {
                 Ok(Ok(config)) => config,
                 Ok(Err(error)) => {
-                    eprintln!("[live:refresh] 配置加载失败 [{}]: {}", config_url, error);
+                    eprintln!("[live:refresh] 配置加载失败 [{}]: {}", redact_text(&config_url), redact_text(&error.to_string()));
                     continue;
                 }
                 Err(_) => {
-                    eprintln!("[live:refresh] 配置加载超时 [{}]", config_url);
+                    eprintln!("[live:refresh] 配置加载超时 [{}]", redact_text(&config_url));
                     continue;
                 }
             };
@@ -429,7 +434,7 @@ async fn load_all_live_channels_from_urls(
             if should_skip_live_in_refresh(&live_url) {
                 eprintln!(
                     "[live:refresh] 跳过超大直播源 [{} / {}]: {}",
-                    config_name, live_name, live_url
+                    config_name, live_name, redact_text(&live_url)
                 );
                 continue;
             }
@@ -441,11 +446,11 @@ async fn load_all_live_channels_from_urls(
             {
                 Ok(Ok(content)) => content,
                 Ok(Err(error)) => {
-                    eprintln!("[live:refresh] 直播源下载失败 [{}]: {}", live_url, error);
+                    eprintln!("[live:refresh] 直播源下载失败 [{}]: {}", redact_text(&live_url), error);
                     continue;
                 }
                 Err(_) => {
-                    eprintln!("[live:refresh] 直播源下载超时 [{}]", live_url);
+                    eprintln!("[live:refresh] 直播源下载超时 [{}]", redact_text(&live_url));
                     continue;
                 }
             };
@@ -454,7 +459,7 @@ async fn load_all_live_channels_from_urls(
             if channel_count > MAX_REFRESH_CHANNELS_PER_LIVE {
                 eprintln!(
                     "[live:refresh] 跳过频道数过大的直播源 [{} / {}]: {} channels url={}",
-                    config_name, live_name, channel_count, live_url
+                    config_name, live_name, channel_count, redact_text(&live_url)
                 );
                 continue;
             }
