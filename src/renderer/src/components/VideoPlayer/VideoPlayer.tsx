@@ -254,8 +254,9 @@ export default function VideoPlayer() {
     const video = videoRef.current
     const target = pendingSeekRef.current
     if (!video || target <= 3) return
-    if (!Number.isFinite(video.duration) || video.duration <= target + 2) return
-    video.currentTime = Math.min(target, Math.max(0, video.duration - 2))
+    // 直接 seek 到目标位置。浏览器/HLS 会在数据加载后自动处理 seek。
+    // 不检查 duration 是因为 HLS 的 duration 可能为 Infinity 或 0（尚未解析完毕）。
+    video.currentTime = target
     pendingSeekRef.current = 0
   }, [])
 
@@ -690,7 +691,11 @@ export default function VideoPlayer() {
       setDuration(video.duration || 0)
       applyPendingSeek()
     }
-    const onPlay = () => setIsPlaying(true)
+    const onPlay = () => {
+      setIsPlaying(true)
+      // 用户恢复播放时继续执行未完成的 seek（从 MiniPlayer 退出后场景）
+      applyPendingSeek()
+    }
     const onPause = () => {
       setIsPlaying(false)
       savePlaybackHistory(true)
