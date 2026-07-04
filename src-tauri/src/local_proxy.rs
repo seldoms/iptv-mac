@@ -455,7 +455,7 @@ fn write_options_response(stream: &mut TcpStream) -> Result<(), String> {
     stream
         .write_all(
             b"HTTP/1.1 204 No Content\r\n\
-              Access-Control-Allow-Origin: *\r\n\
+              Access-Control-Allow-Origin: http://tauri://localhost\r\n\
               Access-Control-Allow-Methods: GET, OPTIONS\r\n\
               Access-Control-Allow-Headers: *\r\n\
               Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type\r\n\
@@ -484,7 +484,7 @@ fn write_response(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Origin: http://tauri://localhost\r\n\
          Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type\r\n\
          Cache-Control: no-store\r\n\
          Connection: close\r\n\r\n",
@@ -515,7 +515,7 @@ fn write_media_headers(
     let mut header = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Origin: http://tauri://localhost\r\n\
          Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, Content-Type\r\n\
          Cache-Control: no-store\r\n",
         status,
