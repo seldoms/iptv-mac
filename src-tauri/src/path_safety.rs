@@ -22,9 +22,15 @@ pub fn resolve_safe_path(root_path: &str, input: &str, allow_root: bool) -> Opti
     let mut resolved = PathBuf::new();
     for comp in &candidate_components {
         match comp {
-            Component::ParentDir => { resolved.pop(); }
-            Component::Normal(_) => { resolved.push(comp); }
-            Component::RootDir => { resolved.push(comp); }
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(_) => {
+                resolved.push(comp);
+            }
+            Component::RootDir => {
+                resolved.push(comp);
+            }
             _ => {}
         }
     }
@@ -73,11 +79,8 @@ mod tests {
     use std::fs;
 
     fn test_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "iptv-path-test-{}-{}",
-            name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("iptv-path-test-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -91,7 +94,11 @@ mod tests {
         let result = resolve_safe_path(root.to_str().unwrap(), "movies/demo.mp4", true);
         assert!(result.is_some(), "should allow subpath");
         let path = result.unwrap();
-        assert!(path.to_string_lossy().ends_with("movies/demo.mp4"), "path should end with movies/demo.mp4, got: {:?}", path);
+        assert!(
+            path.to_string_lossy().ends_with("movies/demo.mp4"),
+            "path should end with movies/demo.mp4, got: {:?}",
+            path
+        );
     }
 
     #[test]

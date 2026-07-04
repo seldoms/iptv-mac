@@ -4,10 +4,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::error::AppError;
 use crate::network::safe_json_parse;
+use crate::path_safety;
 
 /// 配置存储文件名
 const CONFIG_STORE_FILE: &str = "config-store.json";
@@ -41,6 +43,7 @@ struct ConfigStoreData {
 /// 配置管理器
 pub struct ConfigManager {
     store_path: PathBuf,
+    data_dir: PathBuf,
     items: Vec<ConfigItem>,
     current_url: Option<String>,
 }
@@ -68,6 +71,7 @@ impl ConfigManager {
         };
         Self {
             store_path,
+            data_dir,
             items: store.configs,
             current_url,
         }
@@ -172,57 +176,77 @@ impl ConfigManager {
     /// TVBox JSON 配置原样返回；直播 M3U/TXT/JSON 直链会包装成只含一个
     /// lives 条目的配置，让 config/load/refresh 等入口共享同一流程。
     pub async fn load_from_url(&self, url: &str) -> Result<Value, AppError> {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            let client = crate::network::create_client()?;
-            let text = crate::network::http_get(&client, url).await?;
+        load_config_from_url(url, Some(&self.data_dir)).await
+    }
+}
 
-            // 检测多仓配置
-            if let Ok(parsed) = crate::network::safe_json_parse(&text) {
-                if is_multi_warehouse_config(&parsed) {
-                    let configs = load_multi_warehouse_configs(&client, &parsed, url).await?;
-                    if !configs.is_empty() {
-                        return Ok(merge_tvbox_configs(configs));
-                    }
+pub async fn load_config_from_url(
+    url: &str,
+    data_dir: Option<&std::path::PathBuf>,
+) -> Result<Value, AppError> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let client = crate::network::create_client()?;
+        let text = crate::network::http_get(&client, url).await?;
+
+        // 检测多仓配置
+        if let Ok(parsed) = crate::network::safe_json_parse(&text) {
+            if is_multi_warehouse_config(&parsed) {
+                let configs = load_multi_warehouse_configs(&client, &parsed, url).await?;
+                if !configs.is_empty() {
+                    return Ok(merge_tvbox_configs(configs));
                 }
             }
-
-            return match parse_config_or_live_source(url, &text) {
-                Ok(config) => Ok(config),
-                Err(error) => {
-                    if let Some(fallback_url) = github_raw_fallback_url(url) {
-                        let fallback_text =
-                            crate::network::http_get(&client, &fallback_url).await?;
-                        parse_config_or_live_source(&fallback_url, &fallback_text)
-                    } else {
-                        Err(error)
-                    }
-                }
-            };
         }
 
-        let text = if url.starts_with("file://") {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            fs::read_to_string(path).map_err(|e| {
-                AppError::not_found(format!("文件不存在: {}", path)).with_internal(e.to_string())
-            })?
-        } else {
-            // 尝试作为本地文件路径
-            let path = PathBuf::from(url);
-            if path.exists() {
-                fs::read_to_string(url).map_err(|e| {
-                    AppError::not_found(format!("文件读取失败: {}", url))
-                        .with_internal(e.to_string())
-                })?
-            } else {
-                return Err(AppError::invalid_input(format!(
-                    "不支持的配置地址: {}",
-                    url
-                )));
+        return match parse_config_or_live_source(url, &text) {
+            Ok(config) => Ok(config),
+            Err(error) => {
+                if let Some(config) = load_link3_public_configs(&client, url, &text).await? {
+                    return Ok(config);
+                }
+                if let Some(fallback_url) = github_raw_fallback_url(url) {
+                    let fallback_text = crate::network::http_get(&client, &fallback_url).await?;
+                    parse_config_or_live_source(&fallback_url, &fallback_text)
+                } else {
+                    Err(error)
+                }
             }
         };
-
-        parse_config_or_live_source(url, &text)
     }
+
+    let text = if url.starts_with("file://") {
+        let data_dir = data_dir.ok_or_else(|| {
+            AppError::invalid_input("file:// 协议只能在应用目录内使用")
+        })?;
+        let path_str = url.strip_prefix("file://").unwrap_or(url);
+        // 使用 path_safety 的路径规范化函数防止路径遍历
+        let safe_path = path_safety::resolve_safe_path(
+            &data_dir.to_string_lossy(),
+            path_str,
+            false,
+        )
+        .ok_or_else(|| {
+            AppError::invalid_input(format!("不允许访问路径: {}", path_str))
+        })?;
+        fs::read_to_string(&safe_path).map_err(|e| {
+            AppError::not_found(format!("文件不存在: {}", safe_path.display())).with_internal(e.to_string())
+        })?
+    } else {
+        // 尝试作为本地文件路径
+        let path = PathBuf::from(url);
+        if path.exists() {
+            fs::read_to_string(url).map_err(|e| {
+                AppError::not_found(format!("文件读取失败: {}", url)).with_internal(e.to_string())
+            })?
+        } else {
+            return Err(AppError::invalid_input(format!(
+                "不支持的配置地址: {}",
+                url
+            )));
+        }
+    };
+
+    parse_config_or_live_source(url, &text)
 }
 
 pub fn parse_config_or_live_source(url: &str, text: &str) -> Result<Value, AppError> {
@@ -282,7 +306,10 @@ pub fn merge_tvbox_configs(configs: Vec<Value>) -> Value {
     let mut all_sites: Vec<Value> = Vec::new();
     let mut all_lives: Vec<Value> = Vec::new();
     let mut all_parses: Vec<Value> = Vec::new();
-    let mut seen_site_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut site_key_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut seen_site_fingerprints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut spider: Option<&str> = None;
 
     for config in &configs {
@@ -293,12 +320,22 @@ pub fn merge_tvbox_configs(configs: Vec<Value>) -> Value {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if !key.is_empty() && !seen_site_keys.contains(&key) {
-                    seen_site_keys.insert(key);
-                    all_sites.push(site.clone());
-                } else if key.is_empty() {
-                    all_sites.push(site.clone());
+                let api = site.get("api").and_then(Value::as_str).unwrap_or("");
+                let name = site.get("name").and_then(Value::as_str).unwrap_or("");
+                let fingerprint = format!("{}\n{}\n{}", key, api, name);
+                if !seen_site_fingerprints.insert(fingerprint) {
+                    continue;
                 }
+
+                let mut site = site.clone();
+                if !key.is_empty() {
+                    let count = site_key_counts.entry(key.clone()).or_insert(0);
+                    *count += 1;
+                    if *count > 1 {
+                        site["key"] = Value::String(format!("{}__{}", key, count));
+                    }
+                }
+                all_sites.push(site);
             }
         }
         if let Some(lives) = config.get("lives").and_then(Value::as_array) {
@@ -370,6 +407,169 @@ pub async fn load_multi_warehouse_configs(
     }
 
     Ok(configs)
+}
+
+async fn load_link3_public_configs(
+    client: &reqwest::Client,
+    source_url: &str,
+    html: &str,
+) -> Result<Option<Value>, AppError> {
+    let Some(username) = extract_link3_username(source_url, html) else {
+        return Ok(None);
+    };
+
+    let response = client
+        .post("https://v5.api.link3.cc:5678/api/no_auth/user")
+        .json(&serde_json::json!({ "username": username }))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return Ok(None);
+    };
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let Ok(value) = response.json::<Value>().await else {
+        return Ok(None);
+    };
+    let links = link3_links(&value);
+    if links.is_empty() {
+        return Ok(None);
+    }
+
+    let mut configs = Vec::new();
+    for candidate in extract_link3_candidate_urls(&links) {
+        match load_single_sub_config(client, &candidate).await {
+            Ok(config) => configs.push(config),
+            Err(e) => eprintln!("[config] Link3 候选配置加载失败 [{}]: {}", candidate, e),
+        }
+    }
+
+    if configs.is_empty() {
+        Ok(None)
+    } else if configs.len() == 1 {
+        Ok(configs.pop())
+    } else {
+        Ok(Some(merge_tvbox_configs(configs)))
+    }
+}
+
+fn extract_link3_username(source_url: &str, html: &str) -> Option<String> {
+    if let Ok(parsed) = url::Url::parse(source_url) {
+        if parsed
+            .host_str()
+            .is_some_and(|host| host.ends_with("link3.cc"))
+        {
+            if let Some(username) = parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next())
+                .and_then(clean_link3_username)
+            {
+                return Some(username);
+            }
+        }
+    }
+
+    if !html.to_ascii_lowercase().contains("link3") {
+        return None;
+    }
+
+    let marker = "link3.cc/";
+    let mut search_start = 0;
+    while let Some(offset) = html[search_start..].find(marker) {
+        let start = search_start + offset + marker.len();
+        let username: String = html[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+            .collect();
+        if let Some(username) = clean_link3_username(&username) {
+            return Some(username);
+        }
+        search_start = start;
+    }
+
+    None
+}
+
+fn clean_link3_username(value: &str) -> Option<String> {
+    let username = value.trim().trim_matches('/').trim();
+    if username.is_empty()
+        || matches!(
+            username,
+            "api" | "auths" | "user" | "account" | "admin" | "search" | "weixin" | "js" | "css"
+        )
+    {
+        return None;
+    }
+    Some(username.to_string())
+}
+
+fn link3_links(value: &Value) -> Vec<Value> {
+    let Some(raw_links) = value.get("data").and_then(|data| data.get("links")) else {
+        return Vec::new();
+    };
+
+    if let Some(items) = raw_links.as_array() {
+        return items.clone();
+    }
+
+    raw_links
+        .as_str()
+        .and_then(|text| serde_json::from_str::<Vec<Value>>(text).ok())
+        .unwrap_or_default()
+}
+
+fn extract_link3_candidate_urls(links: &[Value]) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for item in links {
+        if item.get("enable").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(type_value) = item.get("typeValue").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for field in [
+            "content",
+            "nav_url",
+            "url",
+            "link",
+            "copy_text",
+            "copy_content",
+            "text",
+        ] {
+            let Some(text) = type_value.get(field).and_then(Value::as_str) else {
+                continue;
+            };
+            for url in extract_urls_from_text(text) {
+                if seen.insert(url.clone()) {
+                    urls.push(url);
+                }
+            }
+        }
+    }
+
+    urls
+}
+
+fn extract_urls_from_text(text: &str) -> Vec<String> {
+    let Ok(re) = Regex::new(r#"https?://[^\s<>"',，。；;、]+"#) else {
+        return Vec::new();
+    };
+
+    re.find_iter(text)
+        .map(|m| {
+            m.as_str()
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, ')' | '）' | ']' | '】' | '"' | '\''))
+                .to_string()
+        })
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .collect()
 }
 
 async fn load_single_sub_config(client: &reqwest::Client, url: &str) -> Result<Value, AppError> {
@@ -735,6 +935,46 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_html_rejects_non_config_payload() {
+        let result = parse_config_or_live_source(
+            "https://example.com/",
+            r#"<!doctype html><html><head><title>Not Config</title></head><body>入口,http://example.com/tv.json</body></html>"#,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extracts_link3_username_from_html() {
+        let html = r#"<html><head><title>link3.cc/uuccc | Link3</title></head></html>"#;
+        assert_eq!(
+            extract_link3_username("http://影视仓.com/", html).as_deref(),
+            Some("uuccc")
+        );
+    }
+
+    #[test]
+    fn extracts_link3_candidate_config_urls() {
+        let links: Vec<Value> = serde_json::from_str(
+            r#"[
+                {"enable":true,"type":"text","typeValue":{"title":"主接口","content":"http://www.影视仓.com"}},
+                {"enable":true,"type":"text","typeValue":{"title":"备用接口","content":"https://example.com/tv.json"}},
+                {"enable":true,"type":"url","typeValue":{"title":"教程","nav_url":"https://www.kdocs.cn/l/doc"}}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_link3_candidate_urls(&links),
+            vec![
+                "http://www.影视仓.com".to_string(),
+                "https://example.com/tv.json".to_string(),
+                "https://www.kdocs.cn/l/doc".to_string()
+            ]
+        );
     }
 
     #[test]
