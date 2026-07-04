@@ -71,6 +71,7 @@ export default function Settings() {
   const [adBlockEnabled, setAdBlockEnabled] = useState(false)
   const [defaultSpeed, setDefaultSpeed] = useState('1')
   const [danmakuEnabled, setDanmakuEnabled] = useState(true)
+  const [playerEngine, setPlayerEngine] = useState<'auto' | 'native' | 'hlsjs'>('auto')
   const [settingsLoaded, setSettingsLoaded] = useState(false)
 
   // 加载所有设置
@@ -83,13 +84,15 @@ export default function Settings() {
       settingsApi.get('adBlockEnabled').catch(() => false),
       settingsApi.get('defaultSpeed').catch(() => '1'),
       settingsApi.get('danmakuEnabled').catch(() => true),
-    ]).then(([doh, proxy, hosts, ad, speed, danmaku]) => {
+      settingsApi.get('playerEngine').catch(() => 'auto'),
+    ]).then(([doh, proxy, hosts, ad, speed, danmaku, engine]) => {
       setDohUrl(doh as string || '')
       setProxyUrl(proxy as string || '')
       setHostsText(hosts as string || '')
       setAdBlockEnabled(Boolean(ad))
       setDefaultSpeed(speed as string || '1')
       setDanmakuEnabled(Boolean(danmaku))
+      setPlayerEngine((engine as string) as 'auto' | 'native' | 'hlsjs' || 'auto')
       setSettingsLoaded(true)
     })
   }, [])
@@ -712,6 +715,20 @@ export default function Settings() {
         {/* 播放设置 */}
         {activeTab === 'player' && (
           <div className="space-y-6 max-w-2xl">
+            <div>
+              <h3 className="text-sm font-medium text-text-primary mb-3">HLS 播放引擎</h3>
+              <select
+                value={playerEngine}
+                onChange={(e) => { setPlayerEngine(e.target.value as any); saveSetting('playerEngine', e.target.value) }}
+                className="w-full px-3 py-2 bg-bg-tertiary rounded-lg text-sm text-text-primary outline-none"
+                disabled={!settingsLoaded}
+              >
+                <option value="auto">自动（优先原生）</option>
+                <option value="native">原生（macOS 系统解码）</option>
+                <option value="hlsjs">HLS.js（MSE 解码）</option>
+              </select>
+              <p className="text-xs text-text-muted mt-1.5">macOS 原生解码器兼容 HEVC/H.265；切换后需刷新页面生效</p>
+            </div>
             <div>
               <h3 className="text-sm font-medium text-text-primary mb-3">默认倍速</h3>
               <select

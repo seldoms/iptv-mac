@@ -426,11 +426,16 @@ export default function VideoPlayer() {
       const player = dashjs.MediaPlayer().create()
       player.initialize(video, currentUrl, true)
       dashRef.current = player
+    } else if (currentProtocol === 'hls' && video.canPlayType('application/vnd.apple.mpegurl')) {
+      // macOS 原生 HLS（系统 VideoToolbox 解码器，兼容 HEVC/H.265）
+      console.log('[VideoPlayer] 使用 macOS 原生 HLS:', currentUrl)
+      video.src = currentUrl
+      video.play().catch(() => {})
     } else if (currentProtocol === 'hls' && Hls.isSupported()) {
       let networkRecoveryAttempts = 0
       let mediaRecoveryAttempts = 0
 
-      // 优先使用 HLS.js
+      // HLS.js 回退（MSE 解码）
       const hls = new Hls({
         // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
         enableWorker: false,
@@ -579,10 +584,6 @@ export default function VideoPlayer() {
         }
       })
       hlsRef.current = hls
-    } else if (currentProtocol === 'hls' && video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari 原生 HLS
-      video.src = currentUrl
-      video.play().catch(() => {})
     } else {
       // 原生播放
       video.src = currentUrl
