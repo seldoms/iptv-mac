@@ -25,11 +25,8 @@ fn load_current_config(state: &State<'_, AppState>) -> Result<(String, Value), A
         }
     }
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
     let mgr = state.config_manager.lock();
-    let config = rt
-        .block_on(mgr.load_from_url(&config_url))
+    let config = crate::block_on(mgr.load_from_url(&config_url))
         .map_err(|_| AppError::not_found("配置加载失败"))?;
     *state.current_config.lock() = Some((config_url.clone(), config.clone()));
     Ok((config_url, config))
@@ -146,9 +143,7 @@ fn block_on<F, T>(fut: F) -> Result<T, AppError>
 where
     F: std::future::Future<Output = Result<T, AppError>>,
 {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-    rt.block_on(fut)
+    crate::block_on(fut)
 }
 
 /// site:homeContent
@@ -226,17 +221,13 @@ pub fn handle_site_probe(
     state: &State<'_, AppState>,
     site_keys: Vec<String>,
 ) -> Result<Value, AppError> {
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => return Err(AppError::internal("创建运行时失败").with_internal(e.to_string())),
-    };
 
     for site_key in &site_keys {
         let spider = match create_spider(state, site_key) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let result = match rt.block_on(spider.home_content(true)) {
+        let result = match crate::block_on(spider.home_content(true)) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -457,9 +448,7 @@ pub fn handle_site_find_across_sites(
     keyword: String,
     options: Option<Value>,
 ) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-    rt.block_on(handle_site_find_across_sites_async(state, keyword, options))
+    crate::block_on(handle_site_find_across_sites_async(state, keyword, options))
 }
 
 fn normalize_title(value: &str) -> String {

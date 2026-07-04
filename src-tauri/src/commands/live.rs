@@ -158,9 +158,7 @@ pub async fn handle_live_load_async(
 }
 
 pub fn handle_live_load(state: &State<'_, AppState>, live_name: String) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-    rt.block_on(handle_live_load_async(state, live_name))
+    crate::block_on(handle_live_load_async(state, live_name))
 }
 
 /// 按 URL 直接加载直播源
@@ -183,9 +181,7 @@ pub fn handle_live_load_by_url(
     url: String,
     name: Option<String>,
 ) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-    rt.block_on(handle_live_load_by_url_async(state, url, name))
+    crate::block_on(handle_live_load_by_url_async(state, url, name))
 }
 
 /// Emit a refresh progress event via Tauri
@@ -279,9 +275,6 @@ fn run_live_refresh_background(
         .and_then(|h| h.path().app_data_dir().ok())
         .ok_or_else(|| AppError::internal("无法获取数据目录"))?;
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
     // 打开独立数据库连接
     let mut database =
         Database::open(data_dir.join("iptv.db")).map_err(|e| AppError::database_error(e))?;
@@ -291,7 +284,7 @@ fn run_live_refresh_background(
         .update_refresh_status(&serde_json::json!({ "status": "refreshing" }))
         .map_err(|e| AppError::database_error(e))?;
 
-    let channels = rt.block_on(load_all_live_channels_from_urls(&urls, app_ref))?;
+    let channels = crate::block_on(load_all_live_channels_from_urls(&urls, app_ref))?;
     let total_urls: usize = channels.iter().map(|channel| channel.urls.len()).sum();
     if channels.is_empty() || total_urls == 0 {
         emit_progress(
@@ -318,7 +311,7 @@ fn run_live_refresh_background(
         total_urls,
         Some(&format!("正在测速 {} 条线路...", total_urls)),
     );
-    let tested_channels = rt.block_on(test_and_merge_channels(channels, app_ref))?;
+    let tested_channels = crate::block_on(test_and_merge_channels(channels, app_ref))?;
 
     emit_progress(
         app_ref,
@@ -662,7 +655,5 @@ pub async fn handle_live_epg_async(
 }
 
 pub fn handle_live_epg(epg_url: String, channel_map: Option<Value>) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-    rt.block_on(handle_live_epg_async(epg_url, channel_map))
+    crate::block_on(handle_live_epg_async(epg_url, channel_map))
 }

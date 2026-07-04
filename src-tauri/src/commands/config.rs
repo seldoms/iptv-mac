@@ -150,13 +150,18 @@ pub fn handle_config_get_current(state: &State<'_, AppState>) -> Result<Value, A
         .get_current_url()
         .map(|s| s.to_string());
     if let Some(url) = url {
-        // 异步加载，这里做简单同步获取
-        // 完整实现需要迁移到异步 command
+        if let Some((cached_url, cached_config)) = state.current_config.lock().as_ref() {
+            if cached_url == &url {
+                return Ok(cached_config.clone());
+            }
+        }
+        // 异步加载，在共享同步运行时上阻塞等待
         let mgr = state.config_manager.lock();
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-        match rt.block_on(mgr.load_from_url(&url)) {
-            Ok(config) => Ok(config),
+        match crate::block_on(mgr.load_from_url(&url)) {
+            Ok(config) => {
+                *state.current_config.lock() = Some((url, config.clone()));
+                Ok(config)
+            }
             Err(_) => Ok(Value::Null),
         }
     } else {
@@ -182,12 +187,9 @@ pub fn handle_config_list(state: &State<'_, AppState>) -> Result<Value, AppError
 
 /// 获取配置预检信息
 pub fn handle_config_inspect(state: &State<'_, AppState>, url: String) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
     let config_result = {
         let mgr = state.config_manager.lock();
-        rt.block_on(mgr.load_from_url(&url))
+        crate::block_on(mgr.load_from_url(&url))
     };
 
     match config_result {
@@ -276,7 +278,7 @@ pub fn handle_config_inspect(state: &State<'_, AppState>, url: String) -> Result
                 ));
             }
 
-            let probe_stats = rt.block_on(probe_supported_sites(&url, &config));
+            let probe_stats = crate::block_on(probe_supported_sites(&url, &config));
             if probe_stats.inspected > 0 && probe_stats.passed == 0 {
                 warnings.push(format!(
                     "已抽样测试 {} 个 HTTP API 站点，暂未拿到首页分类或列表",
@@ -394,12 +396,9 @@ pub fn handle_config_load(
     url: String,
     name: Option<String>,
 ) -> Result<Value, AppError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
     let config = {
         let mgr = state.config_manager.lock();
-        rt.block_on(mgr.load_from_url(&url))?
+        crate::block_on(mgr.load_from_url(&url))?
     };
 
     let display_name = name.clone().unwrap_or_else(|| {
@@ -424,6 +423,7 @@ pub fn handle_config_load(
         mgr.add(&url, &display_name)?;
         mgr.set_current_url(Some(url.clone()))?;
     }
+    *state.current_config.lock() = Some((url.clone(), config.clone()));
 
     // 返回配置数据
     Ok(serde_json::json!({ "success": true, "data": config }))
@@ -432,6 +432,20 @@ pub fn handle_config_load(
 /// 删除配置
 pub fn handle_config_remove(state: &State<'_, AppState>, url: String) -> Result<Value, AppError> {
     state.config_manager.lock().remove(&url)?;
+    let current_url = state
+        .config_manager
+        .lock()
+        .get_current_url()
+        .map(str::to_string);
+    let should_clear_cache = state
+        .current_config
+        .lock()
+        .as_ref()
+        .map(|(cached_url, _)| Some(cached_url) != current_url.as_ref())
+        .unwrap_or(false);
+    if should_clear_cache {
+        *state.current_config.lock() = None;
+    }
     Ok(serde_json::json!({ "success": true }))
 }
 
@@ -451,10 +465,7 @@ pub fn handle_config_peek_lives(
     url: String,
 ) -> Result<Value, AppError> {
     let mgr = state.config_manager.lock();
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| AppError::internal("创建运行时失败").with_internal(e.to_string()))?;
-
-    match rt.block_on(mgr.load_from_url(&url)) {
+    match crate::block_on(mgr.load_from_url(&url)) {
         Ok(config) => {
             let lives = config.get("lives").cloned().unwrap_or(Value::Array(vec![]));
             Ok(serde_json::json!({ "success": true, "data": lives }))

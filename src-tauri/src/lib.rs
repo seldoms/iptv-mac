@@ -13,6 +13,7 @@ mod spider;
 mod super_parse;
 mod types;
 
+use std::sync::LazyLock;
 use std::{fs, path::PathBuf, time::SystemTime};
 
 use parking_lot::Mutex;
@@ -21,6 +22,18 @@ use tauri::{Manager, State};
 
 use database::Database;
 use error::AppError;
+
+/// 全局共享的 Tokio 运行时，避免每个同步命令重复创建。
+/// 用 LazyLock 延迟初始化，仅创建一次。
+static SHARED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Runtime::new().expect("初始化 Tokio 运行时失败")
+});
+
+/// 在共享运行时上同步阻塞异步任务。
+/// 用于 Tauri 同步 command 中需要调用 async 函数的场景。
+pub fn block_on<F: std::future::Future<Output = T>, T>(fut: F) -> T {
+    SHARED_RUNTIME.block_on(fut)
+}
 
 const MAX_SETTINGS_FILE_SIZE: u64 = 1 * 1024 * 1024; // 1MB
 const MAX_SETTINGS_VALUE_SIZE: usize = 100 * 1024; // 100KB
