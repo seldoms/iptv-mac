@@ -80,6 +80,15 @@ pub async fn json_parse(
     headers: Option<&HashMap<String, String>>,
 ) -> Result<Option<ParseResult>, AppError> {
     let client = crate::network::create_client()?;
+
+    // Validate parse_url is a safe absolute http/https URL
+    let base_parsed = url::Url::parse(parse_url)
+        .map_err(|e| AppError::invalid_input("无效的解析地址").with_internal(e.to_string()))?;
+    match base_parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err(AppError::invalid_input("不支持的解析协议")),
+    }
+    // urlencoding::encode prevents URL injection in web_url (escapes ?#@ etc.)
     let full_url = format!("{}{}", parse_url, urlencoding::encode(web_url));
 
     let mut req = client
@@ -268,7 +277,12 @@ pub async fn super_parse(
     // Level 2/3: Web sniff (not yet migrated)
     // Try playUrl fallback
     if let Some(pu) = play_url {
-        let full_url = format!("{}{}", pu, result_url);
+        // Validate play_url as safe http/https before concatenation
+        if !pu.starts_with("http://") && !pu.starts_with("https://") {
+            return Ok(None);
+        }
+        let encoded = urlencoding::encode(&result_url);
+        let full_url = format!("{}{}", pu, encoded);
         if spider::is_video_format(&full_url) {
             let result = ParseResult {
                 url: full_url,
