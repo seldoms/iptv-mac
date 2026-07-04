@@ -2,10 +2,22 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Search, ChevronDown, Loader2, ArrowLeft, Clock } from 'lucide-react'
 import { useConfigStore } from '@/stores/useConfigStore'
-import { historyApi } from '@/utils/ipc'
+import { configApi, historyApi } from '@/utils/ipc'
 import VodCard from '@/components/VodCard/VodCard'
 import EmptyState from '@/components/EmptyState/EmptyState'
 import type { History as HistoryItem } from '@shared/types'
+
+// ==================== 内置推荐源 ====================
+const DEFAULT_SOURCES: { name: string; url: string; desc: string }[] = [
+  { name: '多多影音', url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json', desc: '435 个点播站点 + 直播' },
+  { name: '心魔在线', url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json', desc: '151 个点播站点' },
+  { name: '高天流云', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json', desc: '298 个点播站点 + 直播' },
+  { name: '宝盒备用', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json', desc: '77 个点播站点 + 直播' },
+  { name: 'D佬线路', url: 'http://rihou.cc:555/nzk/nzk0722.json', desc: '37 个点播站点 + 20 直播源' },
+  { name: '小盒子单仓', url: 'http://xhztv.top/xhz', desc: '54 个点播站点 + 直播' },
+  { name: '香雅晴线', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json', desc: '48 个点播站点 + 直播' },
+  { name: '多多内置', url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin', desc: '91 个点播站点 + 10 直播源' },
+]
 
 function formatResumeTime(seconds = 0): string {
   const safeSeconds = Math.max(0, Math.floor(seconds))
@@ -21,7 +33,7 @@ export default function Home() {
   const {
     currentConfig, sites, currentSiteKey, contentSiteKey, pendingSiteKey, categories, filters, homeVideos,
     categoryVideos, currentPage, hasMore, isLoading, error,
-    switchSite, fetchCategoryContent
+    switchSite, fetchCategoryContent, loadConfig
   } = useConfigStore()
 
       const [activeCategory, setActiveCategory] = useState<string>('')
@@ -344,28 +356,61 @@ export default function Home() {
         )}
       </div>
 
-      {/* 站点切换下拉菜单 - 放在 overflow 容器外避免被裁剪 */}
+      {/* 悬浮源选择卡片 */}
       {showSiteSheet && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setShowSiteSheet(false)} />
           <div
             ref={siteSheetRef}
-            className="fixed z-50 min-w-[180px] max-h-[360px] overflow-y-auto rounded-lg border border-[#2a2a2a] bg-bg-secondary shadow-xl py-1"
-            style={{ top: siteSheetRect.top, left: siteSheetRect.left }}
+            className="fixed z-50 w-[480px] max-h-[460px] overflow-y-auto rounded-xl border border-[#2a2a2a] bg-bg-secondary shadow-2xl p-4"
+            style={{ top: siteSheetRect.top, left: Math.max(16, siteSheetRect.left) }}
           >
-            {visibleSites.map((site) => (
+            <p className="text-xs text-text-muted mb-3 font-medium">当前站点（点击切换）</p>
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              {visibleSites.map((site) => (
+                <button
+                  key={site.key}
+                  onClick={() => handleSiteSwitch(site.key)}
+                  className={`text-left px-3 py-2 text-sm rounded-lg transition-colors ${
+                    currentSiteKey === site.key
+                      ? 'bg-accent/20 text-accent font-medium ring-1 ring-accent/40'
+                      : 'bg-bg-tertiary text-text-secondary hover:text-text-primary hover:bg-bg-hover'
+                  }`}
+                >
+                  {site.name}
+                  {currentSiteKey === site.key && (
+                    <span className="ml-1.5 text-[10px] text-accent/70">当前</span>
+                  )}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-text-muted mb-3 font-medium border-t border-[#2a2a2a] pt-3">推荐配置（点击切换）</p>
+            <div className="grid grid-cols-2 gap-2">
+              {DEFAULT_SOURCES.map((src) => (
+                <button
+                  key={src.url}
+                  onClick={async () => {
+                    setShowSiteSheet(false)
+                    const result = await configApi.load(src.url) as { success: boolean; error?: string }
+                    if (result.success) {
+                      await loadConfig(src.url)
+                    }
+                  }}
+                  className="text-left rounded-lg border border-[#2a2a2a] bg-bg-primary p-2.5 transition-all hover:border-accent/40 hover:bg-bg-hover"
+                >
+                  <p className="text-sm font-medium text-text-primary truncate">{src.name}</p>
+                  <p className="text-[10px] text-text-muted mt-0.5">{src.desc}</p>
+                </button>
+              ))}
+            </div>
+            <p className="text-center mt-3">
               <button
-                key={site.key}
-                onClick={() => handleSiteSwitch(site.key)}
-                className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                  currentSiteKey === site.key
-                    ? 'text-accent bg-accent/10'
-                    : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
-                }`}
+                onClick={() => { setShowSiteSheet(false); navigate('/settings') }}
+                className="text-xs text-text-muted hover:text-accent transition-colors"
               >
-                {site.name}
+                管理更多配置 →
               </button>
-            ))}
+            </p>
           </div>
         </>
       )}
