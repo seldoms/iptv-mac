@@ -382,7 +382,8 @@ export default function Live() {
             <div className="shrink-0 px-4 py-2 bg-bg-secondary border-t border-[#2a2a2a]">
               <div className="flex items-center gap-4 text-xs">
                 {epgData.slice(0, 3).map((epg, idx) => (
-                  <div key={idx} className="flex items-center gap-1.5">
+                  // eslint-disable-next-line react/no-array-index-key
+                  <div key={`${epg.channel}:${epg.start}:${epg.title}`} className="flex items-center gap-1.5">
                     <span className="text-text-muted">{epg.start.slice(11, 16)}</span>
                     <span className={idx === 0 ? 'text-accent' : 'text-text-secondary'}>
                       {epg.title}
