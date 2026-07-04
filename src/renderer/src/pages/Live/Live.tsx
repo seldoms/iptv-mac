@@ -4,36 +4,40 @@ import { useConfigStore } from '@/stores/useConfigStore'
 import { usePlayerStore } from '@/stores/usePlayerStore'
 import ChannelItem from '@/components/ChannelItem/ChannelItem'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
-import { Radio, Search } from 'lucide-react'
-import { configApi, on } from '@/utils/ipc'
+import { Loader2, Radio, Search } from 'lucide-react'
 import { getPlayableMediaUrl } from '@/utils/media'
-import LiveTree from '@/components/LiveTree/LiveTree'
-import LiveRefreshBar from '@/components/LiveRefreshBar/LiveRefreshBar'
 import EmptyState from '@/components/EmptyState/EmptyState'
+import { cacheApi } from '@/utils/ipc'
 import { useNavigate } from 'react-router-dom'
 
-function getEquivalentChannelKey(name: string): string {
-  const cctv = name.match(/cctv[-_\s]*0?(\d{1,2})(?!\d)/i)
-  return cctv ? `cctv${Number(cctv[1])}` : name.trim().toLowerCase()
+const LAST_LIVE_SOURCE_KEY = 'iptv:last-live-source'
+
+function getLiveSourceKey(live: { name: string; url: string }) {
+  return `${live.name}\n${live.url}`
 }
 
-function scoreLiveUrl(url: string): number {
-  const lower = url.toLowerCase()
-  let score = 0
-  if (/videocodec=h264|\/h264\/|avc|kankanlive/i.test(lower)) score -= 80
-  if (/videocodec=h265|h265|hevc/i.test(lower)) score += 140
-  if (/\.m3u8(?:\?|$)/i.test(lower)) score -= 20
-  if (/miguvideo\.com/i.test(lower)) score += 10
-  return score
+async function readLastLiveSourceKey() {
+  try {
+    const value = await cacheApi.get(LAST_LIVE_SOURCE_KEY) as string | null
+    return value || ''
+  } catch {
+    return ''
+  }
+}
+
+async function writeLastLiveSourceKey(key: string) {
+  try {
+    await cacheApi.set(LAST_LIVE_SOURCE_KEY, key)
+  } catch {
+    // ignore storage failures
+  }
 }
 
 export default function Live() {
   const navigate = useNavigate()
   const {
     groups, channels, currentGroup, currentChannel, epgData,
-    isPlaying, isLoading, error, loadLiveByUrl, switchGroup, switchChannel, fetchEpg,
-    getChannelTree, triggerRefresh, getRefreshStatus, applyRefreshProgress,
-    isRefreshing, refreshProgress, lastRefreshTime, refreshInterval,
+    isLoading, error, loadLive, switchGroup, switchChannel, fetchEpg, reset,
   } = useLiveStore()
   const play = usePlayerStore((state) => state.play)
   const autoSwitchSource = usePlayerStore((state) => state.autoSwitchSource)
@@ -44,75 +48,36 @@ export default function Live() {
 
   const livesConfig = liveConfig || currentConfig
 
-  const hasLoadedRef = useRef(false)
-  const triedIndexRef = useRef(0)
-  const otherQueueRef = useRef<{ name: string; url: string }[]>([])
-  const otherFetchingRef = useRef(false)
-  const loadingRef = useRef(false)
+  const loadedLiveKeyRef = useRef('')
+  const loadEffectRequestRef = useRef(0)
   const channelUrlIndexRef = useRef(0)
   const playRequestRef = useRef(0)
   const channelPlaybackQueueRef = useRef<string[]>([])
   const channelHeadersQueueRef = useRef<Array<Record<string, string> | undefined>>([])
 
-  const [channelTree, setChannelTree] = useState<any>(null)
   const [searchKeyword, setSearchKeyword] = useState('')
+  const [selectedLiveIndex, setSelectedLiveIndex] = useState(0)
 
-  const equivalentChannels = useMemo(() => {
-    const index = new Map<string, any[]>()
-    for (const country of channelTree?.countries || []) {
-      for (const category of country.categories || []) {
-        for (const channel of category.channels || []) {
-          const key = getEquivalentChannelKey(channel.name)
-          const items = index.get(key) || []
-          items.push(channel)
-          index.set(key, items)
-        }
-      }
-    }
-    return index
-  }, [channelTree])
+  const liveSources = useMemo(
+    () => (livesConfig?.lives || []).filter((live) => live.name && live.url),
+    [livesConfig?.lives]
+  )
 
   const buildPlaybackQueue = useCallback((channel: Channel): { urls: string[]; headers: Array<Record<string, string> | undefined> } => {
-    const candidates: Array<{ url: string; latency: number; preferred: boolean; best: boolean; headers?: Record<string, string> }> = []
-    const key = getEquivalentChannelKey(channel.name)
+    const candidates: Array<{ url: string; best: boolean; headers?: Record<string, string> }> = []
     const bestUrl = (channel as Channel & { bestUrl?: string }).bestUrl
     const channelUrlHeaders = (channel as any).urlHeaders as Record<string, Record<string, string>> | undefined
 
     if (bestUrl) {
-      candidates.push({ url: bestUrl, latency: 0, preferred: true, best: true, headers: channelUrlHeaders?.[bestUrl] })
+      candidates.push({ url: bestUrl, best: true, headers: channelUrlHeaders?.[bestUrl] })
     }
     for (const url of channel.urls) {
-      candidates.push({ url, latency: 0, preferred: true, best: url === bestUrl, headers: channelUrlHeaders?.[url] })
-    }
-
-    for (const item of equivalentChannels.get(key) || []) {
-      const itemUrlHeaders = item.urlHeaders as Record<string, Record<string, string>> | undefined
-      if (item.bestUrl) {
-        candidates.push({
-          url: item.bestUrl,
-          latency: Number(item.latency) || Number.MAX_SAFE_INTEGER,
-          preferred: item.name === channel.name,
-          best: true,
-          headers: itemUrlHeaders?.[item.bestUrl]
-        })
-      }
-      for (const url of item.urls || []) {
-        candidates.push({
-          url,
-          latency: Number(item.latency) || Number.MAX_SAFE_INTEGER,
-          preferred: item.name === channel.name,
-          best: url === item.bestUrl,
-          headers: itemUrlHeaders?.[url]
-        })
-      }
+      candidates.push({ url, best: url === bestUrl, headers: channelUrlHeaders?.[url] })
     }
 
     candidates.sort((a, b) => {
       if (a.best !== b.best) return a.best ? -1 : 1
-      if (a.preferred !== b.preferred) return a.preferred ? -1 : 1
-      const scoreDelta = scoreLiveUrl(a.url) - scoreLiveUrl(b.url)
-      if (scoreDelta !== 0) return scoreDelta
-      return a.latency - b.latency
+      return 0
     })
 
     const uniqueUrls: string[] = []
@@ -126,106 +91,41 @@ export default function Live() {
       }
     }
     return { urls: uniqueUrls, headers: uniqueHeaders }
-  }, [equivalentChannels])
+  }, [])
 
-  // IPC 进度监听 + 加载频道树
   useEffect(() => {
-    const handleProgress = (progress: any) => {
-      applyRefreshProgress(progress)
-      if (progress.phase === 'done') {
-        getChannelTree().then(setChannelTree)
-      }
+    const restoreLastLiveSource = async () => {
+      const savedKey = await readLastLiveSourceKey()
+      const savedIndex = liveSources.findIndex((live) => getLiveSourceKey(live) === savedKey || live.url === savedKey)
+      setSelectedLiveIndex(savedIndex >= 0 ? savedIndex : 0)
+      loadedLiveKeyRef.current = ''
     }
+    void restoreLastLiveSource()
+  }, [liveSources])
 
-    const cleanup = on('live:refreshProgress', handleProgress)
-
-    getChannelTree().then(setChannelTree)
-    void getRefreshStatus()
-
-    return cleanup as () => void
-  }, [applyRefreshProgress, getChannelTree, getRefreshStatus])
-
-  // 自动加载直播源（保留原有逻辑）
   useEffect(() => {
-    if (hasLoadedRef.current) return
-    if (groups.length > 0) {
-      hasLoadedRef.current = true
+    if (!livesConfig || liveSources.length === 0) {
+      loadEffectRequestRef.current += 1
+      reset()
+      loadedLiveKeyRef.current = ''
       return
     }
-    if (isLoading || loadingRef.current) return
-    if (!livesConfig) return
+    const live = liveSources[Math.min(selectedLiveIndex, liveSources.length - 1)]
+    if (!live) return
+    const liveKey = getLiveSourceKey(live)
+    if (loadedLiveKeyRef.current === liveKey) return
 
-    const tryNext = async () => {
-      loadingRef.current = true
-      const lives = livesConfig?.lives
-
-      if (lives && lives.length > 0) {
-        while (triedIndexRef.current < lives.length) {
-          const live = lives[triedIndexRef.current]
-          triedIndexRef.current++
-          if (live.name && live.url) {
-            console.log('[Live] 尝试当前配置直播源:', live.name, 'url:', live.url)
-            await loadLiveByUrl(live.url, live.name)
-            hasLoadedRef.current = useLiveStore.getState().groups.length > 0
-            loadingRef.current = false
-            return
-          }
-        }
-      }
-
-      while (otherQueueRef.current.length > 0) {
-        const live = otherQueueRef.current.shift()!
-        if (live.name && live.url) {
-          console.log('[Live] 尝试其他配置直播源:', live.name, 'url:', live.url)
-          await loadLiveByUrl(live.url, live.name)
-          hasLoadedRef.current = useLiveStore.getState().groups.length > 0
-          loadingRef.current = false
-          return
-        }
-      }
-
-      if (!otherFetchingRef.current) {
-        otherFetchingRef.current = true
-        try {
-          const configList = await configApi.list() as { url: string; name: string }[]
-          for (const cfg of configList) {
-            try {
-              const res = await configApi.peekLives(cfg.url) as { success: boolean; data?: any[]; error?: string }
-              if (res.success && res.data) {
-                for (const live of res.data) {
-                  if (live.name && live.url) {
-                    otherQueueRef.current.push({ name: live.name, url: live.url })
-                  }
-                }
-              }
-            } catch {
-              // 跳过失败的配置
-            }
-          }
-        } catch (err) {
-          console.error('[Live] 获取其他配置失败:', err)
-        }
-        otherFetchingRef.current = false
-
-        while (otherQueueRef.current.length > 0) {
-          const live = otherQueueRef.current.shift()!
-          if (live.name && live.url) {
-            console.log('[Live] 尝试其他配置直播源:', live.name, 'url:', live.url)
-            await loadLiveByUrl(live.url, live.name)
-            hasLoadedRef.current = useLiveStore.getState().groups.length > 0
-            loadingRef.current = false
-            return
-          }
-        }
-      }
-
-      console.log('[Live] 所有配置的直播源均不可用')
-      hasLoadedRef.current = true
-      loadingRef.current = false
+    const loadSelected = async () => {
+      const requestId = ++loadEffectRequestRef.current
+      console.log('[Live] 加载当前选择的直播源:', live.name, 'url:', live.url)
+      await loadLive(live.name)
+      if (requestId !== loadEffectRequestRef.current) return
+      loadedLiveKeyRef.current = liveKey
+      await writeLastLiveSourceKey(liveKey)
     }
 
-    tryNext()
-  }, [livesConfig, livesConfig?.lives, groups.length, isLoading, error])
+    void loadSelected()
+  }, [livesConfig, liveSources, selectedLiveIndex, loadLive, reset])
 
   const playLiveUrl = useCallback(async (url: string, headers?: Record<string, string>) => {
     const requestId = ++playRequestRef.current
@@ -326,67 +226,14 @@ export default function Live() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [handleKeyDown])
 
-  const handleChannelClick = useCallback((channel: any) => {
-    switchChannel({
-      name: channel.name,
-      urls: channel.bestUrl ? [channel.bestUrl, ...(channel.urls || [])] : channel.urls,
-      number: channel.number,
-      logo: channel.logo,
-      format: channel.format,
-      epgId: channel.epgId,
-      bestUrl: channel.bestUrl,
-      urlHeaders: channel.urlHeaders,
-      epgUrl: channel.epgUrl
-    })
-  }, [switchChannel])
-
-  const verifiedChannelNames = useMemo(() => {
-    const names = new Set<string>()
-    for (const country of channelTree?.countries || []) {
-      for (const category of country.categories || []) {
-        for (const channel of category.channels || []) {
-          names.add(channel.name)
-        }
-      }
-    }
-    return names
-  }, [channelTree])
-
   const displayChannels = useMemo(() => {
     const keyword = searchKeyword.trim().toLowerCase()
     const isVisible = (channel: Channel) =>
-      (verifiedChannelNames.size === 0 || verifiedChannelNames.has(channel.name)) &&
       (!keyword || channel.name.toLowerCase().includes(keyword))
     return keyword
       ? groups.flatMap((group) => group.channels.filter(isVisible))
       : channels.filter(isVisible)
-  }, [channels, groups, searchKeyword, verifiedChannelNames])
-
-  const filteredChannelTree = useMemo(() => {
-    const keyword = searchKeyword.trim().toLowerCase()
-    if (!channelTree || !keyword) return channelTree
-
-    return {
-      countries: channelTree.countries.map((country: any) => ({
-        ...country,
-        categories: country.categories.map((category: any) => ({
-          ...category,
-          channels: category.channels.filter((channel: any) =>
-            channel.name.toLowerCase().includes(keyword)
-          )
-        })).filter((category: any) => category.channels.length > 0)
-      })).filter((country: any) => country.categories.length > 0)
-    }
-  }, [channelTree, searchKeyword])
-
-  const handleRetry = () => {
-    hasLoadedRef.current = false
-    triedIndexRef.current = 0
-    otherQueueRef.current = []
-    otherFetchingRef.current = false
-    loadingRef.current = false
-    loadLiveByUrl(livesConfig?.lives?.[0]?.url || '', livesConfig?.lives?.[0]?.name)
-  }
+  }, [channels, groups, searchKeyword])
 
   if (!currentConfig && !liveConfig) {
     return (
@@ -404,7 +251,7 @@ export default function Live() {
     <div className="h-full min-h-0 flex flex-col">
       {/* 主内容区 */}
       <div className="flex-1 min-h-0 flex">
-        {/* 左侧 - 频道树 */}
+        {/* 左侧 - 当前源频道 */}
         <div className="w-56 min-h-0 shrink-0 border-r border-[#2a2a2a] flex flex-col">
           <div className="px-3 py-2 border-b border-[#2a2a2a]">
             <span className="text-xs text-text-secondary font-medium">
@@ -412,14 +259,26 @@ export default function Live() {
             </span>
           </div>
 
-          <LiveRefreshBar
-            isRefreshing={isRefreshing}
-            refreshProgress={refreshProgress}
-            lastRefreshTime={lastRefreshTime}
-            refreshInterval={refreshInterval}
-            onRefresh={() => void triggerRefresh()}
-            onSettings={() => navigate('/settings')}
-          />
+          {liveSources.length > 1 && (
+            <div className="px-3 py-2 border-b border-[#2a2a2a]">
+              <select
+                value={selectedLiveIndex}
+                onChange={(event) => {
+                  const nextIndex = Number(event.target.value)
+                  setSelectedLiveIndex(nextIndex)
+                  const live = liveSources[nextIndex]
+                  if (live) void writeLastLiveSourceKey(getLiveSourceKey(live))
+                }}
+                className="w-full bg-bg-tertiary border border-[#2a2a2a] rounded-md px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent"
+              >
+                {liveSources.map((live, index) => (
+                  <option key={`${live.name}:${live.url}:${index}`} value={index}>
+                    {live.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {/* 搜索框 */}
           <div className="px-3 py-2 border-b border-[#2a2a2a]">
@@ -435,48 +294,69 @@ export default function Live() {
             </div>
           </div>
 
-          {/* 树形展示或传统列表 */}
-          {channelTree && channelTree.countries.length > 0 ? (
-            filteredChannelTree?.countries.length > 0 ? (
-            <LiveTree
-              tree={filteredChannelTree}
-              onChannelClick={handleChannelClick}
-              currentChannelName={currentChannel?.name}
-            />
-            ) : (
-              <div className="flex-1 min-h-0 flex items-center justify-center px-3 text-text-muted text-xs">
-                未找到匹配频道
-              </div>
-            )
-          ) : (
-            /* 传统列表展示（无树形数据时） */
-            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-dark py-1">
-              {displayChannels.length === 0 ? (
-                <div className="flex items-center justify-center py-8 text-text-muted text-xs">
-                  {searchKeyword ? '未找到匹配频道' : '暂无可用频道'}
-                </div>
-              ) : (
-                displayChannels.map((channel, index) => (
-                  <ChannelItem
-                    key={`${channel.name}:${channel.urls[0] || 'no-url'}:${index}`}
-                    channel={channel}
-                    isActive={currentChannel?.name === channel.name}
-                    onClick={(ch) => switchChannel(ch)}
-                  />
-                ))
-              )}
+          {groups.length > 1 && !searchKeyword && (
+            <div className="shrink-0 max-h-36 overflow-y-auto scrollbar-dark border-b border-[#2a2a2a] py-1">
+              {groups.map((group) => (
+                <button
+                  key={group.name}
+                  onClick={() => switchGroup(group.name)}
+                  className={`w-full px-3 py-1.5 text-left text-xs transition-colors ${
+                    currentGroup === group.name
+                      ? 'bg-accent-muted text-accent'
+                      : 'text-text-muted hover:text-text-secondary hover:bg-bg-hover'
+                  }`}
+                >
+                  <span className="block truncate">{group.name}</span>
+                </button>
+              ))}
             </div>
           )}
+
+          {/* 当前直播源频道列表 */}
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-dark py-1">
+            {displayChannels.length === 0 ? (
+              <div className="flex items-center justify-center py-8 text-text-muted text-xs">
+                {isLoading && !searchKeyword ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    正在加载频道...
+                  </span>
+                ) : searchKeyword ? '未找到匹配频道' : '暂无可用频道'}
+              </div>
+            ) : (
+              displayChannels.map((channel, index) => (
+                <ChannelItem
+                  key={`${channel.name}:${channel.urls[0] || 'no-url'}:${index}`}
+                  channel={channel}
+                  isActive={currentChannel?.name === channel.name}
+                  onClick={(ch) => switchChannel(ch)}
+                />
+              ))
+            )}
+          </div>
         </div>
 
         {/* 右侧 - 播放器 */}
         <div className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="flex-1 min-h-0 bg-black relative">
             {currentChannel ? (
-              <VideoPlayer />
+              <>
+                <VideoPlayer />
+                {isLoading && (
+                  <div className="pointer-events-none absolute right-4 top-4 z-30 inline-flex items-center gap-2 rounded-md border border-white/10 bg-black/65 px-3 py-2 text-xs text-white/80 shadow-lg backdrop-blur">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+                    正在后台加载直播源
+                  </div>
+                )}
+              </>
             ) : (
               <div className="h-full flex items-center justify-center text-text-muted text-sm">
-                {isLoading ? '加载频道中...' : error || '请选择频道'}
+                {isLoading ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin text-accent" />
+                    正在加载频道...
+                  </span>
+                ) : error || '请选择频道'}
               </div>
             )}
           </div>

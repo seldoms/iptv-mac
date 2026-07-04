@@ -1,5 +1,7 @@
 import { create } from 'zustand'
-import { invoke } from '@/utils/ipc'
+import { cacheApi, invoke } from '@/utils/ipc'
+
+const LAST_SITE_PREFIX = 'iptv:last-site:'
 
 export interface Site {
   key: string
@@ -51,6 +53,8 @@ interface ConfigState {
   currentConfig: VodConfig | null
   sites: Site[]
   currentSiteKey: string
+  contentSiteKey: string
+  pendingSiteKey: string
   categories: Category[]
   filters: Record<string, Filter[]>
   homeVideos: Vod[]
@@ -79,6 +83,8 @@ const initialState: ConfigState = {
   currentConfig: null,
   sites: [],
   currentSiteKey: '',
+  contentSiteKey: '',
+  pendingSiteKey: '',
   categories: [],
   filters: {},
   homeVideos: [],
@@ -97,30 +103,48 @@ function isVisibleSite(s: Site): boolean {
   return (s.type === 0 || s.type === 1 || s.type === 4) && s.hide !== 1 && Boolean(s.api?.trim())
 }
 
-/**
- * 并行探测站点，返回第一个成功的
- */
-async function probeSites(
-  siteKeys: string[]
-): Promise<{ siteKey: string; result: any } | null> {
-  if (siteKeys.length === 0) return null
-  const probeRes = await invoke('site:probe', siteKeys) as {
-    success: boolean; data?: { siteKey: string; result: any }; error?: string
-  }
-  if (probeRes.success && probeRes.data) {
-    return probeRes.data
-  }
-  return null
+function lastSiteStorageKey(configUrl: string) {
+  return `${LAST_SITE_PREFIX}${configUrl}`
 }
+
+async function readLastSiteKey(configUrl: string): Promise<string> {
+  try {
+    const value = await cacheApi.get(lastSiteStorageKey(configUrl)) as string | null
+    return value || ''
+  } catch {
+    return ''
+  }
+}
+
+async function writeLastSiteKey(configUrl: string, siteKey: string) {
+  try {
+    await cacheApi.set(lastSiteStorageKey(configUrl), siteKey)
+  } catch {
+    // ignore storage failures
+  }
+}
+
+async function loadSiteHome(siteKey: string) {
+  const res = await invoke('site:homeContent', siteKey, true) as { success: boolean; data?: any; error?: string }
+  if (!res.success || !res.data) {
+    throw new Error(res.error || '获取首页内容失败')
+  }
+  return res.data || {}
+}
+
+let siteHomeRequestId = 0
 
 export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) => ({
   ...initialState,
 
   loadConfig: async (url: string) => {
+    siteHomeRequestId += 1
     set({
       isLoading: true,
       error: null,
       currentSiteKey: '',
+      contentSiteKey: '',
+      pendingSiteKey: '',
       categories: [],
       filters: {},
       homeVideos: [],
@@ -142,36 +166,39 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
 
       // 无论有没有可见站点，先设置配置（直播源可能可用）
       set({ currentConfig: config, sites })
-      // 保存直播配置（独立于首页）
-      if (hasLives) {
-        set({ liveConfig: config })
-      }
+      set({ liveConfig: hasLives ? config : null })
 
       if (visibleSites.length > 0) {
-        // 当前配置有可用站点，直接探测
-        const siteKeys = visibleSites.map((s) => s.key)
-        console.log('[ConfigStore] 并行探测站点:', siteKeys)
-        const probeResult = await probeSites(siteKeys)
-        if (probeResult) {
-          const { siteKey, result } = probeResult
-          console.log('[ConfigStore] 探测成功, 使用站点:', siteKey)
+        const savedSiteKey = await readLastSiteKey(url)
+        const initialSite = visibleSites.find((site) => site.key === savedSiteKey) || visibleSites[0]
+        const siteKey = initialSite.key
+        console.log('[ConfigStore] 加载站点:', siteKey)
+        try {
+          const result = await loadSiteHome(siteKey)
           set({
             currentSiteKey: siteKey,
+            contentSiteKey: siteKey,
+            pendingSiteKey: '',
             categories: result.class || result.types || [],
             filters: result.filters || {},
             homeVideos: result.list || [],
             isLoading: false
           })
-        } else {
+          await writeLastSiteKey(url, siteKey)
+        } catch (error: any) {
           set({
-            currentSiteKey: visibleSites[0].key,
+            currentSiteKey: siteKey,
+            contentSiteKey: '',
+            pendingSiteKey: '',
             isLoading: false,
-            error: '所有站点暂时不可用，请稍后重试或切换配置源'
+            error: error.message || '获取首页内容失败，请切换站点重试'
           })
         }
       } else {
         set({
           currentSiteKey: '',
+          contentSiteKey: '',
+          pendingSiteKey: '',
           categories: [],
           filters: {},
           homeVideos: [],
@@ -187,22 +214,40 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
   },
 
   switchSite: async (siteKey: string) => {
-    set({ currentSiteKey: siteKey, categories: [], filters: {}, homeVideos: [], categoryVideos: [], currentPage: 1, isLoading: true, error: null })
+    const requestId = ++siteHomeRequestId
+    set({
+      currentSiteKey: siteKey,
+      pendingSiteKey: siteKey,
+      categories: [],
+      filters: {},
+      categoryVideos: [],
+      currentPage: 1,
+      hasMore: true,
+      isLoading: true,
+      error: null
+    })
     try {
-      const res = await invoke('site:homeContent', siteKey, true) as { success: boolean; data?: any; error?: string }
-      if (res.success && res.data) {
-        const result = res.data || {}
-        set({
-          categories: result.class || result.types || [],
-          filters: result.filters || {},
-          homeVideos: result.list || [],
-          isLoading: false
-        })
-      } else {
-        set({ isLoading: false, error: res.error || '获取首页内容失败' })
-      }
+      const result = await loadSiteHome(siteKey)
+      if (requestId !== siteHomeRequestId || get().currentSiteKey !== siteKey) return
+      const currentConfigUrl = await invoke('config:getCurrentUrl') as string
+      if (requestId !== siteHomeRequestId || get().currentSiteKey !== siteKey) return
+      if (currentConfigUrl) await writeLastSiteKey(currentConfigUrl, siteKey)
+      set({
+        contentSiteKey: siteKey,
+        pendingSiteKey: '',
+        categories: result.class || result.types || [],
+        filters: result.filters || {},
+        homeVideos: result.list || [],
+        categoryVideos: [],
+        isLoading: false
+      })
     } catch (e: any) {
-      set({ isLoading: false, error: e.message || '获取首页内容失败' })
+      if (requestId !== siteHomeRequestId || get().currentSiteKey !== siteKey) return
+      set({
+        pendingSiteKey: '',
+        isLoading: false,
+        error: e.message || '获取首页内容失败'
+      })
     }
   },
 
@@ -211,16 +256,11 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
     if (!currentSiteKey) return false
     set({ isLoading: true, error: null })
     try {
-      const res = await invoke('site:homeContent', currentSiteKey, true) as { success: boolean; data?: any; error?: string }
-      if (!res.success) {
-        set({ isLoading: false, error: res.error || '获取首页内容失败' })
-        return false
-      }
-      const result = res.data || {}
+      const result = await loadSiteHome(currentSiteKey)
       const categories = result.class || result.types || []
       const homeVideos = result.list || []
       const filters = result.filters || {}
-      set({ categories, filters, homeVideos, isLoading: false })
+      set({ categories, filters, homeVideos, contentSiteKey: currentSiteKey, pendingSiteKey: '', isLoading: false })
       return categories.length > 0 || homeVideos.length > 0
     } catch (e: any) {
       set({ isLoading: false, error: e.message || '获取首页内容失败' })

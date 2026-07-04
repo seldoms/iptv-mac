@@ -3,7 +3,7 @@ import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
 import { usePlayerStore } from '@/stores/usePlayerStore'
 import { settingsApi } from '@/utils/ipc'
 import { getPlayableMediaUrl } from '@/utils/media'
-import { clearPlaybackMetrics, getPlaybackMetricSummary } from '@/utils/playbackMetrics'
+import { clearPlaybackMetrics, getPlaybackMetricSummary, type PlaybackMetricSummary } from '@/utils/playbackMetrics'
 
 export interface AlphaPlaybackSmokeConfig {
   enabled: boolean
@@ -19,7 +19,7 @@ interface AlphaPlaybackSmokeResult {
   message: string
   error?: string
   diagnostic?: unknown
-  metrics: ReturnType<typeof getPlaybackMetricSummary>
+  metrics: PlaybackMetricSummary
   debug?: unknown
   mediaUrl: string
   userAgent: string
@@ -49,7 +49,7 @@ export default function AlphaPlaybackSmoke({ config }: { config: AlphaPlaybackSm
 
   useEffect(() => {
     let cancelled = false
-    clearPlaybackMetrics()
+    void clearPlaybackMetrics()
     reset()
     setVolume(0)
     const startPlayback = async () => {
@@ -107,7 +107,7 @@ export default function AlphaPlaybackSmoke({ config }: { config: AlphaPlaybackSm
       message,
       error: usePlayerStore.getState().playbackError || undefined,
       diagnostic: usePlayerStore.getState().playbackDiagnostic || undefined,
-      metrics: getPlaybackMetricSummary(),
+      metrics: await getPlaybackMetricSummary(),
       debug: window.__alphaPlaybackDebug,
       mediaUrl,
       userAgent: navigator.userAgent

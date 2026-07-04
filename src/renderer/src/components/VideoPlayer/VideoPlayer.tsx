@@ -1,5 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import Hls from 'hls.js'
 import dashjs from 'dashjs'
 import { usePlayerStore } from '@/stores/usePlayerStore'
@@ -151,6 +151,7 @@ export default function VideoPlayer() {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [isDragging, setIsDragging] = useState(false)
   const [isActualFullscreen, setIsActualFullscreen] = useState(false)
+  const [miniTransitionStyle, setMiniTransitionStyle] = useState<CSSProperties | null>(null)
   const [streamStats, setStreamStats] = useState<StreamStats>(emptyStreamStats)
 
   // ==================== 换源：触发失败事件 ====================
@@ -314,12 +315,62 @@ export default function VideoPlayer() {
   // 进入精简模式
   const handleEnterMiniMode = useCallback(async () => {
     if (!currentUrl) return
+    if (miniTransitionStyle) return
     const video = videoRef.current
+    const container = containerRef.current
     const savedTime = video?.currentTime || currentTime
-    setIsPlaying(false)
-    await windowApi.savePlayerState({ url: currentUrl, header: playHeader || undefined, currentTime: savedTime })
-    await windowApi.enterMiniMode()
-  }, [currentUrl, playHeader, currentTime, setIsPlaying])
+    const rect = container?.getBoundingClientRect()
+
+    if (rect) {
+      const targetWidth = Math.min(480, Math.max(320, window.innerWidth - 48))
+      const targetHeight = 300
+      const targetLeft = Math.max(16, window.innerWidth - targetWidth - 24)
+      const targetTop = Math.max(16, window.innerHeight - targetHeight - 24)
+      const scaleX = targetWidth / rect.width
+      const scaleY = targetHeight / rect.height
+
+      setMiniTransitionStyle({
+        position: 'fixed',
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        zIndex: 9999,
+        overflow: 'hidden',
+        transform: 'translate3d(0, 0, 0) scale(1)',
+        transformOrigin: 'top left',
+        transition: 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1), border-radius 220ms ease, box-shadow 220ms ease',
+        borderRadius: 0,
+        boxShadow: '0 0 0 rgba(0, 0, 0, 0)'
+      })
+
+      requestAnimationFrame(() => {
+        setMiniTransitionStyle((style) => style
+          ? {
+              ...style,
+              transform: `translate3d(${targetLeft - rect.left}px, ${targetTop - rect.top}px, 0) scale(${scaleX}, ${scaleY})`,
+              borderRadius: 10,
+              boxShadow: '0 18px 60px rgba(0, 0, 0, 0.45)'
+            }
+          : style)
+      })
+    }
+
+    try {
+      await Promise.all([
+        windowApi.savePlayerState({ url: currentUrl, header: playHeader || undefined, currentTime: savedTime }),
+        new Promise((resolve) => window.setTimeout(resolve, rect ? 230 : 0))
+      ])
+      await windowApi.enterMiniMode()
+      const url = new URL(window.location.href)
+      url.searchParams.set('mode', 'mini')
+      window.history.replaceState(null, '', url.toString())
+      window.dispatchEvent(new CustomEvent('app:miniModeChanged', { detail: true }))
+    } catch (err) {
+      console.error('[VideoPlayer] 进入精简模式失败:', err)
+      setMiniTransitionStyle(null)
+    }
+  }, [currentUrl, playHeader, currentTime, miniTransitionStyle])
 
   // 初始化播放器 - 仅在 URL/header 变化时重跑
   useEffect(() => {
@@ -706,15 +757,29 @@ export default function VideoPlayer() {
   }, [isPlaying])
 
   // 全屏切换
-  const handleToggleFullscreen = useCallback(() => {
+  const handleToggleFullscreen = useCallback(async () => {
     const container = containerRef.current
     if (!container) return
-    if (document.fullscreenElement) {
-      document.exitFullscreen()
-    } else {
-      container.requestFullscreen()
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+        setIsActualFullscreen(false)
+      } else {
+        await container.requestFullscreen()
+        setIsActualFullscreen(true)
+      }
+    } catch {
+      const nextFullscreen = !isActualFullscreen
+      await windowApi.setFullscreen(nextFullscreen).catch(() => {})
+      setIsActualFullscreen(nextFullscreen)
     }
-  }, [])
+  }, [isActualFullscreen])
+
+  const handleDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement
+    if (target.closest('button,input,select,textarea')) return
+    void handleToggleFullscreen()
+  }, [handleToggleFullscreen])
 
   // 监听全屏变化
   useEffect(() => {
@@ -819,8 +884,8 @@ export default function VideoPlayer() {
   const bitrateText = formatThroughput(streamStats.bitrateKbps)
   const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps)
 
-  const buildDiagnosticsText = () => {
-    const metricSummary = getPlaybackMetricSummary()
+  const buildDiagnosticsText = async () => {
+    const metricSummary = await getPlaybackMetricSummary()
     const lines = [
       'IPTV Mac 播放诊断',
       `阶段: ${playbackPhase}`,
@@ -852,7 +917,7 @@ export default function VideoPlayer() {
 
   const handleCopyDiagnostics = async () => {
     try {
-      const text = buildDiagnosticsText()
+      const text = await buildDiagnosticsText()
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text)
       } else {
@@ -884,10 +949,17 @@ export default function VideoPlayer() {
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full bg-black group"
+      className={`bg-black group ${
+        miniTransitionStyle
+          ? ''
+          : isActualFullscreen
+          ? 'fixed inset-0 z-[9999] h-screen w-screen'
+          : 'relative h-full w-full'
+      }`}
+      style={miniTransitionStyle || undefined}
       onMouseMove={resetHideTimer}
       onMouseLeave={() => isPlaying && setShowControls(false)}
-      onDoubleClick={handleToggleFullscreen}
+      onDoubleClick={handleDoubleClick}
     >
       <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} />
 
@@ -902,6 +974,16 @@ export default function VideoPlayer() {
             <span className="font-mono text-white">{linkSpeedText}</span>
           </div>
         </div>
+      )}
+
+      {currentUrl && (
+        <button
+          onClick={handleEnterMiniMode}
+          className="absolute right-3 top-[4.75rem] z-30 rounded-md border border-white/10 bg-black/55 p-2 text-white/80 shadow-lg backdrop-blur transition hover:bg-black/75 hover:text-white"
+          title="精简模式"
+        >
+          <PictureInPicture2 className="h-4 w-4" />
+        </button>
       )}
 
       {/* 播放状态 */}

@@ -1,3 +1,5 @@
+import { cacheApi } from './ipc'
+
 const STORAGE_KEY = 'iptv:playback-metrics:v1'
 const MAX_SAMPLES = 200
 
@@ -19,10 +21,9 @@ export interface PlaybackMetricSummary {
   totalFailures: number
 }
 
-function readSamples(): PlaybackMetricSample[] {
-  if (typeof window === 'undefined') return []
+async function readSamples(): Promise<PlaybackMetricSample[]> {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY)
+    const raw = await cacheApi.get(STORAGE_KEY) as string | null
     if (!raw) return []
     const parsed = JSON.parse(raw)
     return Array.isArray(parsed) ? parsed.filter(isSample) : []
@@ -37,18 +38,17 @@ function isSample(value: unknown): value is PlaybackMetricSample {
   return (sample.type === 'first_frame' || sample.type === 'failure') && typeof sample.at === 'number'
 }
 
-export function recordPlaybackMetric(sample: PlaybackMetricSample): void {
-  if (typeof window === 'undefined') return
+export async function recordPlaybackMetric(sample: PlaybackMetricSample): Promise<void> {
   try {
-    const samples = [...readSamples(), sample].slice(-MAX_SAMPLES)
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(samples))
+    const samples = [...await readSamples(), sample].slice(-MAX_SAMPLES)
+    await cacheApi.set(STORAGE_KEY, JSON.stringify(samples))
   } catch {
     // Metrics should never interrupt playback.
   }
 }
 
-export function getPlaybackMetricSummary(): PlaybackMetricSummary {
-  const samples = readSamples()
+export async function getPlaybackMetricSummary(): Promise<PlaybackMetricSummary> {
+  const samples = await readSamples()
   const firstFrameMs = samples
     .filter((sample) => sample.type === 'first_frame' && typeof sample.elapsedMs === 'number')
     .map((sample) => sample.elapsedMs as number)
@@ -62,10 +62,9 @@ export function getPlaybackMetricSummary(): PlaybackMetricSummary {
   }
 }
 
-export function clearPlaybackMetrics(): void {
-  if (typeof window === 'undefined') return
+export async function clearPlaybackMetrics(): Promise<void> {
   try {
-    window.localStorage.removeItem(STORAGE_KEY)
+    await cacheApi.del(STORAGE_KEY)
   } catch {
     // Ignore storage failures.
   }
