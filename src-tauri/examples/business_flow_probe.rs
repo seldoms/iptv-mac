@@ -12,6 +12,8 @@ mod live;
 mod network;
 #[path = "../src/spider.rs"]
 mod spider;
+#[path = "../src/path_safety.rs"]
+mod path_safety;
 
 const SOURCES: &[(&str, &str)] = &[
     ("开心点播 · 如意采集", "https://700sjro44343.vicp.fun/vip/vip/tv.json"),
@@ -63,9 +65,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         totals.configs_ok += 1;
-        let sites = config.get("sites").and_then(Value::as_array).cloned().unwrap_or_default();
-        let lives = config.get("lives").and_then(Value::as_array).cloned().unwrap_or_default();
-        println!("CONFIG OK: effective={} sites={} lives={}", effective_url, sites.len(), lives.len());
+        let sites = config
+            .get("sites")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let lives = config
+            .get("lives")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        println!(
+            "CONFIG OK: effective={} sites={} lives={}",
+            effective_url,
+            sites.len(),
+            lives.len()
+        );
 
         if let Some((site_name, play_url)) = probe_vod(&sites).await {
             totals.vod_sites_checked += 1;
@@ -78,14 +93,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for live_entry in lives {
             totals.live_entries += 1;
-            let live_name = live_entry.get("name").and_then(Value::as_str).unwrap_or("未命名直播源");
+            let live_name = live_entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("未命名直播源");
             let Some(live_url) = live_entry.get("url").and_then(Value::as_str) else {
                 println!("LIVE FAIL [{}]: missing url", live_name);
                 continue;
             };
             let live_url = config::resolve_relative_url(&effective_url, live_url);
 
-            let content = match tokio::time::timeout(Duration::from_secs(30), network::http_get(&client, &live_url)).await {
+            let content = match tokio::time::timeout(
+                Duration::from_secs(30),
+                network::http_get(&client, &live_url),
+            )
+            .await
+            {
                 Ok(Ok(text)) => text,
                 Ok(Err(error)) => {
                     println!("LIVE FAIL [{}]: {} url={}", live_name, error, live_url);
@@ -121,14 +144,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 totals.live_empty_entries += 1;
-                println!("LIVE EMPTY [{}]: groups={} channels={} url={}", live_name, groups.len(), channel_count, live_url);
+                println!(
+                    "LIVE EMPTY [{}]: groups={} channels={} url={}",
+                    live_name,
+                    groups.len(),
+                    channel_count,
+                    live_url
+                );
             }
         }
     }
 
     println!("\n========== BUSINESS FLOW RESULTS ==========");
-    println!("configs: ok={} failed={}", totals.configs_ok, totals.configs_failed);
-    println!("vod: sites_checked={} play_links={}", totals.vod_sites_checked, totals.vod_play_links);
+    println!(
+        "configs: ok={} failed={}",
+        totals.configs_ok, totals.configs_failed
+    );
+    println!(
+        "vod: sites_checked={} play_links={}",
+        totals.vod_sites_checked, totals.vod_play_links
+    );
     println!(
         "live: entries={} loaded={} play_links={} alive_samples={} empty_entries={}",
         totals.live_entries,
@@ -137,7 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         totals.live_alive_samples,
         totals.live_empty_entries
     );
-    println!("parsed live: groups={} channels={}", totals.groups, totals.channels);
+    println!(
+        "parsed live: groups={} channels={}",
+        totals.groups, totals.channels
+    );
 
     if totals.configs_failed > 0 || totals.vod_play_links == 0 || totals.live_play_links == 0 {
         return Err("business flow probe failed".into());
@@ -147,7 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn load_config(client: &reqwest::Client, url: &str) -> Result<(String, Value), error::AppError> {
+async fn load_config(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(String, Value), error::AppError> {
     let text = network::http_get(client, url).await?;
     match config::parse_config_or_live_source(url, &text) {
         Ok(value) => Ok((url.to_string(), value)),
@@ -166,7 +207,11 @@ async fn load_config(client: &reqwest::Client, url: &str) -> Result<(String, Val
 async fn probe_vod(sites: &[Value]) -> Option<(String, String)> {
     for site in sites.iter().filter(|site| is_supported_site(site)) {
         let key = site.get("key").and_then(Value::as_str).unwrap_or_default();
-        let name = site.get("name").and_then(Value::as_str).unwrap_or(key).to_string();
+        let name = site
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(key)
+            .to_string();
         let api = site.get("api").and_then(Value::as_str)?;
         let spider = spider::HttpSpider::new(spider::SiteConfig {
             key: key.to_string(),
@@ -174,15 +219,26 @@ async fn probe_vod(sites: &[Value]) -> Option<(String, String)> {
             site_type: site.get("type").and_then(Value::as_i64).unwrap_or(1),
             api: api.to_string(),
             ext: site.get("ext").cloned(),
-            play_url: site.get("playUrl").or_else(|| site.get("play_url")).and_then(Value::as_str).map(String::from),
+            play_url: site
+                .get("playUrl")
+                .or_else(|| site.get("play_url"))
+                .and_then(Value::as_str)
+                .map(String::from),
             click: site.get("click").and_then(Value::as_str).map(String::from),
             header: site.get("header").cloned(),
             timeout: site.get("timeout").and_then(Value::as_i64),
         });
 
-        let Ok(home) = spider.home_content(false).await else { continue; };
+        let Ok(home) = spider.home_content(false).await else {
+            continue;
+        };
         let first_vod = home.list.as_ref().and_then(|list| list.first())?;
-        let Ok(detail) = spider.detail_content(std::slice::from_ref(&first_vod.vod_id)).await else { continue; };
+        let Ok(detail) = spider
+            .detail_content(std::slice::from_ref(&first_vod.vod_id))
+            .await
+        else {
+            continue;
+        };
         let Some(play_url) = detail
             .list
             .as_ref()
@@ -193,7 +249,9 @@ async fn probe_vod(sites: &[Value]) -> Option<(String, String)> {
             continue;
         };
 
-        let Ok(player) = spider.player_content("", play_url, &[]).await else { continue; };
+        let Ok(player) = spider.player_content("", play_url, &[]).await else {
+            continue;
+        };
         if !player.url.trim().is_empty() {
             return Some((name, player.url));
         }
@@ -202,14 +260,22 @@ async fn probe_vod(sites: &[Value]) -> Option<(String, String)> {
 }
 
 fn is_supported_site(site: &Value) -> bool {
-    matches!(site.get("type").and_then(Value::as_i64).unwrap_or(0), 0 | 1 | 4)
+    matches!(
+        site.get("type").and_then(Value::as_i64).unwrap_or(0),
+        0 | 1 | 4
+    )
 }
 
 fn first_episode_url(vod_play_url: &str) -> Option<&str> {
     vod_play_url
         .split('#')
         .next()
-        .and_then(|episode| episode.rsplit_once('$').map(|(_, url)| url).or(Some(episode)))
+        .and_then(|episode| {
+            episode
+                .rsplit_once('$')
+                .map(|(_, url)| url)
+                .or(Some(episode))
+        })
         .map(str::trim)
         .filter(|url| !url.is_empty())
 }
@@ -217,9 +283,10 @@ fn first_episode_url(vod_play_url: &str) -> Option<&str> {
 fn first_live_play_url(groups: &[live::Group]) -> Option<(String, String)> {
     groups.iter().find_map(|group| {
         group.channel.iter().find_map(|channel| {
-            channel.urls.first().map(|url| {
-                (channel.name.clone(), url.clone())
-            })
+            channel
+                .urls
+                .first()
+                .map(|url| (channel.name.clone(), url.clone()))
         })
     })
 }

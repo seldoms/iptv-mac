@@ -21,6 +21,8 @@ mod live;
 mod network;
 #[path = "../src/spider.rs"]
 mod spider;
+#[path = "../src/path_safety.rs"]
+mod path_safety;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,15 +36,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = network::create_client()?;
     let config_text = network::http_get(&client, &config_url).await?;
     let config = config::parse_config_or_live_source(&config_url, &config_text)?;
-    let sites = config.get("sites").and_then(Value::as_array).cloned().unwrap_or_default();
-    let lives = config.get("lives").and_then(Value::as_array).cloned().unwrap_or_default();
+    let sites = config
+        .get("sites")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let lives = config
+        .get("lives")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     println!("CONFIG OK: sites={} lives={}", sites.len(), lives.len());
 
     let site = sites.first().ok_or("missing site")?;
-    let api = site.get("api").and_then(Value::as_str).ok_or("missing api")?;
+    let api = site
+        .get("api")
+        .and_then(Value::as_str)
+        .ok_or("missing api")?;
     let spider = spider::HttpSpider::new(spider::SiteConfig {
-        key: site.get("key").and_then(Value::as_str).unwrap_or("local").to_string(),
-        name: site.get("name").and_then(Value::as_str).unwrap_or("Local").to_string(),
+        key: site
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("local")
+            .to_string(),
+        name: site
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("Local")
+            .to_string(),
         site_type: site.get("type").and_then(Value::as_i64).unwrap_or(1),
         api: config::resolve_relative_url(&config_url, api),
         ext: None,
@@ -58,8 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut channels = Vec::new();
     for live_entry in &lives {
-        let live_name = live_entry.get("name").and_then(Value::as_str).unwrap_or("live");
-        let live_url = live_entry.get("url").and_then(Value::as_str).ok_or("missing live url")?;
+        let live_name = live_entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("live");
+        let live_url = live_entry
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or("missing live url")?;
         let live_url = config::resolve_relative_url(&config_url, live_url);
         let content = network::http_get(&client, &live_url).await?;
         let groups = live::parse_live_content(&content);
@@ -71,7 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let merged = merge_and_test(channels).await;
-    let demo = merged.iter().find(|channel| channel.name == "Demo Channel").ok_or("missing merged channel")?;
+    let demo = merged
+        .iter()
+        .find(|channel| channel.name == "Demo Channel")
+        .ok_or("missing merged channel")?;
     println!(
         "LIVE OK: merged={} demo_urls={} best_url={} latency={} origins={:?}",
         merged.len(),
@@ -80,12 +110,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         demo.latency,
         demo.origins
     );
-    assert_eq!(demo.urls.len(), 2, "same channel should merge URLs from multiple sources");
-    assert!(demo.best_url.ends_with("/fast.m3u8"), "fastest URL should be preferred");
+    assert_eq!(
+        demo.urls.len(),
+        2,
+        "same channel should merge URLs from multiple sources"
+    );
+    assert!(
+        demo.best_url.ends_with("/fast.m3u8"),
+        "fastest URL should be preferred"
+    );
     assert!(demo.origins.iter().any(|origin| origin.contains("Live A")));
     assert!(demo.origins.iter().any(|origin| origin.contains("Live B")));
-    let solo = merged.iter().find(|channel| channel.name == "Solo Channel").ok_or("missing solo channel")?;
-    assert_eq!(solo.urls.len(), 1, "single-line channels should be kept without speed competition");
+    let solo = merged
+        .iter()
+        .find(|channel| channel.name == "Solo Channel")
+        .ok_or("missing solo channel")?;
+    assert_eq!(
+        solo.urls.len(),
+        1,
+        "single-line channels should be kept without speed competition"
+    );
     assert_eq!(solo.latency, -1);
 
     server.stop();
@@ -102,10 +146,13 @@ struct MergedChannel {
 }
 
 async fn merge_and_test(channels: Vec<(String, live::Channel)>) -> Vec<MergedChannel> {
-    let mut by_name: std::collections::HashMap<String, (String, Vec<String>, Vec<String>)> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, (String, Vec<String>, Vec<String>)> =
+        std::collections::HashMap::new();
     for (origin, channel) in channels {
         let key = live::normalize_name(&channel.name);
-        let entry = by_name.entry(key).or_insert_with(|| (channel.name.clone(), Vec::new(), Vec::new()));
+        let entry = by_name
+            .entry(key)
+            .or_insert_with(|| (channel.name.clone(), Vec::new(), Vec::new()));
         for url in channel.urls {
             if !entry.1.contains(&url) {
                 entry.1.push(url);
@@ -134,7 +181,13 @@ async fn merge_and_test(channels: Vec<(String, live::Channel)>) -> Vec<MergedCha
             results.push(live::test_url(url, 2_000).await);
         }
         results.retain(|result| result.alive);
-        results.sort_by_key(|result| if result.latency < 0 { i64::MAX } else { result.latency });
+        results.sort_by_key(|result| {
+            if result.latency < 0 {
+                i64::MAX
+            } else {
+                result.latency
+            }
+        });
         if let Some(best) = results.first() {
             merged.push(MergedChannel {
                 name,
@@ -190,7 +243,9 @@ impl TestServer {
 
 fn handle_connection(mut stream: TcpStream, base_url: &str) {
     let mut buffer = [0u8; 2048];
-    let Ok(size) = stream.read(&mut buffer) else { return; };
+    let Ok(size) = stream.read(&mut buffer) else {
+        return;
+    };
     let request = String::from_utf8_lossy(&buffer[..size]);
     let path = request
         .lines()

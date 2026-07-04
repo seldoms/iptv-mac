@@ -18,6 +18,8 @@ mod network;
 mod spider;
 #[path = "../src/super_parse.rs"]
 mod super_parse;
+#[path = "../src/path_safety.rs"]
+mod path_safety;
 
 const TARGET_SAMPLES: usize = 10;
 const MIN_SUCCESS_RATE: f64 = 0.85;

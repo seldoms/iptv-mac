@@ -2,16 +2,18 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-#[path = "../src/error.rs"]
-mod error;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/error.rs"]
+mod error;
 #[path = "../src/live.rs"]
 mod live;
 #[path = "../src/network.rs"]
 mod network;
 #[path = "../src/spider.rs"]
 mod spider;
+#[path = "../src/path_safety.rs"]
+mod path_safety;
 
 #[derive(Default)]
 struct ProbeTotals {
@@ -41,7 +43,10 @@ async fn main() {
         ("203511", "https://tv.203511.xyz/0821.json"),
         ("qist/潇洒", "https://qist.wyfc.qzz.io/xiaosa/api.json"),
         ("qist/jsm", "https://qist.wyfc.qzz.io/jsm.json"),
-        ("codeberg", "https://codeberg.org/wei88976862/tvbox001/raw/branch/main/fty.json"),
+        (
+            "codeberg",
+            "https://codeberg.org/wei88976862/tvbox001/raw/branch/main/fty.json",
+        ),
         ("pastebin", "https://pastebin.com/raw/sbPpDm9G"),
         ("IP:47", "http://47.96.82.41:5188/api.json"),
         ("iyouhun", "https://www.iyouhun.com/tv/wex"),
@@ -83,15 +88,26 @@ async fn main() {
         };
 
         totals.configs_ok += 1;
-        let site_entries = config.get("sites").and_then(Value::as_array).cloned().unwrap_or_default();
+        let site_entries = config
+            .get("sites")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let sites = site_entries.len();
-        let lives = config.get("lives").and_then(Value::as_array).cloned().unwrap_or_default();
+        let lives = config
+            .get("lives")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         println!("CONFIG OK: sites={} lives={}", sites, lives.len());
         probe_sites(&site_entries).await;
 
         for live_entry in lives {
             totals.live_entries += 1;
-            let live_name = live_entry.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+            let live_name = live_entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unnamed");
             let Some(live_url) = live_entry.get("url").and_then(Value::as_str) else {
                 totals.live_failed += 1;
                 println!("  LIVE FAIL [{}]: missing url", live_name);
@@ -121,12 +137,18 @@ async fn main() {
     }
 
     println!("\n========== RESULTS ==========");
-    println!("configs: ok={} failed={}", totals.configs_ok, totals.configs_failed);
+    println!(
+        "configs: ok={} failed={}",
+        totals.configs_ok, totals.configs_failed
+    );
     println!(
         "lives: entries={} loaded={} failed={}",
         totals.live_entries, totals.live_loaded, totals.live_failed
     );
-    println!("parsed: groups={} channels={}", totals.groups, totals.channels);
+    println!(
+        "parsed: groups={} channels={}",
+        totals.groups, totals.channels
+    );
     println!("==============================");
 }
 
@@ -158,7 +180,11 @@ async fn probe_sites(sites: &[Value]) {
             site_type,
             api: api.to_string(),
             ext: site.get("ext").cloned(),
-            play_url: site.get("playUrl").or_else(|| site.get("play_url")).and_then(Value::as_str).map(String::from),
+            play_url: site
+                .get("playUrl")
+                .or_else(|| site.get("play_url"))
+                .and_then(Value::as_str)
+                .map(String::from),
             click: site.get("click").and_then(Value::as_str).map(String::from),
             header: site.get("header").cloned(),
             timeout: site.get("timeout").and_then(Value::as_i64),
@@ -175,7 +201,10 @@ async fn probe_sites(sites: &[Value]) {
                 );
 
                 if let Some(first_vod) = home.list.as_ref().and_then(|list| list.first()) {
-                    match spider.detail_content(std::slice::from_ref(&first_vod.vod_id)).await {
+                    match spider
+                        .detail_content(std::slice::from_ref(&first_vod.vod_id))
+                        .await
+                    {
                         Ok(detail) => {
                             let detail_count = detail.list.as_ref().map_or(0, Vec::len);
                             println!(
@@ -220,7 +249,12 @@ fn first_play_url(vod_play_url: &str) -> Option<&str> {
     vod_play_url
         .split('#')
         .next()
-        .and_then(|episode| episode.rsplit_once('$').map(|(_, url)| url).or(Some(episode)))
+        .and_then(|episode| {
+            episode
+                .rsplit_once('$')
+                .map(|(_, url)| url)
+                .or(Some(episode))
+        })
         .map(str::trim)
         .filter(|url| !url.is_empty())
 }
@@ -229,8 +263,9 @@ async fn load_live(
     client: &reqwest::Client,
     live_url: &str,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    let content = tokio::time::timeout(Duration::from_secs(20), network::http_get(client, live_url))
-        .await??;
+    let content =
+        tokio::time::timeout(Duration::from_secs(20), network::http_get(client, live_url))
+            .await??;
     let groups = live::parse_live_content(&content);
     let channel_count = groups.iter().map(|group| group.channel.len()).sum();
     Ok((groups.len(), channel_count))
