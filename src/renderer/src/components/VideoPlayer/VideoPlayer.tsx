@@ -16,6 +16,7 @@ import {
   SkipForward,
   MessageSquare,
   PictureInPicture2,
+  Monitor,
   Loader2,
   ClipboardList,
   Copy,
@@ -962,7 +963,7 @@ export default function VideoPlayer() {
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onDoubleClick={handleDoubleClick}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} />
+      <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} x-webkit-airplay="allow" />
 
       {currentUrl && (
         <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
@@ -1099,6 +1100,20 @@ export default function VideoPlayer() {
               title="播放诊断"
             >
               <ClipboardList className="w-4 h-4" />
+            </button>
+
+            {/* 投屏（AirPlay） */}
+            <button
+              onClick={() => {
+                const video = videoRef.current
+                if (video && 'webkitShowPlaybackTargetPicker' in video) {
+                  (video as any).webkitShowPlaybackTargetPicker()
+                }
+              }}
+              className="p-1 text-white/80 hover:text-white"
+              title="投屏到电视"
+            >
+              <Monitor className="w-4 h-4" />
             </button>
 
             {/* 精简模式 */}

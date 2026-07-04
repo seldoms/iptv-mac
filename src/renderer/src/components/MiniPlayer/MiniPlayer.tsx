@@ -10,7 +10,8 @@ import {
   VolumeX,
   X,
   Maximize2,
-  GripHorizontal
+  GripHorizontal,
+  Monitor
 } from 'lucide-react'
 
 function getMiniWindowSize(videoWidth: number, videoHeight: number) {
@@ -340,6 +341,18 @@ export default function MiniPlayer() {
             <GripHorizontal className="w-4 h-4 text-white/40" />
           </div>
           <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <button
+              onClick={() => {
+                const video = videoRef.current
+                if (video && 'webkitShowPlaybackTargetPicker' in video) {
+                  (video as any).webkitShowPlaybackTargetPicker()
+                }
+              }}
+              className="p-1 text-white/70 hover:text-white rounded hover:bg-white/10 transition-colors"
+              title="投屏到电视"
+            >
+              <Monitor className="w-3.5 h-3.5" />
+            </button>
             <button
               onClick={handleExitMiniMode}
               className="p-1 text-white/70 hover:text-white rounded hover:bg-white/10 transition-colors"
