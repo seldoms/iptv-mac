@@ -406,5 +406,5 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
     sourceSwitchMessage: ''
   }),
 
-  reset: () => set({ ...initialState, brokenSources: new Set() })
+  reset: () => set(initialState)
 }))

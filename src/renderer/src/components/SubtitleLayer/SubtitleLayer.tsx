@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react'
 
+// 字幕解析缓存 keyed by URL，避免相同 URL 重复解析 SRT
+const subtitleCache = new Map<string, SubtitleCue[]>()
+
 interface SubtitleCue {
   start: number
   end: number
@@ -45,9 +48,21 @@ export default function SubtitleLayer({ currentTime = 0 }: SubtitleLayerProps) {
   // 加载字幕
   const loadSubtitle = async (url: string, label: string, language = 'zh') => {
     try {
+      // 优先使用缓存，避免重复解析
+      const cached = subtitleCache.get(url)
+      if (cached) {
+        setTracks((prev) => [...prev, { label, language, cues: cached }])
+        return
+      }
       const res = await fetch(url)
       const content = await res.text()
       const cues = parseSRT(content)
+      // 限制缓存条目数，防止内存泄漏
+      if (subtitleCache.size >= 50) {
+        const firstKey = subtitleCache.keys().next().value
+        if (firstKey) subtitleCache.delete(firstKey)
+      }
+      subtitleCache.set(url, cues)
       setTracks((prev) => [...prev, { label, language, cues }])
     } catch {
       // 字幕加载失败静默处理
