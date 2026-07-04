@@ -147,7 +147,14 @@ impl HttpSpider {
             .await
             .map_err(|e| AppError::network_error(format!("读取响应失败: {}", e)))?;
         serde_json::from_str(&text)
-            .map_err(|e| AppError::parse_error(format!("API 返回非 JSON: {}", e)))
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("expected value") || msg.contains("EOF while parsing") {
+                    AppError::parse_error("站点返回了非 JSON 内容（可能是网页或错误页面），暂无法解析")
+                } else {
+                    AppError::parse_error(format!("站点数据解析失败: {}", msg))
+                }
+            })
     }
 
     async fn fetch_xml(&self, url: &str) -> HttpResult<Value> {
