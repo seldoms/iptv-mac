@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -55,11 +54,10 @@ pub fn start_local_proxy() -> Result<LocalProxyInfo, String> {
 }
 
 fn make_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}{:x}", nanos, std::process::id())
+    use rand::Rng;
+    // 128-bit cryptographically random token (32 hex chars)
+    let token: u128 = rand::thread_rng().gen();
+    format!("{:032x}", token)
 }
 
 fn trace_enabled() -> bool {
@@ -94,7 +92,9 @@ fn register_proxy_item(
     url: &str,
     headers: &HashMap<String, String>,
 ) -> String {
-    let id = PROXY_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed).to_string();
+    let id = PROXY_ITEM_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
     if let Ok(mut items) = proxy_items().lock() {
         if items.len() >= MAX_PROXY_ITEMS {
             let overflow = items.len() + 1 - MAX_PROXY_ITEMS;
@@ -207,7 +207,10 @@ fn handle_stream(mut stream: TcpStream, info: &LocalProxyInfo) -> Result<(), Str
         "{} {} range={}",
         method,
         url,
-        request_headers.get("range").map(String::as_str).unwrap_or("-")
+        request_headers
+            .get("range")
+            .map(String::as_str)
+            .unwrap_or("-")
     ));
 
     if let Err(error) = proxy_media(&mut stream, info, &url, &headers, &request_headers) {
@@ -307,7 +310,9 @@ fn proxy_media(
         while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
             streamed_bytes += chunk.len() as u64;
             if content_length.is_some() {
-                stream.write_all(&chunk).map_err(|error| error.to_string())?;
+                stream
+                    .write_all(&chunk)
+                    .map_err(|error| error.to_string())?;
             } else {
                 write_chunk(stream, &chunk)?;
             }
@@ -341,7 +346,109 @@ fn parse_request_headers(request: &str) -> HashMap<String, String> {
 }
 
 fn is_allowed_media_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return false;
+    }
+
+    // Parse host to check for private/internal IP ranges (SSRF protection)
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    let host = match parsed.host() {
+        Some(h) => h,
+        None => return false,
+    };
+
+    // Check hostname — localhost variants and bare IPs
+    let host_str = host.to_string();
+    let is_loopback_host = matches!(
+        host_str.as_str(),
+        "localhost"
+            | "127.0.0.1"
+            | "::1"
+            | "[::1]"
+            | "0.0.0.0"
+            | "localhost.localdomain"
+            | "127.0.1.1"
+    ) || host_str.ends_with(".local")
+        || host_str.ends_with(".localhost");
+
+    if is_loopback_host {
+        return false;
+    }
+
+    // If the host is an IP address, check against private/reserved ranges
+    if let Ok(ip) = host_str.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                // 127.0.0.0/8 (loopback)
+                if v4.octets()[0] == 127 {
+                    return false;
+                }
+                // 10.0.0.0/8 (private A)
+                if v4.octets()[0] == 10 {
+                    return false;
+                }
+                // 172.16.0.0/12 (private B)
+                if v4.octets()[0] == 172 && (v4.octets()[1] & 0xF0) == 16 {
+                    return false;
+                }
+                // 192.168.0.0/16 (private C)
+                if v4.octets()[0] == 192 && v4.octets()[1] == 168 {
+                    return false;
+                }
+                // 169.254.0.0/16 (link-local)
+                if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
+                    return false;
+                }
+                // 0.0.0.0/8
+                if v4.octets()[0] == 0 {
+                    return false;
+                }
+                // 100.64.0.0/10 (CGNAT / Carrier-grade NAT)
+                if v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 {
+                    return false;
+                }
+                // 198.18.0.0/15 (benchmarking)
+                if v4.octets()[0] == 198 && (v4.octets()[1] & 0xFE) == 18 {
+                    return false;
+                }
+            }
+            IpAddr::V6(v6) => {
+                let segments = v6.segments();
+                // ::1 (loopback)
+                if segments == [0, 0, 0, 0, 0, 0, 0, 1] {
+                    return false;
+                }
+                // IPv4-mapped IPv6: ::ffff:0:0/96 — check the embedded IPv4
+                if segments[0..5] == [0, 0, 0, 0, 0] && segments[5] == 0xFFFF {
+                    let embedded = std::net::Ipv4Addr::new(
+                        (segments[6] >> 8) as u8,
+                        (segments[6] & 0xFF) as u8,
+                        (segments[7] >> 8) as u8,
+                        (segments[7] & 0xFF) as u8,
+                    );
+                    // Re-check against the IPv4 private ranges
+                    let octets = embedded.octets();
+                    if octets[0] == 127
+                        || octets[0] == 10
+                        || (octets[0] == 172 && (octets[1] & 0xF0) == 16)
+                        || (octets[0] == 192 && octets[1] == 168)
+                        || (octets[0] == 169 && octets[1] == 254)
+                    {
+                        return false;
+                    }
+                }
+                // Unique Local Address (ULA): fd00::/8
+                if segments[0] & 0xFF00 == 0xFD00 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 fn write_options_response(stream: &mut TcpStream) -> Result<(), String> {
@@ -456,8 +563,24 @@ mod tests {
     fn only_allows_http_media_urls() {
         assert!(is_allowed_media_url("https://example.com/a.m3u8"));
         assert!(is_allowed_media_url("http://example.com/a.m3u8"));
+        assert!(is_allowed_media_url("http://93.184.216.34:8080/stream.ts"));
         assert!(!is_allowed_media_url("file:///tmp/a.m3u8"));
         assert!(!is_allowed_media_url("data:text/plain,hello"));
+    }
+
+    #[test]
+    fn rejects_private_ip_ssrf() {
+        assert!(!is_allowed_media_url("http://127.0.0.1:22"));
+        assert!(!is_allowed_media_url("http://127.0.0.1"));
+        assert!(!is_allowed_media_url("http://localhost:8080/stream"));
+        assert!(!is_allowed_media_url("http://10.0.0.1/latest/meta-data/"));
+        assert!(!is_allowed_media_url("http://172.16.0.1:3000"));
+        assert!(!is_allowed_media_url("http://192.168.1.1/admin"));
+        assert!(!is_allowed_media_url("http://169.254.169.254/latest/meta-data/"));
+        assert!(!is_allowed_media_url("http://[::1]:8080"));
+        assert!(!is_allowed_media_url("http://0.0.0.0"));
+        assert!(!is_allowed_media_url("http://100.64.0.1"));
+        assert!(!is_allowed_media_url("http://198.18.0.1"));
     }
 
     #[test]
