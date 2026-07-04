@@ -8,6 +8,8 @@ interface Danmaku {
   x: number
   y: number
   fontSize: number
+  /** 预计算的文本宽度，避免每帧调用 ctx.measureText */
+  textWidth: number
 }
 
 interface DanmakuLayerProps {
@@ -32,6 +34,8 @@ export default function DanmakuLayer({ opacity = 0.8, speed = 2, fontSize = 20 }
       if (!ctx) return
 
       const y = Math.random() * (canvas.height - fontSize - 10) + 5
+      ctx.font = `${fontSize}px "Noto Sans SC", sans-serif`
+      const textWidth = ctx.measureText(text).width
       danmakuListRef.current.push({
         id: idCounter.current++,
         text,
@@ -39,7 +43,8 @@ export default function DanmakuLayer({ opacity = 0.8, speed = 2, fontSize = 20 }
         speed: speed + Math.random() * 0.5,
         x: canvas.width,
         y,
-        fontSize
+        fontSize,
+        textWidth,
       })
     },
     [enabled, speed, fontSize]
@@ -67,7 +72,8 @@ export default function DanmakuLayer({ opacity = 0.8, speed = 2, fontSize = 20 }
 
       danmakuListRef.current = danmakuListRef.current.filter((d) => {
         d.x -= d.speed
-        if (d.x < -ctx.measureText(d.text).width * 2) return false
+        // 使用预计算的文本宽度，避免每帧调用 measureText
+        if (d.x < -d.textWidth * 2) return false
 
         ctx.font = `${d.fontSize}px "Noto Sans SC", sans-serif`
         ctx.fillStyle = d.color
