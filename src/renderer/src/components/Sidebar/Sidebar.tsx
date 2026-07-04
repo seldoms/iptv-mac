@@ -32,8 +32,8 @@ export default function Sidebar() {
       }`}
     >
       {/* Logo - 可拖动区域 */}
-      <div className="flex items-center justify-center h-16 shrink-0 border-b border-[#2a2a2a]" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
-        <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+      <div className="flex items-center justify-center h-16 shrink-0 border-b border-[#2a2a2a]" data-tauri-drag-region>
+        <div>
           <AppLogo />
         </div>
       </div>

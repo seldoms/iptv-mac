@@ -336,11 +336,11 @@ export default function MiniPlayer() {
           showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
-        <div className="flex items-center justify-between" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
-          <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        <div className="flex items-center justify-between" data-tauri-drag-region>
+          <div className="flex items-center gap-1">
             <GripHorizontal className="w-4 h-4 text-white/40" />
           </div>
-          <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          <div className="flex items-center gap-1">
             <button
               onClick={() => {
                 const video = videoRef.current

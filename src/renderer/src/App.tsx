@@ -95,11 +95,11 @@ export default function App() {
   }
 
   return (
-    <div className={`h-screen w-screen overflow-hidden bg-bg-primary ${miniMode ? 'hidden' : ''}`}>
+    <div className={`flex h-screen w-screen overflow-hidden bg-bg-primary ${miniMode ? 'hidden' : ''}`}>
       <Sidebar />
       <main className="flex-1 flex flex-col overflow-hidden">
         {/* 顶部拖动条 - 用于移动窗口 */}
-        <div className="shrink-0 h-8 flex items-center px-4 bg-bg-secondary border-b border-[#2a2a2a]" style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}>
+        <div className="shrink-0 h-8 flex items-center px-4 bg-bg-secondary border-b border-[#2a2a2a]" data-tauri-drag-region>
           <span className="text-[10px] text-text-muted select-none">IPTV</span>
         </div>
         <div className="flex-1 overflow-hidden">
