@@ -11,14 +11,20 @@ macOS 上的 TVBox / CatVod 兼容播放器，基于 **Tauri 2 + Rust + React 18
 
 ### 直接下载安装（普通用户）
 
-1. 打开 **[Releases](https://github.com/seldoms/iptv-mac/releases)** → 下载 `IPTV-Mac-macos-arm64.zip`
-   （`latest` 是每次推送后自动构建的最新版）
-2. 解压得到 `IPTV Mac.app`，拖进「应用程序」
-3. **首次打开请右键 → 打开**（构建未做 Apple 签名/公证）；若仍被拦，执行一次：
+**方式一：一行命令（推荐）** —— 自动下载最新版、装到「应用程序」并去掉 Gatekeeper 的隔离标记：
 
 ```bash
-xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"
+curl -fsSL https://raw.githubusercontent.com/seldoms/iptv-mac/main/scripts/install-macos.sh | bash
+# 想要每次推送都重新构建的滚动版：把结尾换成 `| bash -s pre`
 ```
+
+**方式二：手动** —— 打开 **[Releases](https://github.com/seldoms/iptv-mac/releases)** 下载 `IPTV-Mac-macos-arm64.zip`
+（或 `.dmg`），解压后把 `IPTV Mac.app` 拖进「应用程序」。
+
+> **关于"无法验证开发者"**：本项目**没有 Apple 开发者账号**（签名/公证需要付费账号），所以下载来的包会被 Gatekeeper 拦。
+> 用上面的一行命令会自动处理；手动装的请 **右键 App → 打开**，或到「系统设置 → 隐私与安全性 → 仍要打开」；
+> 也可以自己执行 `xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"`。
+> CI 里已做 ad-hoc 签名（保证包内签名自洽），但这不能替代公证。
 
 > 目前只提供 Apple Silicon（arm64）；Intel 机器请从源码构建（见下）。
 

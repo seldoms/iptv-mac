@@ -56,6 +56,13 @@ jobs:
       - name: 打包 .app（必需）
         run: npx tauri build --bundles app
 
+      # 没有 Apple 开发者账号：至少做 ad-hoc 签名，保证包内签名自洽（Apple Silicon 上也更不容易被拦）
+      - name: ad-hoc 签名（无开发者账号）
+        continue-on-error: true
+        run: |
+          codesign --force --deep --sign - --timestamp=none "src-tauri/target/release/bundle/macos/IPTV Mac.app" || true
+          codesign --verify --deep --verbose=1 "src-tauri/target/release/bundle/macos/IPTV Mac.app" || true
+
       # ⚠️ 顺序很重要：Tauri 的 DMG 打包会把 bundle/macos 下的 .app 清掉（塞进 DMG 后清场），
       # 所以必须先压缩好 .app，再去打 DMG。
       - name: 压缩客户端（zip 便于直接下载解压）
@@ -114,8 +121,13 @@ jobs:
           body: |
             macOS 客户端（Apple Silicon / arm64），构建自 `${{ github.sha }}`。
 
-            **安装**：下载 zip → 解压得到 `IPTV Mac.app` → 拖进「应用程序」。
-            首次打开请**右键 → 打开**（本构建未做 Apple 签名/公证）；
+            **一键安装（推荐，自动去掉 Gatekeeper 的 quarantine 标记）**：
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/seldoms/iptv-mac/main/scripts/install-macos.sh | bash
+            ```
+
+            **手动安装**：下载 zip → 解压得到 `IPTV Mac.app` → 拖进「应用程序」；
+            首次打开请**右键 → 打开**（本构建未做 Apple 签名/公证，开发者账号暂无）；
             若仍被拦，执行一次：
             ```bash
             xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"
