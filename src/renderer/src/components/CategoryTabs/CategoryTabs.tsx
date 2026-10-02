@@ -5,6 +5,8 @@ import type { Category, Filter } from '@/stores/useConfigStore'
 interface CategoryTabsProps {
   categories: Category[]
   activeCategory: string
+  /** 切站过程中为 true：此时标签仍属于旧站点，点它只会拿到空数据 */
+  disabled?: boolean
   onSelect: (tid: string) => void
   hasFilters: boolean
   showFilter: boolean
@@ -18,6 +20,7 @@ interface CategoryTabsProps {
 export default function CategoryTabs({
   categories,
   activeCategory,
+  disabled = false,
   onSelect,
   hasFilters,
   showFilter,
@@ -40,9 +43,10 @@ export default function CategoryTabs({
             key={cat.type_id}
             ref={active ? activeRef : undefined}
             onClick={() => onSelect(cat.type_id)}
+            disabled={disabled}
             aria-selected={active}
             data-active={active ? 'true' : 'false'}
-            className={`shrink-0 px-3 py-1 text-xs rounded-full transition-all duration-200 ${
+            className={`shrink-0 px-3 py-1 text-xs rounded-full transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-50 ${
               active
                 ? 'bg-accent text-bg-primary font-semibold shadow-sm'
                 : 'text-white/70 hover:text-white/90 hover:bg-white/[0.06]'

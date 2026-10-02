@@ -436,6 +436,7 @@ export default function Home() {
           <CategoryTabs
             categories={categories}
             activeCategory={activeCategory}
+            disabled={Boolean(pendingSiteKey)}
             onSelect={handleCategoryClick}
             hasFilters={activeFilters.length > 0}
             showFilter={showFilterPanel}
