@@ -1,0 +1,66 @@
+# 推送代码后自动在 GitHub 的 macOS runner 上编译并产出 .app / .dmg
+#
+# 说明：
+# - 只在 main 分支和 v* tag 上跑，避免每个功能分支都消耗额度
+# - public 仓库的 GitHub 托管 runner 免费；macOS runner 单次约 5–15 分钟
+# - 产物**未做签名/公证**：用户首次打开需要「右键 → 打开」，或
+#   `xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"`
+#   要免这一步，需要 Apple Developer 账号并在 secrets 里配置签名证书（见文末注释）
+name: build-macos
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查与前端测试
+        run: npm run typecheck && npm test
+
+      - name: Rust 测试（单线程）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
+
+      - name: 打包 .app / .dmg
+        run: npm run build:mac
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Mac-macos
+          path: |
+            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      - name: 打 tag 时附到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src-tauri/target/release/bundle/dmg/*.dmg
+
+# 想做成"下载即可打开"的正规分发，需要：
+#   1. Apple Developer Program 账号，导出 Developer ID Application 证书（.p12）
+#   2. 仓库 Secrets 增加：APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+#      APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+#   3. 在上面的打包步骤前导入证书，Tauri 会自动完成签名 + 公证
