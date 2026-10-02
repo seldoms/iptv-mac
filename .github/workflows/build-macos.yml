@@ -56,16 +56,18 @@ jobs:
       - name: 打包 .app（必需）
         run: npx tauri build --bundles app
 
-      # DMG 是加分项：GitHub runner 上 hdiutil 正常，但本机曾卡住过，所以失败也不影响 zip 发布
-      - name: 尝试打包 .dmg（可选）
-        continue-on-error: true
-        run: npx tauri build --bundles dmg
-
+      # ⚠️ 顺序很重要：Tauri 的 DMG 打包会把 bundle/macos 下的 .app 清掉（塞进 DMG 后清场），
+      # 所以必须先压缩好 .app，再去打 DMG。
       - name: 压缩客户端（zip 便于直接下载解压）
         run: |
           cd "src-tauri/target/release/bundle/macos"
           ditto -c -k --sequesterRsrc --keepParent "IPTV Mac.app" "IPTV-Mac-macos-arm64.zip"
           ls -lh
+
+      # DMG 是加分项：runner 上 hdiutil 正常，失败也不影响已压好的 zip
+      - name: 尝试打包 .dmg（可选）
+        continue-on-error: true
+        run: npx tauri build --bundles dmg
 
       - name: 上传 zip（必需）
         uses: actions/upload-artifact@v4
