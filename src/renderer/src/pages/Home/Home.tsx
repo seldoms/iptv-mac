@@ -28,6 +28,7 @@ export default function Home() {
   const navigate = useNavigate()
   const {
     currentConfig, sites, siteSpeeds, isStartupReady, currentSiteKey, contentSiteKey, pendingSiteKey, categories, filters, homeVideos,
+    startupAttempt,
     categoryVideos, currentPage, hasMore, isLoading, error, liveConfig,
     switchSite, fetchCategoryContent, fetchHomeContent, loadConfig
   } = useConfigStore()
@@ -406,7 +407,11 @@ export default function Home() {
       {/* FongMi: ProgressLayout wrapping VerticalGridView */}
       <ProgressLayout
         state={pageState}
-        loadingMessage="正在加载首页内容..."
+        loadingMessage={
+          startupAttempt
+            ? `正在尝试第 ${startupAttempt.index}/${startupAttempt.total} 个站点：${startupAttempt.siteName}…`
+            : '正在加载首页内容...'
+        }
         emptyTitle="暂无内容"
         emptyDescription=""
       >

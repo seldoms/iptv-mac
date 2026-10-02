@@ -12,6 +12,9 @@ import {
 
 const LAST_SITE_PREFIX = 'iptv:last-site:'
 const MAX_INITIAL_SITE_ATTEMPTS = 6
+/// 启动时自动找站的**总**预算：单站超时不可控，串行试 6 个可能转好几分钟，
+/// 超过预算就停下、把错误和站点选择入口交给用户（比一直转圈更有用）。
+const STARTUP_ATTEMPT_BUDGET_MS = 25_000
 
 export interface Site {
   key: string
@@ -77,6 +80,8 @@ interface ConfigState {
   currentSiteKey: string
   contentSiteKey: string
   pendingSiteKey: string
+  /** 启动自动找站的进度（用于加载动画里显示"正在尝试第 N/M 个：站点名"） */
+  startupAttempt: { index: number; total: number; siteName: string } | null
   categories: Category[]
   filters: Record<string, Filter[]>
   /** 首页选中的分类标签（放 store 才能在进播放页再返回后保持） */
@@ -128,6 +133,7 @@ const initialState: ConfigState = {
   currentSiteKey: '',
   contentSiteKey: '',
   pendingSiteKey: '',
+  startupAttempt: null,
   categories: [],
   filters: {},
   activeCategory: '',
@@ -328,7 +334,42 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
         const attemptedSites = candidates.slice(0, MAX_INITIAL_SITE_ATTEMPTS)
         let lastError = '站点没有返回首页内容'
 
+        // 先把本地 24h 缓存里的内容显示出来：用户打开就看到首页，不用对着转圈等网络。
+        // （loadSiteHome 自身也会读缓存，但那只覆盖"第一个"候选站；这里扫一遍候选，任一命中就秒开）
         for (const site of attemptedSites) {
+          const cached = await getCachedSiteData(url, site.key)
+          if (requestId !== siteHomeRequestId) return { success: false, error: '配置加载已取消' }
+          const cachedCategories = cached?.class || cached?.types || []
+          const cachedVideos = cached?.list || []
+          if (cachedCategories.length > 0 || cachedVideos.length > 0) {
+            console.log('[ConfigStore] 启动秒开（命中缓存）:', site.key)
+            set({
+              currentSiteKey: site.key,
+              contentSiteKey: site.key,
+              pendingSiteKey: '',
+              categories: cachedCategories,
+              filters: (cached?.filters as any) || {},
+              homeVideos: cachedVideos,
+              categoryVideos: cached?.firstCategoryPage1 || [],
+              isLoading: false
+            })
+            break
+          }
+        }
+
+        const budgetStart = Date.now()
+        let attemptIndex = 0
+        for (const site of attemptedSites) {
+          attemptIndex += 1
+          if (Date.now() - budgetStart > STARTUP_ATTEMPT_BUDGET_MS) {
+            lastError = `自动尝试已超过 ${Math.round(STARTUP_ATTEMPT_BUDGET_MS / 1000)} 秒（已试 ${attemptIndex - 1} 个站点），请手动选择站点`
+            console.warn('[ConfigStore]', lastError)
+            break
+          }
+          set({
+            startupAttempt: { index: attemptIndex, total: attemptedSites.length, siteName: site.name },
+            pendingSiteKey: site.key
+          })
           console.log('[ConfigStore] 尝试加载站点:', site.key)
           try {
             const result = await loadSiteHome(site.key)
@@ -343,6 +384,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
               currentSiteKey: site.key,
               contentSiteKey: site.key,
               pendingSiteKey: '',
+              startupAttempt: null,
               categories,
               filters: result.filters || {},
               homeVideos,
@@ -371,6 +413,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
           currentSiteKey: siteKey,
           contentSiteKey: '',
           pendingSiteKey: '',
+          startupAttempt: null,
           isLoading: false,
           error: message
         })

@@ -17,13 +17,16 @@ function stringify(value: unknown): string {
   }
 }
 
-function forward(level: 'error' | 'warn', message: string, detail?: string): void {
+function forward(level: 'error' | 'warn' | 'info', message: string, detail?: string): void {
   void invoke('log:frontend', level, message, detail).catch(() => {})
 }
 
 export function installFrontendLogBridge(): void {
+  // 这些前缀是"启动/加载链路"的关键轨迹：出问题（比如一直转圈）时日志里必须能看到卡在哪
+  const TRACED_PREFIXES = ['[ConfigStore]', '[App]', '[Live]', '[continuity]', '[stats]']
   const originalError = console.error
   const originalWarn = console.warn
+  const originalLog = console.log
 
   console.error = (...args: unknown[]) => {
     originalError(...args)
@@ -34,6 +37,14 @@ export function installFrontendLogBridge(): void {
     originalWarn(...args)
     const [first, ...rest] = args
     forward('warn', stringify(first), rest.map(stringify).join(' ').slice(0, 400))
+  }
+
+  console.log = (...args: unknown[]) => {
+    originalLog(...args)
+    const text = stringify(args[0])
+    if (TRACED_PREFIXES.some((prefix) => text.startsWith(prefix))) {
+      forward('info', text, args.slice(1).map(stringify).join(' ').slice(0, 400))
+    }
   }
 
   window.addEventListener('error', (event) => {
