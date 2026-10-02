@@ -91,9 +91,12 @@ jobs:
           if-no-files-found: ignore
 
   # 把 zip 发布到 Releases，普通用户可直接下载
+  # - 推 main → 更新滚动预发布 `latest`（用户装到的永远是最新构建）
+  # - 打 v* tag → 生成正式 Release
+  # - 手动触发 → 同样更新 `latest`
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
