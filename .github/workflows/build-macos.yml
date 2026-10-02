@@ -122,14 +122,22 @@ jobs:
             dist/IPTV-Mac-macos-arm64.zip
             dist/**/*.dmg
           body: |
-            macOS 客户端（Apple Silicon / arm64），构建自 `${{ github.sha }}`。
+            ## 一键安装（推荐）
 
-            **一键安装（推荐，自动去掉 Gatekeeper 的 quarantine 标记）**：
             ```bash
             curl -fsSL https://raw.githubusercontent.com/seldoms/iptv-mac/main/scripts/install-macos.sh | bash
             ```
 
-            **手动安装**：下载 zip → 解压得到 `IPTV Mac.app` → 拖进「应用程序」；
+            指定版本：在结尾加 `| bash -s -- --tag v1.0.2`；滚动最新：`| bash -s pre`。
+
+            macOS 客户端（Apple Silicon / arm64），构建自 `${{ github.sha }}`。
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/seldoms/iptv-mac/main/scripts/install-macos.sh | bash
+            ```
+
+            ## 手动安装
+
+            下载 zip → 解压得到 `IPTV Mac.app` → 拖进「应用程序」；
             首次打开请**右键 → 打开**（本构建未做 Apple 签名/公证，开发者账号暂无）；
             若仍被拦，执行一次：
             ```bash

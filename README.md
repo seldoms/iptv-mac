@@ -7,6 +7,28 @@ macOS 上的 TVBox / CatVod 兼容播放器，基于 **Tauri 2 + Rust + React 18
 
 ---
 
+## ⬇️ 下载安装（macOS / Apple Silicon）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/seldoms/iptv-mac/main/scripts/install-macos.sh | bash
+```
+
+一行命令搞定：下载最新版 → 装到「应用程序」→ **自动去掉 Gatekeeper 的隔离标记** → 打开。
+（本项目没有 Apple 开发者账号，所以没做签名公证；这条命令等价于帮你完成"右键→打开"那一步。）
+
+| 想装的东西 | 命令 / 入口 |
+| --- | --- |
+| 最新**正式版**（默认） | 上面那行 |
+| 每次推送都重建的**滚动版** | `…install-macos.sh \| bash -s pre` |
+| **指定版本**（方便回退） | `…install-macos.sh \| bash -s -- --tag v1.0.2` |
+| 只看会下哪个地址 | `bash scripts/install-macos.sh --dry-run` |
+| 手动下载 | [Releases](https://github.com/seldoms/iptv-mac/releases) 里的 `.zip` / `.dmg` |
+| 从源码构建 / 让 AI 装环境 | 见下方「[从源码构建](#从源码构建)」与[部署提示词](docs/SETUP_PROMPT.md) |
+
+> 仅 Apple Silicon（arm64）；Intel 需自行从源码编译。
+
+---
+
 ## 快速开始
 
 ### 直接下载安装（普通用户）
