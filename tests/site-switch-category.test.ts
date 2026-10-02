@@ -44,10 +44,11 @@ describe('切站时的守卫（契约）', () => {
   const home = read('src/renderer/src/pages/Home/Home.tsx')
   const tabs = read('src/renderer/src/components/CategoryTabs/CategoryTabs.tsx')
 
-  it('切站期间忽略分类请求（屏幕上的标签还是旧站点的，发出去必然空）', () => {
+  it('分类请求按"标签所属站点"配对，切站期间也不阻塞用户点击', () => {
     const fn = between(store, 'fetchCategoryContent: async', 'setCurrentSiteKey: (key: string) => set(')
-    expect(fn).toContain('if (get().pendingSiteKey)')
-    expect(fn).toContain('站点切换中，忽略分类请求')
+    expect(fn).toContain('get().contentSiteKey || get().currentSiteKey')
+    // 曾经这里是"切站期间直接忽略请求"，导致点标签毫无反应，比空数据更糟
+    expect(fn).not.toContain('if (get().pendingSiteKey)')
   })
 
   it('分类请求打到"当前正在显示内容的站点"', () => {
@@ -74,9 +75,8 @@ describe('切站时的守卫（契约）', () => {
     expect(store).not.toContain('writeHomeTabs(state.contentSiteKey || state.currentSiteKey')
   })
 
-  it('切站期间标签置灰，从源头杜绝点旧标签', () => {
-    expect(home).toContain('disabled={Boolean(pendingSiteKey)}')
-    expect(tabs).toContain('disabled = false')
-    expect(tabs).toContain('disabled={disabled}')
+  it('标签始终可点（配对逻辑已保证不会错配），站点就绪后自动重取当前分类', () => {
+    expect(home).not.toContain('disabled={Boolean(pendingSiteKey)}')
+    expect(home).toContain('contentSiteKey]')
   })
 })

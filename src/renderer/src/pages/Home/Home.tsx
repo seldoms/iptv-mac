@@ -139,7 +139,8 @@ export default function Home() {
     if (activeCategory && activeCategory !== '首页') {
       fetchCategoryContent(activeCategory, 1, selectedFilters)
     }
-  }, [activeCategory, selectedFilters, fetchCategoryContent])
+    // contentSiteKey 变化 = 站点内容就绪/切换完成：此时要把当前分类重新拉一次
+  }, [activeCategory, selectedFilters, fetchCategoryContent, contentSiteKey])
 
   // Scroll detection for toolbar
   useEffect(() => {
@@ -436,7 +437,6 @@ export default function Home() {
           <CategoryTabs
             categories={categories}
             activeCategory={activeCategory}
-            disabled={Boolean(pendingSiteKey)}
             onSelect={handleCategoryClick}
             hasFilters={activeFilters.length > 0}
             showFilter={showFilterPanel}

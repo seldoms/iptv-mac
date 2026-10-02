@@ -593,22 +593,21 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
   },
 
   fetchCategoryContent: async (tid: string, pg: number, extend?: Record<string, string>) => {
-    // 正在切站：此时屏幕上的标签还是旧站点的，拿它去请求新站点必然返回空（"暂无数据"就是这么来的）
-    if (get().pendingSiteKey) {
-      console.warn('[ConfigStore] 站点切换中，忽略分类请求:', tid)
-      return
-    }
-    // 请求打到"当前正在显示内容的站点"：切换过程中它就是旧站点，与新标签天然匹配
+    // 关键：分类 type_id 是站点私有的，必须"标签属于哪个站点就请求哪个站点"。
+    // contentSiteKey 正是"当前屏幕上这套分类/内容所属的站点"：
+    //   - 切站过程中它还是旧站点 → 点旧标签就请求旧站点（配对正确，不会得到空数据）
+    //   - 新站点就绪后它变成新站点 → 自然请求新站点
+    // 之前这里是"切站期间直接忽略请求"，用户点标签毫无反应，体验比空数据更糟，已改掉。
     const siteKey = get().contentSiteKey || get().currentSiteKey
     if (!siteKey) return
-    // 分类是站点私有的 type_id：与当前展示的站点分类对不上就说明状态错位，别发请求制造"暂无数据"
+    // 纵深防御：只有请求的 tid 确实属于"该站点的分类列表"才发出去
     const currentCategories = get().categories
     if (
       tid !== '首页' &&
       currentCategories.length > 0 &&
       !currentCategories.some((cat) => String(cat.type_id) === String(tid))
     ) {
-      console.warn('[ConfigStore] 分类不属于当前站点，已忽略:', tid)
+      console.warn('[ConfigStore] 分类不属于当前展示的站点，已忽略:', tid)
       return
     }
     const requestId = ++categoryRequestId
@@ -622,7 +621,8 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
       if (!res.success || !res.data) throw new Error(res.error || '获取分类内容失败')
       const result = res.data || {}
       const newList = result.list || []
-      if (requestId !== categoryRequestId || get().currentSiteKey !== siteKey) return
+      // 与请求目标保持一致：屏幕上还在展示这个站点的内容就采纳结果
+      if (requestId !== categoryRequestId || (get().contentSiteKey || get().currentSiteKey) !== siteKey) return
       const currentCategoryVideos = get().categoryVideos
       set({
         categoryVideos: pg === 1 ? newList : [...currentCategoryVideos, ...newList],
@@ -631,7 +631,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
         isLoading: false
       })
     } catch (e: any) {
-      if (requestId !== categoryRequestId || get().currentSiteKey !== siteKey) return
+      if (requestId !== categoryRequestId || (get().contentSiteKey || get().currentSiteKey) !== siteKey) return
       set({ isLoading: false, error: errorMessage(e, '获取分类内容失败') })
     }
   },
