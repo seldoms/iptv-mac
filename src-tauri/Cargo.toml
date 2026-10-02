@@ -1,7 +1,8 @@
 [package]
 name = "iptv-mac"
-version = "1.0.1"
-description = "macOS IPTV player"
+version = "1.0.2"
+description = "macOS IPTV player (TVBox/CatVod compatible)"
+license = "GPL-3.0-only"
 authors = ["IPTV Mac contributors"]
 edition = "2021"
 

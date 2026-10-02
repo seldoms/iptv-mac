@@ -106,7 +106,7 @@
 
 ## UI 页面与入口矩阵
 
-| FongMi 页面/弹窗 | mac-tv 对应 | 当前状态 | 当前实现位置 |
+| FongMi 页面/弹窗 | IPTV Mac 对应 | 当前状态 | 当前实现位置 |
 | --- | --- | --- | --- |
 | `HomeActivity` / `VodFragment` | Home | 部分支持 | `src/renderer/src/pages/Home/Home.tsx` |
 | `VodActivity` / `TypeFragment` | Home 分类视图 | 部分支持 | `src/renderer/src/pages/Home/Home.tsx`, `src/renderer/src/stores/useConfigStore.ts` |
@@ -138,5 +138,5 @@
 ## Phase 0 结论
 
 - `TV/` 是 FongMi 本地参考仓库，已通过主仓 `.gitignore` 隔离，避免误提交。
-- 当前 mac-tv 已有 TVBox/CatVod HTTP 站点、直播解析、媒体代理和播放器基础，但离 FongMi 完整复刻还差 type=3 Spider runtime、完整解析/嗅探、本地 HTTP API、网络策略、直播高级行为和 UI 弹窗体系。
+- 当前 IPTV Mac 已有 TVBox/CatVod HTTP 站点、直播解析、媒体代理和播放器基础，但离 FongMi 完整复刻还差 type=3 Spider runtime、完整解析/嗅探、本地 HTTP API、网络策略、直播高级行为和 UI 弹窗体系。
 - 后续 Phase 1 应先扩展配置协议和规范化模型；不要跳阶段直接啃 JAR/WebView，这坑不是一般深。

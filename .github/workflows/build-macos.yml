@@ -53,9 +53,13 @@ jobs:
       - name: Rust 测试（单线程）
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
 
-      # 只要 .app：DMG 由下一步单独尝试，失败也不影响客户端下载
-      - name: 打包 .app
+      - name: 打包 .app（必需）
         run: npx tauri build --bundles app
+
+      # DMG 是加分项：GitHub runner 上 hdiutil 正常，但本机曾卡住过，所以失败也不影响 zip 发布
+      - name: 尝试打包 .dmg（可选）
+        continue-on-error: true
+        run: npx tauri build --bundles dmg
 
       - name: 压缩客户端（zip 便于直接下载解压）
         run: |
@@ -63,12 +67,19 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "IPTV Mac.app" "IPTV-Mac-macos-arm64.zip"
           ls -lh
 
-      - name: 上传构建产物
+      - name: 上传 zip（必需）
         uses: actions/upload-artifact@v4
         with:
           name: IPTV-Mac-macos
           path: src-tauri/target/release/bundle/macos/IPTV-Mac-macos-arm64.zip
           if-no-files-found: error
+
+      - name: 上传 dmg（可选）
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Mac-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: ignore
 
   # 把 zip 发布到 Releases，普通用户可直接下载
   publish:
@@ -81,6 +92,13 @@ jobs:
           name: IPTV-Mac-macos
           path: dist
 
+      - name: 下载可选 dmg（没有就跳过）
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: IPTV-Mac-dmg
+          path: dist
+
       - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
@@ -88,7 +106,9 @@ jobs:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'IPTV Mac（最新构建）' }}
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-          files: dist/IPTV-Mac-macos-arm64.zip
+          files: |
+            dist/IPTV-Mac-macos-arm64.zip
+            dist/**/*.dmg
           body: |
             macOS 客户端（Apple Silicon / arm64），构建自 `${{ github.sha }}`。
 

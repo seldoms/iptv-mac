@@ -196,10 +196,20 @@ Tauri 2 · Rust · React 18 + TypeScript · Zustand · Tailwind CSS · SQLite ·
 - [订阅与播放验证](docs/SUBSCRIPTION_PLAYBACK.md) ｜ [测试源清单](docs/TEST_SOURCES.md)
 - [代码审计](docs/CODE_AUDIT.md) ｜ [当前进度](docs/PROGRESS.md) ｜ [交接单](HANDOFF.md)
 
-## 参考项目与许可
+## 许可
 
-- [FongMi/TV](https://github.com/FongMi/TV)（GPL-3.0：内置 `gbk.js`/`http.js`/`cat.js` 等来自该项目的运行库，对外分发需遵守其许可）
-- [CatVod](https://github.com/catvod/CatVodOpen)
-- 第三方库：cheerio、crypto-js（MIT）
+本项目以 **GPL-3.0** 发布，完整条款见 [LICENSE](LICENSE)。
 
-本项目代码以 MIT 发布。
+**为什么是 GPL-3.0**：`src-tauri/assets/js/lib/cat.js`（Cat 系站点运行库）与 `gbk.js` 来自
+[FongMi/TV](https://github.com/FongMi/TV)（GPL-3.0），并会由 Rust 侧 `include_str!` **编进二进制随包分发**；
+分发内嵌 GPL 代码的组合作品时，整体需要遵循 GPL-3.0。如果你想以 MIT 之类的宽松许可发布，必须先移除这两个文件
+（代价是 Cat 系站点与 GBK 解码不可用），见 [内置 JS 运行库说明](src-tauri/assets/js/README.md)。
+
+| 组件 | 许可 |
+| --- | --- |
+| 本项目代码 | GPL-3.0-only |
+| `lib/cat.js`、`lib/gbk.js`（FongMi TV 自带，已内嵌） | GPL-3.0 |
+| `lib/cheerio.min.js`、`lib/crypto-js.js` | MIT（cheerio / crypto-js） |
+| 内置 ffmpeg（`scripts/fetch-ffmpeg.sh` 下载，不随仓库分发） | 见 ffmpeg 上游许可（LGPL/GPL，取决于构建） |
+
+再分发时请保留本 LICENSE 与上述署名。

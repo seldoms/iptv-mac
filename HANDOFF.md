@@ -132,7 +132,7 @@
   - **播放标签记忆**：首页分类标签/二级筛选从组件 `useState` 提到 `useConfigStore`，进播放页返回后保持原标签。
   - **小窗加固**：进小窗前校验播放状态已保存（否则不进、给错误）；MiniPlayer 无地址时显示「未能恢复播放」+ 返回按钮；
     退出小窗还原进入前尺寸。新增**前端日志桥**（`log:frontend`）—— WebView 的 error/warn 会落进 `/tmp/iptv-app.log` 的 `[renderer/...]`。
-  - **目录收敛**：删除过时数据目录 `mac-tv`(366M)、`iptv-mac`(298M)、`IPTV`(92K)（历史已并入正式库，23 条）；
+  - **目录收敛**：删除过时数据目录 `IPTV Mac`(366M)、`iptv-mac`(298M)、`IPTV`(92K)（历史已并入正式库，23 条）；
     删除 `port-pending`（产物全部并入：decoder/network/resume；`docs/NETWORK_LAYER.md` 已归档进本仓库 docs）；
     删除重复 FongMi 检出 60M、`TVBoxOSC`(488K，可克隆)、`tvbox/TVBoxmacOS`(348M，源码归档到 `IPTV/_archive/`)；
     清理 `target/debug/{incremental,examples}` 3.7G。**此后只维护 `~/sobey/ai/iptv-mac` 一个项目**；
@@ -146,7 +146,7 @@
     合并前两个库都备份为 `*.merge-bak-20261002-101958`。
   - **教训**：`IPTV_TEST_DATA_DIR` 只在冒烟测试里用，绝不能拿它跑日常使用；排查"数据不见了"先确认实例用的是哪个数据目录
     （`app.path().app_data_dir()` = `com.iptvmac.desktop`，可用 `ps eww <pid> | grep IPTV_TEST_DATA_DIR` 核对）。
-  - 顺带确认：磁盘上另有历史库 `~/Library/Application Support/mac-tv/iptv.db`（6-14）与 `iptv-mac/iptv.db`（6-04），
+  - 顺带确认：磁盘上另有历史库 `~/Library/Application Support/IPTV Mac/iptv.db`（6-14）与 `iptv-mac/iptv.db`（6-04），
     是更早的 bundle id 留下的，未再写入。
 - 最后更新：2026-10-02，**测活策略重做（增量+限速+限时+优先级）+ 关于页精简**：
   - 旧策略问题：每次刷新都从直播源重新解析，上一轮结果不带过来 → 两万条线路**全量重测**；
@@ -281,17 +281,21 @@
 - 仓库原有大量未提交修改、未追踪文件、staged `out/` 删除，切勿回滚。
 - 原正式数据 `~/Library/Application Support/com.iptvmac.desktop/config-store.json` 审计确认仍有 42 条外部订阅；`127.0.0.1` 仅存在隔离测试目录。
 
-## 下一步
+## 下一步（2026-10-02 更新，已剔除过期项）
 
-1. 真机验证本轮改动：把窗口拖到 480 / 900 / 1200px 各档，确认底部导航、直播与设置页重排、详情页堆叠，以及精简模式下的边缘缩放。
-2. drpy 运行时后续：① Runtime/Context 复用（现在每次方法调用重装 cheerio+drpy2，home ≈2-5s）② `player_content`（播放链路）在 drpy 站点上的验证 ③ Cat 系（`assets://js/lib/cat.js`）支持的许可评估 ④ 用真实订阅批量回归「多少 JS 站点从报错变成可用」。
-2. 待移植（原工作区快照 `IPTV/iptv-mac-v2` 已删除，成果留在 `IPTV/port-pending/`，目录内有 README）：FongMi Decoder（`**` 图片隐写 + `2423` AES 配置，饭太硬 `in.bmp` / 南风 `XC.json` 就靠它）、DoH + TVBox UA 拉取通道（`http_get_tvbox_config`：饭太硬与王二小接口按 UA 分流，浏览器 UA 只返回导航页/「你好！」）。断点续播部分已移植完成。
-3. 为 debug 测试 bundle 使用独立 identifier 后，再做一次隔离原生 UI 验证；当前 harness 因与正式 app 共用 `com.iptvmac.desktop` 被 macOS 单实例接管。
-4. 优先按用户实际订阅验证公网持续直播、弱网切线与冷启动耗时，记录首帧与失败原因。
-5. 验证真实 30 分钟巡检和休眠唤醒；应用关闭时不会巡检。
-6. 依具体订阅需求补完整 drpy/Cat/ESM 或动态网页嗅探；JAR/CSP 当前不兼容。
-7. 历史/收藏缺订阅身份，跨源同 ID 可能混淆，另行设计兼容数据库迁移。
-8. 正式发布前处理签名、公证及发行包验收；当前交付为 debug 测试包。
+> 此前这里还写着「待移植 FongMi Decoder / DoH，成果留在 `IPTV/port-pending/`」——**那两项早已落地、port-pending 目录也已删除**，
+> 属过期待办，本次清掉。已完成的能力清单见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+
+1. **正式发布**：打 `v*` tag 让 CI 产出正式 Release（目前只有滚动的 `latest` 预发布）；
+   签名/公证需 Apple Developer 账号（`.github/workflows/build-macos.yml` 末尾列了所需 Secrets）。
+2. **Cat 系通路验证**：`assets://js/lib/cat.js` 已接通，但 15 条订阅里只有 2 个 Cat 站点且上游返回空数据，
+   需要有数据的站点来验证；同时确认 GPL-3.0 许可边界（见 README「许可」）。
+3. **drpy 运行时优化**：每次方法调用会重装 cheerio + drpy2（home ≈2-5s），可做 Runtime/Context 复用；
+   `player_content`（播放链路）还需真站验证。
+4. **历史/收藏带订阅身份**：跨订阅同 ID 会混淆，需兼容现有数据库的迁移。
+5. **长时间真机验收**：30 分钟巡检、休眠唤醒、弱网切换、冷启动耗时统计。
+6. **JAR/CSP 仍不支持**（`csp_` 前缀需 Android/JVM，站点列表已隐藏）；有需求再评估。
+7. **禁止用真实用户数据跑测试**：smoke 开关一律不得写入 `settings.json`；`IPTV_TEST_DATA_DIR` 只用于隔离验收。
 
 ## 已踩过的坑
 

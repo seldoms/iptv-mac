@@ -1,6 +1,6 @@
 {
-  "name": "mac-tv",
-  "version": "1.0.1",
+  "name": "iptv-mac",
+  "version": "1.0.2",
   "description": "macOS IPTV Player - Based on FongMi/TV",
   "type": "module",
   "scripts": {
@@ -10,7 +10,6 @@
     "build": "tauri build",
     "build:web": "vite build",
     "build:tauri": "tauri build",
-    "postinstall": "",
     "build:mac": "tauri build --bundles app,dmg",
     "build:check": "tauri build --debug --no-bundle",
     "preview": "vite preview",
@@ -45,5 +44,6 @@
     "typescript": "^5.9.3",
     "vite": "^7.3.5",
     "vitest": "^4.1.8"
-  }
+  },
+  "license": "GPL-3.0-only"
 }

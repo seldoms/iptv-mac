@@ -1,4 +1,4 @@
-# mac-tv 产品开发路线图
+# IPTV Mac 产品开发路线图
 
 ## 1. 产品方向
 
@@ -41,7 +41,7 @@ TVBox/CatVod 兼容是导入能力，不作为用户理解产品的前提。
 
 ### 已具备
 
-- Tauri 2 + Rust + React 18 桌面应用骨架（已更名为 mac-tv）。
+- Tauri 2 + Rust + React 18 桌面应用骨架（已更名为 IPTV Mac）。
 - TVBox/CatVod JSON 配置导入。
 - HTTP 类型站点浏览、搜索和详情。
 - HLS、DASH 和原生视频播放。
@@ -302,7 +302,7 @@ type PlaybackPhase =
 
 ### 开发任务
 
-- [x] 应用名称已改为 mac-tv（package.json name）。图标、签名、公证和 DMG 待完成。
+- [x] 应用名称已改为 IPTV Mac（package.json name）。图标、签名、公证和 DMG 待完成。
 - [ ] 接入自动更新，支持下载进度、稍后安装和失败回滚。
 - [ ] 实现启动异常和数据库损坏恢复界面。
 - [x] 日志脱敏已实现（redact_url / redact_bearer / redact_cookie），导出和预览功能待实现。

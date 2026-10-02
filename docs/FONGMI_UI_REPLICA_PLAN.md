@@ -1,4 +1,4 @@
-# FongMi UI Replica Plan for mac-tv
+# FongMi UI Replica Plan for IPTV Mac
 
 > 目标：在现有 Tauri + React 前端上复刻 FongMi 的页面结构、按钮入口、弹窗体系和交互语义，同时适配 macOS 桌面使用方式。不要机械照搬 Android TV/Leanback 视觉皮肤；复刻的是产品信息架构和功能入口，不是把遥控器 UI 硬贴到 Mac 上。
 
@@ -9,7 +9,7 @@
   - 移动端页面：`TV/app/src/mobile/java/com/fongmi/android/tv/ui/activity`
   - 通用播放弹窗：`TV/app/src/main/java/com/fongmi/android/tv/ui/dialog`
   - 布局 XML：`TV/app/src/leanback/res/layout`、`TV/app/src/mobile/res/layout`
-- mac-tv 当前页面：
+- IPTV Mac 当前页面：
   - `src/renderer/src/pages/Home`
   - `src/renderer/src/pages/Live`
   - `src/renderer/src/pages/Search`
@@ -21,7 +21,7 @@
 
 ## 2. 设计原则
 
-- 复刻 FongMi 的入口完整性：每个 FongMi 页面、按钮、弹窗在 mac-tv 都要有对应位置。
+- 复刻 FongMi 的入口完整性：每个 FongMi 页面、按钮、弹窗在 IPTV Mac 都要有对应位置。
 - 保留 macOS 桌面操作习惯：鼠标、触控板、键盘快捷键、侧栏、工具栏、分段控件、菜单、抽屉。
 - 不做 Android TV 大焦点卡片硬搬：遥控器焦点态改成 hover、active、selected、focus-visible。
 - 控件类型按桌面语义重映射：图标按钮用于播放工具；分段控件用于模式切换；菜单用于选项；抽屉用于复杂设置；确认弹窗用于危险操作。
@@ -29,7 +29,7 @@
 
 ## 3. 页面映射
 
-| FongMi 页面 | mac-tv 目标页面 | 复刻内容 | macOS 适配 |
+| FongMi 页面 | IPTV Mac 目标页面 | 复刻内容 | macOS 适配 |
 | --- | --- | --- | --- |
 | `HomeActivity` / `VodFragment` | Home | 壁纸/公告、站点入口、分类、推荐、继续观看、功能入口 | 左侧全局 Sidebar + 顶部站点/搜索工具栏 + 内容瀑布/分区 |
 | `VodActivity` / `TypeFragment` | Home 分类视图 | 分类列表、筛选器、分页、Vod 卡片样式 | 顶部横向分类 + 筛选抽屉 + 无限/分页加载 |
@@ -133,7 +133,7 @@
 
 ### 5.1 全局导航
 
-| FongMi 入口 | mac-tv 控件 | 行为 |
+| FongMi 入口 | IPTV Mac 控件 | 行为 |
 | --- | --- | --- |
 | 点播 | Sidebar item | 打开 Home |
 | 直播 | Sidebar item | 打开 Live |
@@ -145,7 +145,7 @@
 
 ### 5.2 首页/点播
 
-| FongMi 控件 | mac-tv 控件 | 行为 |
+| FongMi 控件 | IPTV Mac 控件 | 行为 |
 | --- | --- | --- |
 | 站点选择 | toolbar dropdown | 切换站点并刷新分类/推荐 |
 | 分类 tab | horizontal tabs | 切换 type_id |
@@ -156,7 +156,7 @@
 
 ### 5.3 详情/剧集
 
-| FongMi 控件 | mac-tv 控件 | 行为 |
+| FongMi 控件 | IPTV Mac 控件 | 行为 |
 | --- | --- | --- |
 | 播放 | primary button | 播放当前选中剧集 |
 | 收藏 | icon toggle | 收藏/取消收藏 |
@@ -168,7 +168,7 @@
 
 ### 5.4 播放器
 
-| FongMi 控件 | mac-tv 控件 | 行为 |
+| FongMi 控件 | IPTV Mac 控件 | 行为 |
 | --- | --- | --- |
 | action 播放按钮 | icon button | 播放/暂停 |
 | speed | menu | 倍速选择 |
@@ -183,7 +183,7 @@
 
 ### 5.5 直播
 
-| FongMi 控件 | mac-tv 控件 | 行为 |
+| FongMi 控件 | IPTV Mac 控件 | 行为 |
 | --- | --- | --- |
 | group list | left column tabs/list | 切换分组 |
 | channel list | virtualized list | 播放频道 |
@@ -195,7 +195,7 @@
 
 ### 5.6 设置
 
-| FongMi 设置项 | mac-tv 位置 |
+| FongMi 设置项 | IPTV Mac 位置 |
 | --- | --- |
 | Vod 配置 URL / 历史 | Settings > 配置 |
 | Live 配置 URL / 历史 | Settings > 直播源 |
@@ -257,7 +257,7 @@
 
 ### UI Phase 0：界面清单与组件基线
 
-- 建立 FongMi UI 兼容矩阵：Activity/Dialog/Layout -> mac-tv Page/Component。
+- 建立 FongMi UI 兼容矩阵：Activity/Dialog/Layout -> IPTV Mac Page/Component。
 - 定义通用组件：Toolbar、IconButton、SegmentedControl、Drawer、Modal、ContextMenu、StatusPanel、VirtualList。
 - 统一图标策略：优先 lucide-react；播放类按钮用图标，不用文字块硬凑。
 
@@ -301,7 +301,7 @@
 
 ## 10. 验收标准
 
-- 每个 FongMi Activity/Dialog 都能在 mac-tv 找到对应页面、组件或明确“不适用但有替代入口”。
+- 每个 FongMi Activity/Dialog 都能在 IPTV Mac 找到对应页面、组件或明确“不适用但有替代入口”。
 - 配置、直播、点播、搜索、详情、播放、历史、收藏、设置、本地服务入口完整。
 - 播放器按钮覆盖 FongMi 主要控制：播放、暂停、上一/下一、重播、倍速、解析、线路、字幕、弹幕、音轨、章节、全屏、PiP、诊断。
 - 直播按钮覆盖：分组、频道、线路、EPG、回看、收藏、数字选台、密码分组。

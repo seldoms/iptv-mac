@@ -13,9 +13,12 @@
 
 ## 许可提醒
 
-FongMi TV 仓库整体是 **GPL-3.0**。上表前三个文件本身是 MIT 的第三方库（cheerio / crypto-js）；
-`gbk.js`、`http.js`、`cat.js` 是 FongMi 自带的。若本项目将来要对外分发或闭源发布，需要复核这几个文件的许可与署名，
-必要时自行按 MIT 版本的 cheerio/crypto-js 重新构建适配 QuickJS 的产物。
+FongMi TV 仓库整体是 **GPL-3.0**。上表前两个文件本身是 MIT 的第三方库（cheerio / crypto-js）；
+`gbk.js`、`http.js`、`cat.js` 是 FongMi 自带的。
+
+**本项目因此整体以 GPL-3.0 发布**（见仓库根 `LICENSE`）：`cat.js` 与 `gbk.js` 会被 `include_str!` 编进二进制随包分发，
+属于"内嵌 GPL 代码的组合作品"。若要以宽松许可（如 MIT）发布，必须先移除这两个文件，
+代价是 Cat 系站点与 GBK 解码不可用。
 
 ## Cat 系（`cat.js`）现状
 
