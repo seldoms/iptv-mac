@@ -35,6 +35,11 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
+      # tauri.conf.json 把 binaries/ffmpeg 声明为打包资源，而它体积大、被 .gitignore 排除。
+      # 不先取回来，tauri-build 会直接报 "resource path `binaries/ffmpeg` doesn't exist"。
+      - name: 获取内置 ffmpeg
+        run: bash scripts/fetch-ffmpeg.sh
+
       - name: 类型检查与前端测试
         run: npm run typecheck && npm test
 
