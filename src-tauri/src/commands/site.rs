@@ -5,8 +5,16 @@ use serde_json::{json, Value};
 use tauri::State;
 
 use crate::error::AppError;
+use crate::js_spider::JsSpider;
+use crate::site_filter::{is_hidden_site, is_http_api_site, is_searchable_site, site_key, site_name_or, site_type};
 use crate::spider::{HttpSpider, SiteConfig};
 use crate::AppState;
+
+/// 蜘蛛枚举 — 统一 HttpSpider（type 0/1/4）和 JsSpider（type 3）
+enum Spider {
+    Http(HttpSpider),
+    Js(JsSpider),
+}
 
 const MAX_ACROSS_SITE_SEARCH_SITES: usize = 24;
 const DEFAULT_ACROSS_SITE_TIMEOUT_MS: u64 = 8_000;
@@ -55,43 +63,6 @@ async fn load_current_config_async(
     Ok((config_url, config))
 }
 
-fn site_type(site: &Value) -> i64 {
-    site.get("type").and_then(Value::as_i64).unwrap_or(1)
-}
-
-fn is_hidden_site(site: &Value) -> bool {
-    site.get("hide").and_then(Value::as_i64) == Some(1)
-}
-
-fn is_http_api_site(site: &Value) -> bool {
-    matches!(site_type(site), 0 | 1 | 4)
-}
-
-fn is_searchable_site(site: &Value) -> bool {
-    is_http_api_site(site)
-        && !is_hidden_site(site)
-        && site.get("searchable").and_then(Value::as_i64) != Some(0)
-        && site
-            .get("api")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|api| !api.is_empty())
-}
-
-fn site_key(site: &Value) -> Option<&str> {
-    site.get("key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-}
-
-fn site_name<'a>(site: &'a Value, fallback: &'a str) -> &'a str {
-    site.get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(fallback)
-}
 
 fn spider_from_site(config_url: &str, site: &Value) -> Result<HttpSpider, AppError> {
     let key = site_key(site).ok_or_else(|| AppError::invalid_input("站点缺少 key"))?;
@@ -104,7 +75,7 @@ fn spider_from_site(config_url: &str, site: &Value) -> Result<HttpSpider, AppErr
 
     Ok(HttpSpider::new(SiteConfig {
         key: key.to_string(),
-        name: site_name(site, key).to_string(),
+        name: site_name_or(site, key).to_string(),
         site_type: site_type(site),
         api: crate::config::resolve_relative_url(config_url, api),
         ext: site.get("ext").cloned(),
@@ -139,26 +110,161 @@ fn create_spider(state: &State<'_, AppState>, site_key: &str) -> Result<HttpSpid
     spider_from_site(&config_url, site_entry)
 }
 
-fn block_on<F, T>(fut: F) -> Result<T, AppError>
-where
-    F: std::future::Future<Output = Result<T, AppError>>,
-{
-    crate::block_on(fut)
+/// 创建蜘蛛实例（async 版本，自动选择 HttpSpider / JsSpider）
+async fn create_spider_async(
+    state: &State<'_, AppState>,
+    site_key: &str,
+) -> Result<Spider, AppError> {
+    let (config_url, config) = load_current_config_async(state).await?;
+
+    let sites = match config.get("sites").and_then(Value::as_array) {
+        Some(s) => s,
+        None => return Err(AppError::not_found("配置中无站点")),
+    };
+
+    let site_entry = match sites
+        .iter()
+        .find(|s| s.get("key").and_then(Value::as_str) == Some(site_key))
+    {
+        Some(s) => s,
+        None => return Err(AppError::not_found(format!("站点不存在: {}", site_key))),
+    };
+
+    let site_type = site_entry.get("type").and_then(Value::as_i64).unwrap_or(1);
+    let api = site_entry.get("api").and_then(Value::as_str).unwrap_or("");
+
+    let name = site_name_or(site_entry, site_key);
+
+    // Type 0/1/4 → HttpSpider
+    if site_type == 0 || site_type == 1 || site_type == 4 {
+        return Ok(Spider::Http(spider_from_site(&config_url, site_entry)?));
+    }
+
+    // Type=3: api 含 .js → JsSpider（QuickJS）
+    if api.contains(".js") || api.contains(".mjs") {
+        let ext = site_entry.get("ext").and_then(Value::as_str);
+        eprintln!("[spider] JS 蜘蛛: key={}, api={}", site_key, api);
+        let api = crate::config::resolve_relative_url(&config_url, api);
+        let ext = ext.map(|value| {
+            if value.starts_with("./") || value.starts_with("../") || value.starts_with('/') {
+                crate::config::resolve_relative_url(&config_url, value)
+            } else {
+                value.to_string()
+            }
+        });
+        let js_spider = JsSpider::new(&api, ext.as_deref()).await?;
+        return Ok(Spider::Js(js_spider));
+    }
+
+    // Type=3: api 是 csp_（Java JAR）→ 不支持
+    if api.starts_with("csp_") {
+        return Err(AppError::not_found(format!(
+            "站点「{}」使用 Android JAR 爬虫（csp_），macOS 暂不支持 Java 执行环境",
+            name
+        )));
+    }
+
+    // Type=3: api 是 .py（Python）→ 不支持
+    if api.ends_with(".py") || api.contains(".py") {
+        return Err(AppError::not_found(format!(
+            "站点「{}」使用 Python 爬虫（.py），macOS 平台暂不支持 Python 执行环境",
+            name
+        )));
+    }
+
+    if site_type == 3 {
+        return Err(AppError::not_found(format!(
+            "站点「{}」使用脚本爬虫（type 3），当前平台暂不支持",
+            name
+        )));
+    }
+
+    // 其他 → 尝试 HttpSpider
+    eprintln!("[spider] 尝试 HTTP 请求: key={}, api={}", site_key, api);
+    Ok(Spider::Http(spider_from_site(&config_url, site_entry)?))
 }
 
-/// site:homeContent
+impl Spider {
+    async fn home_content(&self, filter: bool) -> Result<Value, AppError> {
+        match self {
+            Spider::Http(h) => h.home_content(filter).await.map(|r| json!(r)),
+            Spider::Js(j) => j.home_content(filter).await,
+        }
+    }
+
+    async fn category_content(
+        &self,
+        tid: &str,
+        pg: &str,
+        filter: bool,
+        extend: &HashMap<String, String>,
+    ) -> Result<Value, AppError> {
+        match self {
+            Spider::Http(h) => h
+                .category_content(tid, pg, filter, extend)
+                .await
+                .map(|r| json!(r)),
+            Spider::Js(j) => j.category_content(tid, pg, filter, extend).await,
+        }
+    }
+
+    async fn detail_content(&self, ids: &[String]) -> Result<Value, AppError> {
+        match self {
+            Spider::Http(h) => h.detail_content(ids).await.map(|r| json!(r)),
+            Spider::Js(j) => j.detail_content(ids).await,
+        }
+    }
+
+    async fn search_content(
+        &self,
+        keyword: &str,
+        quick: bool,
+        pg: Option<&str>,
+    ) -> Result<Value, AppError> {
+        match self {
+            Spider::Http(h) => h.search_content(keyword, quick, pg).await.map(|r| json!(r)),
+            Spider::Js(j) => j.search_content(keyword, quick, pg).await,
+        }
+    }
+
+    async fn player_content(
+        &self,
+        flag: &str,
+        id: &str,
+        vip_flags: &[String],
+    ) -> Result<Value, AppError> {
+        match self {
+            Spider::Http(h) => h
+                .player_content(flag, id, vip_flags)
+                .await
+                .map(|r| json!(r)),
+            Spider::Js(j) => j.player_content(flag, id, vip_flags).await,
+        }
+    }
+}
+
+/// site:homeContent（异步版本，不阻塞主线程）
+pub async fn handle_site_home_content_async(
+    state: &State<'_, AppState>,
+    site_key: String,
+    filter: bool,
+) -> Result<Value, AppError> {
+    let spider = create_spider_async(state, &site_key).await?;
+    let result = spider.home_content(filter).await?;
+    Ok(serde_json::json!({ "success": true, "data": result }))
+}
+
+/// site:homeContent（同步版本，阻塞主线程 — 保留向后兼容）
 pub fn handle_site_home_content(
     state: &State<'_, AppState>,
     site_key: String,
     filter: bool,
 ) -> Result<Value, AppError> {
-    let spider = create_spider(state, &site_key)?;
-    let result = block_on(spider.home_content(filter))?;
-    Ok(serde_json::json!({ "success": true, "data": result }))
+    crate::block_on(handle_site_home_content_async(state, site_key, filter))
 }
 
-/// site:categoryContent
-pub fn handle_site_category_content(
+/// site:categoryContent（异步版本）
+pub async fn handle_site_category_content_async(
     state: &State<'_, AppState>,
     site_key: String,
     tid: String,
@@ -166,7 +272,7 @@ pub fn handle_site_category_content(
     filter: bool,
     extend: Value,
 ) -> Result<Value, AppError> {
-    let spider = create_spider(state, &site_key)?;
+    let spider = create_spider_async(state, &site_key).await?;
     let extend_map: HashMap<String, String> = extend
         .as_object()
         .map(|obj| {
@@ -175,22 +281,75 @@ pub fn handle_site_category_content(
                 .collect()
         })
         .unwrap_or_default();
-    let result = block_on(spider.category_content(&tid, &pg, filter, &extend_map))?;
+    let result = spider
+        .category_content(&tid, &pg, filter, &extend_map)
+        .await?;
     Ok(serde_json::json!({ "success": true, "data": result }))
 }
 
-/// site:detailContent
+/// site:detailContent（异步版本）
+pub async fn handle_site_detail_content_async(
+    state: &State<'_, AppState>,
+    site_key: String,
+    ids: Vec<String>,
+) -> Result<Value, AppError> {
+    let spider = create_spider_async(state, &site_key).await?;
+    let result = spider.detail_content(&ids).await?;
+    Ok(serde_json::json!({ "success": true, "data": result }))
+}
+
+/// site:searchContent（异步版本）
+pub async fn handle_site_search_content_async(
+    state: &State<'_, AppState>,
+    site_key: String,
+    keyword: String,
+    quick: bool,
+    pg: Option<String>,
+) -> Result<Value, AppError> {
+    let spider = create_spider_async(state, &site_key).await?;
+    let result = spider
+        .search_content(&keyword, quick, pg.as_deref())
+        .await?;
+    Ok(serde_json::json!({ "success": true, "data": result }))
+}
+
+/// site:playerContent（异步版本）
+pub async fn handle_site_player_content_async(
+    state: &State<'_, AppState>,
+    site_key: String,
+    flag: String,
+    id: String,
+    vip_flags: Vec<String>,
+) -> Result<Value, AppError> {
+    let spider = create_spider_async(state, &site_key).await?;
+    let result = spider.player_content(&flag, &id, &vip_flags).await?;
+    Ok(serde_json::json!({ "success": true, "data": result }))
+}
+
+/// site:categoryContent（同步版本）
+pub fn handle_site_category_content(
+    state: &State<'_, AppState>,
+    site_key: String,
+    tid: String,
+    pg: String,
+    filter: bool,
+    extend: Value,
+) -> Result<Value, AppError> {
+    crate::block_on(handle_site_category_content_async(
+        state, site_key, tid, pg, filter, extend,
+    ))
+}
+
+/// site:detailContent（同步版本）
 pub fn handle_site_detail_content(
     state: &State<'_, AppState>,
     site_key: String,
     ids: Vec<String>,
 ) -> Result<Value, AppError> {
-    let spider = create_spider(state, &site_key)?;
-    let result = block_on(spider.detail_content(&ids))?;
-    Ok(serde_json::json!({ "success": true, "data": result }))
+    crate::block_on(handle_site_detail_content_async(state, site_key, ids))
 }
 
-/// site:searchContent
+/// site:searchContent（同步版本）
 pub fn handle_site_search_content(
     state: &State<'_, AppState>,
     site_key: String,
@@ -198,12 +357,12 @@ pub fn handle_site_search_content(
     quick: bool,
     pg: Option<String>,
 ) -> Result<Value, AppError> {
-    let spider = create_spider(state, &site_key)?;
-    let result = block_on(spider.search_content(&keyword, quick, pg.as_deref()))?;
-    Ok(serde_json::json!({ "success": true, "data": result }))
+    crate::block_on(handle_site_search_content_async(
+        state, site_key, keyword, quick, pg,
+    ))
 }
 
-/// site:playerContent
+/// site:playerContent（同步版本）
 pub fn handle_site_player_content(
     state: &State<'_, AppState>,
     site_key: String,
@@ -211,9 +370,9 @@ pub fn handle_site_player_content(
     id: String,
     vip_flags: Vec<String>,
 ) -> Result<Value, AppError> {
-    let spider = create_spider(state, &site_key)?;
-    let result = block_on(spider.player_content(&flag, &id, &vip_flags))?;
-    Ok(serde_json::json!({ "success": true, "data": result }))
+    crate::block_on(handle_site_player_content_async(
+        state, site_key, flag, id, vip_flags,
+    ))
 }
 
 /// site:probe
@@ -221,7 +380,6 @@ pub fn handle_site_probe(
     state: &State<'_, AppState>,
     site_keys: Vec<String>,
 ) -> Result<Value, AppError> {
-
     for site_key in &site_keys {
         let spider = match create_spider(state, site_key) {
             Ok(s) => s,
@@ -252,6 +410,13 @@ pub fn handle_site_super_parse(
     state: &State<'_, AppState>,
     params: Value,
 ) -> Result<Value, AppError> {
+    crate::block_on(handle_site_super_parse_async(state, params))
+}
+
+pub async fn handle_site_super_parse_async(
+    state: &State<'_, AppState>,
+    params: Value,
+) -> Result<Value, AppError> {
     let url = params
         .get("url")
         .and_then(Value::as_str)
@@ -268,20 +433,15 @@ pub fn handle_site_super_parse(
         .unwrap_or_default();
     let player_result = params.get("playerResult");
 
-    let (_, config) = load_current_config(state)?;
+    let (_, config) = load_current_config_async(state).await?;
     let parses = config
         .get("parses")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
 
-    let result = block_on(crate::super_parse::super_parse(
-        url,
-        flag,
-        site_key,
-        player_result,
-        Some(&parses),
-    ))?;
+    let result =
+        crate::super_parse::super_parse(url, flag, site_key, player_result, Some(&parses)).await?;
 
     match result {
         Some(data) => Ok(json!({ "success": true, "data": data })),
@@ -338,7 +498,7 @@ pub async fn handle_site_find_across_sites_async(
         if key == exclude_site_key {
             continue;
         }
-        let name = site_name(site, key).to_string();
+        let name = site_name_or(site, key).to_string();
         let spider = match spider_from_site(&config_url, site) {
             Ok(spider) => spider,
             Err(_) => continue,

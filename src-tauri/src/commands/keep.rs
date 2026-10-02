@@ -11,14 +11,26 @@ pub fn handle_keep_add(state: &State<'_, AppState>, item: &Value) -> Result<Valu
 }
 
 /// 获取收藏列表
-pub fn handle_keep_list(state: &State<'_, AppState>, limit: Option<i64>, offset: Option<i64>) -> Result<Value, AppError> {
+pub fn handle_keep_list(
+    state: &State<'_, AppState>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Value, AppError> {
     let limit = limit.unwrap_or(50);
     let offset = offset.unwrap_or(0);
-    state.database.lock().keep_list(limit, offset).map_err(|e| AppError::database_error(e))
+    state
+        .database
+        .lock()
+        .keep_list(limit, offset)
+        .map_err(|e| AppError::database_error(e))
 }
 
 /// 删除收藏
-pub fn handle_keep_delete(state: &State<'_, AppState>, site_key: String, vod_id: String) -> Result<Value, AppError> {
+pub fn handle_keep_delete(
+    state: &State<'_, AppState>,
+    site_key: String,
+    vod_id: String,
+) -> Result<Value, AppError> {
     state.database.lock().delete_keep(&site_key, &vod_id)?;
     Ok(serde_json::json!({ "success": true }))
 }

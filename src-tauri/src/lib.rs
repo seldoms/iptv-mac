@@ -1,13 +1,20 @@
 mod commands;
 mod config;
 mod database;
+mod decoder;
 mod epg;
 mod error;
 mod hls;
+mod js_module;
+mod js_runtime;
+mod js_session;
+mod js_spider;
 mod live;
 mod local_proxy;
 mod logging;
 mod network;
+mod site_filter;
+mod url_util;
 mod path_safety;
 mod spider;
 mod super_parse;
@@ -24,9 +31,8 @@ use error::AppError;
 
 /// 全局共享的 Tokio 运行时，避免每个同步命令重复创建。
 /// 用 LazyLock 延迟初始化，仅创建一次。
-static SHARED_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Runtime::new().expect("初始化 Tokio 运行时失败")
-});
+static SHARED_RUNTIME: LazyLock<tokio::runtime::Runtime> =
+    LazyLock::new(|| tokio::runtime::Runtime::new().expect("初始化 Tokio 运行时失败"));
 
 /// 在共享运行时上同步阻塞异步任务。
 /// 用于 Tauri 同步 command 中需要调用 async 函数的场景。
@@ -43,6 +49,7 @@ const DEFAULT_ALPHA_PLAYBACK_SMOKE_MEDIA_URL: &str =
     "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
 
 pub struct AppState {
+    pub config_load_revision: std::sync::atomic::AtomicU64,
     pub database: Mutex<Database>,
     pub config_manager: Mutex<config::ConfigManager>,
     pub current_config: Mutex<Option<(String, Value)>>,
@@ -130,6 +137,27 @@ fn inject_alpha_playback_smoke_settings(settings: &mut Map<String, Value>) {
     settings.remove("__alphaPlaybackSmokeResult");
 }
 
+/// 播放连续性 smoke：验证全屏/小窗切换不会打断播放（只换布局、不重建播放器）。
+/// 由 `IPTV_CONTINUITY_SMOKE=1` 开启，配合 `IPTV_ALPHA_PLAYBACK_SMOKE=1` 提供播放源。
+fn inject_continuity_smoke_settings(settings: &mut Map<String, Value>) {
+    if std::env::var("IPTV_CONTINUITY_SMOKE").ok().as_deref() != Some("1") {
+        return;
+    }
+    let settle_ms = std::env::var("IPTV_CONTINUITY_SMOKE_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(6_000);
+    let hold_ms = std::env::var("IPTV_CONTINUITY_SMOKE_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    settings.insert(
+        "__continuitySmoke".to_string(),
+        json!({ "enabled": true, "settleMs": settle_ms, "holdMs": hold_ms }),
+    );
+    settings.remove("__continuitySmokeResult");
+}
+
 fn inject_beta_continue_smoke_settings(settings: &mut Map<String, Value>) {
     if std::env::var("IPTV_BETA_CONTINUE_SMOKE").ok().as_deref() != Some("1") {
         return;
@@ -190,6 +218,8 @@ pub fn build_live_tree(channels: Vec<Value>) -> Value {
             "category": ch["category"],
             "sortOrder": ch["sort_order"],
             "originalGroups": ch["original_groups"]
+            , "urlHeaders": ch["urlHeaders"]
+            , "lines": ch["lines"]
         }));
     }
 
@@ -369,6 +399,28 @@ fn invoke_ipc(
             Ok(json!({ "success": true }))
         }
 
+        // 前端日志桥：WebView 里的报错/告警转发到进程 stderr，
+        // 否则 console.error 只在 WebView 里，排查时完全看不到（应用日志只有 Rust 侧）。
+        "log:frontend" => {
+            let level = arg(&args, 0, "level")
+                .ok()
+                .and_then(|value| value.as_str())
+                .unwrap_or("error");
+            let message = arg(&args, 1, "message")
+                .ok()
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let detail = arg(&args, 2, "detail")
+                .ok()
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            eprintln!(
+                "[renderer/{level}] {message}{}",
+                if detail.is_empty() { String::new() } else { format!(" | {detail}") }
+            );
+            Ok(json!({ "success": true }))
+        }
+
         // Window
         "window:savePlayerState" => {
             let player_state = arg(&args, 0, "state")?.clone();
@@ -397,6 +449,12 @@ fn invoke_ipc(
             )))
         }
         "window:exitMiniMode" => Ok(to_json_result(commands::handle_window_exit_mini_mode(&app))),
+        "window:applyMode" => {
+            let mini = arg(&args, 0, "mini")?
+                .as_bool()
+                .ok_or_else(|| "invalid argument: mini".to_string())?;
+            Ok(to_json_result(commands::handle_window_apply_mode(&app, mini)))
+        }
 
         // Live
         "live:load" => {
@@ -427,6 +485,22 @@ fn invoke_ipc(
         "live:getChannelTree" => Ok(to_json_result(commands::handle_live_get_channel_tree(
             &state,
         ))),
+        "live:reportLineResult" => {
+            let urls = arg(&args, 0, "urls")?
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let alive = arg(&args, 1, "alive")?.as_bool().unwrap_or(false);
+            let latency_ms = arg(&args, 2, "latencyMs").ok().and_then(Value::as_i64);
+            Ok(to_json_result(commands::handle_live_report_line_result(
+                &state, urls, alive, latency_ms,
+            )))
+        }
         "live:getRefreshStatus" => Ok(to_json_result(commands::handle_live_get_refresh_status(
             &state,
         ))),
@@ -547,8 +621,97 @@ fn invoke_ipc(
 // ==================== 强类型 Tauri command（供前端直接调用） ====================
 
 #[tauri::command]
+async fn cmd_config_load(state: State<'_, AppState>, url: String) -> Result<Value, String> {
+    commands::handle_config_load_async(&state, url, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_site_home_content(
+    state: State<'_, AppState>,
+    site_key: String,
+    filter: bool,
+) -> Result<Value, String> {
+    commands::handle_site_home_content_async(&state, site_key, filter)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_site_category_content(
+    state: State<'_, AppState>,
+    site_key: String,
+    tid: String,
+    pg: String,
+    filter: bool,
+    extend: Value,
+) -> Result<Value, String> {
+    commands::handle_site_category_content_async(&state, site_key, tid, pg, filter, extend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_site_detail_content(
+    state: State<'_, AppState>,
+    site_key: String,
+    ids: Vec<String>,
+) -> Result<Value, String> {
+    commands::handle_site_detail_content_async(&state, site_key, ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_site_search_content(
+    state: State<'_, AppState>,
+    site_key: String,
+    key: String,
+    quick: bool,
+    pg: Option<String>,
+) -> Result<Value, String> {
+    commands::handle_site_search_content_async(&state, site_key, key, quick, pg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn cmd_history_add(state: State<'_, AppState>, item: Value) -> Result<Value, String> {
     commands::handle_history_add(&state, &item).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_config_peek_lives(state: State<'_, AppState>, url: String) -> Result<Value, String> {
+    let config = config::load_config_from_url(&url, Some(&state.data_dir))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut lives = config
+        .get("lives")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for live in &mut lives {
+        if let Some(source_url) = live.get("url").and_then(Value::as_str) {
+            live["url"] = Value::String(config::resolve_relative_url(&url, source_url));
+        }
+    }
+    Ok(json!({"success": true, "data": lives}))
+}
+
+#[tauri::command]
+fn cmd_config_save(state: State<'_, AppState>, url: String) -> Result<Value, String> {
+    let url = url.trim();
+    let parsed = url::Url::parse(url).map_err(|_| "订阅地址格式无效")?;
+    if !matches!(parsed.scheme(), "http" | "https" | "file") {
+        return Err("订阅地址仅支持 HTTP、HTTPS 或本地文件".into());
+    }
+    let mut manager = state.config_manager.lock();
+    if !manager.list().iter().any(|item| item.url == url) {
+        manager.add(url, url).map_err(|e| e.to_string())?;
+    }
+    commands::request_live_refresh();
+    Ok(json!({"success": true}))
 }
 
 #[tauri::command]
@@ -634,43 +797,23 @@ async fn cmd_live_epg(epg_url: String, channel_map: Option<Value>) -> Result<Val
 }
 
 #[tauri::command]
-fn cmd_live_get_channel_tree(state: State<'_, AppState>) -> Result<Value, String> {
-    commands::handle_live_get_channel_tree(&state).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn cmd_live_get_refresh_status(state: State<'_, AppState>) -> Result<Value, String> {
-    commands::handle_live_get_refresh_status(&state).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn cmd_live_set_refresh_interval(
-    state: State<'_, AppState>,
-    minutes: i64,
-) -> Result<Value, String> {
-    commands::handle_live_set_refresh_interval(&state, minutes).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn cmd_live_refresh(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<Value, String> {
-    commands::handle_live_refresh(&state, Some(&app)).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn cmd_site_player_content(
+async fn cmd_site_player_content(
     state: State<'_, AppState>,
     site_key: String,
     flag: String,
     id: String,
     vip_flags: Vec<String>,
 ) -> Result<Value, String> {
-    commands::handle_site_player_content(&state, site_key, flag, id, vip_flags)
+    commands::handle_site_player_content_async(&state, site_key, flag, id, vip_flags)
+        .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn cmd_site_super_parse(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
-    commands::handle_site_super_parse(&state, params).map_err(|e| e.to_string())
+async fn cmd_site_super_parse(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    commands::handle_site_super_parse_async(&state, params)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -710,6 +853,11 @@ fn cmd_window_enter_mini_mode(app: tauri::AppHandle) -> Result<Value, String> {
 #[tauri::command]
 fn cmd_window_exit_mini_mode(app: tauri::AppHandle) -> Result<Value, String> {
     commands::handle_window_exit_mini_mode(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_window_apply_mode(app: tauri::AppHandle, mini: bool) -> Result<Value, String> {
+    commands::handle_window_apply_mode(&app, mini).map_err(|e| e.to_string())
 }
 
 // ==================== Tests ====================
@@ -780,6 +928,7 @@ mod tests {
         settings_map.insert("theme".to_string(), Value::String("dark".to_string()));
 
         let state = AppState {
+            config_load_revision: std::sync::atomic::AtomicU64::new(0),
             database: Mutex::new(Database::open(":memory:".into()).unwrap()),
             config_manager: Mutex::new(config::ConfigManager::new(dir.clone())),
             current_config: Mutex::new(None),
@@ -814,14 +963,27 @@ pub fn run() {
             let data_dir = debug_data_dir_override().unwrap_or(app.path().app_data_dir()?);
             fs::create_dir_all(&data_dir)?;
             let settings_path = data_dir.join("settings.json");
-            let database =
+            let mut database =
                 Database::open(data_dir.join("iptv.db")).map_err(std::io::Error::other)?;
+            // 上次退出时若巡检没跑完（崩溃/被杀），状态会永远停在 refreshing，
+            // 于是列表既不重测也不刷新。启动时没有任何巡检在跑，直接复位成 idle。
+            if database
+                .get_refresh_status()
+                .ok()
+                .and_then(|status| status.get("status").and_then(|v| v.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("refreshing")
+            {
+                let _ = database.update_refresh_status(&serde_json::json!({ "status": "idle" }));
+            }
             let local_proxy = local_proxy::start_local_proxy().map_err(std::io::Error::other)?;
             let mut settings = load_settings(&settings_path);
             inject_alpha_playback_smoke_settings(&mut settings);
             inject_beta_continue_smoke_settings(&mut settings);
+            inject_continuity_smoke_settings(&mut settings);
 
             app.manage(AppState {
+                config_load_revision: std::sync::atomic::AtomicU64::new(0),
                 database: Mutex::new(database),
                 config_manager: Mutex::new(config::ConfigManager::new(data_dir.clone())),
                 current_config: Mutex::new(None),
@@ -831,11 +993,19 @@ pub fn run() {
                 local_proxy,
                 data_dir,
             });
+            commands::start_live_refresh_scheduler(app.handle().clone());
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             invoke_ipc,
+            cmd_config_load,
+            cmd_config_peek_lives,
+            cmd_config_save,
+            cmd_site_home_content,
+            cmd_site_category_content,
+            cmd_site_detail_content,
+            cmd_site_search_content,
             cmd_history_add,
             cmd_history_list,
             cmd_history_delete,
@@ -848,10 +1018,6 @@ pub fn run() {
             cmd_live_load,
             cmd_live_load_by_url,
             cmd_live_epg,
-            cmd_live_get_channel_tree,
-            cmd_live_get_refresh_status,
-            cmd_live_set_refresh_interval,
-            cmd_live_refresh,
             cmd_site_player_content,
             cmd_site_super_parse,
             cmd_site_find_across_sites,
@@ -860,6 +1026,15 @@ pub fn run() {
             cmd_window_get_player_state,
             cmd_window_enter_mini_mode,
             cmd_window_exit_mini_mode,
+            cmd_window_apply_mode,
+            commands::cmd_download_tools,
+            commands::cmd_download_start,
+            commands::cmd_download_cancel,
+            commands::cmd_download_list,
+            commands::cmd_download_remove,
+            commands::cmd_download_clear_finished,
+            commands::cmd_download_reveal,
+            commands::cmd_download_open_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running IPTV Mac");

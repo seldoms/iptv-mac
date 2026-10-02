@@ -236,15 +236,21 @@ fn proxy_media(
     let rt = proxy_runtime()?;
     rt.block_on(async move {
         let client = proxy_client()?;
+        // HLS 清单必须整份获取：播放器（AVPlayer/Chromium）会先发 `Range: bytes=0-1` 探测，
+        // 若把这个 Range 转发给清单地址，上游只会返回 2 字节的 206 片段，
+        // 而我们随后会把它当作完整清单重写，得到一份残缺 m3u8——拖动进度条重新探测清单时就再也播不出来。
+        let looks_like_playlist = is_playlist_url(url);
         let mut request = client.get(url);
         for (key, value) in headers {
             request = request.header(key, value);
         }
-        if let Some(range) = request_headers.get("range") {
-            request = request.header(reqwest::header::RANGE, range);
-        }
-        if let Some(if_range) = request_headers.get("if-range") {
-            request = request.header(reqwest::header::IF_RANGE, if_range);
+        if !looks_like_playlist {
+            if let Some(range) = request_headers.get("range") {
+                request = request.header(reqwest::header::RANGE, range);
+            }
+            if let Some(if_range) = request_headers.get("if-range") {
+                request = request.header(reqwest::header::IF_RANGE, if_range);
+            }
         }
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
@@ -283,13 +289,14 @@ fn proxy_media(
             || content_type.contains("mpegurl")
             || content_type.contains("vnd.apple");
         if is_hls_playlist {
+            let playlist_url = response.url().to_string();
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|error| error.to_string())?
                 .to_vec();
             let text = String::from_utf8_lossy(&bytes);
-            let body = rewrite_hls_playlist(&text, url, |item_url| {
+            let body = rewrite_hls_playlist(&text, &playlist_url, |item_url| {
                 register_proxy_item(info, item_url, headers)
             })
             .into_bytes();
@@ -343,6 +350,14 @@ fn parse_request_headers(request: &str) -> HashMap<String, String> {
             Some((key.trim().to_ascii_lowercase(), value.trim().to_string()))
         })
         .collect()
+}
+
+/// 是否需要整份获取的 HLS 清单地址。
+/// 清单不接受 Range 转发：播放器的 `Range: bytes=0-1` 探测会让上游只返回 2 字节片段，
+/// 而重写清单需要完整文本。
+fn is_playlist_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains(".m3u8") || lower.contains("mpegurl")
 }
 
 fn is_allowed_media_url(url: &str) -> bool {
@@ -547,7 +562,7 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_media_url, parse_query, parse_request_headers};
+    use super::{is_allowed_media_url, is_playlist_url, parse_query, parse_request_headers};
 
     #[test]
     fn parses_query_values() {
@@ -581,6 +596,17 @@ mod tests {
         assert!(!is_allowed_media_url("http://0.0.0.0"));
         assert!(!is_allowed_media_url("http://100.64.0.1"));
         assert!(!is_allowed_media_url("http://198.18.0.1"));
+    }
+
+    #[test]
+    fn detects_playlist_urls_for_full_fetch() {
+        assert!(is_playlist_url("https://cdn.example/a/index.m3u8"));
+        assert!(is_playlist_url("https://cdn.example/a/index.M3U8?token=1"));
+        assert!(is_playlist_url(
+            "http://127.0.0.1:1/stream?url=https%3A%2F%2Fcdn.example%2Flive%2Fx.m3u8"
+        ));
+        assert!(!is_playlist_url("https://cdn.example/a/seg-1.ts"));
+        assert!(!is_playlist_url("https://cdn.example/a/movie.mp4"));
     }
 
     #[test]

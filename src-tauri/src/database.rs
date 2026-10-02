@@ -65,7 +65,7 @@ const MIGRATIONS: &[Migration] = &[
               country TEXT NOT NULL,
               category TEXT NOT NULL,
               sort_order REAL DEFAULT 0,
-              latency INTEGER DEFAULT -1,
+              latency INTEGER DEFAULT -2,
               original_groups TEXT,
               last_test_time INTEGER NOT NULL,
               is_alive INTEGER DEFAULT 1,
@@ -139,9 +139,7 @@ impl Database {
     fn try_open(path: &PathBuf) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|error| error.to_string())?;
         connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;",
-            )
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
             .map_err(|error| error.to_string())?;
 
         let current_version: i64 = connection
@@ -372,7 +370,8 @@ impl Database {
     pub fn save_live_channels(&mut self, channels: &[Value]) -> Result<(), String> {
         let now = now();
 
-        let tx = self.connection
+        let tx = self
+            .connection
             .transaction()
             .map_err(|error| error.to_string())?;
 
@@ -433,7 +432,10 @@ impl Database {
         let sql = "SELECT id, name, urls, best_url, country, category, sort_order, latency, original_groups, last_test_time, is_alive
                    FROM live_channels WHERE is_alive = 1
                    ORDER BY country, category, sort_order, name";
-        let mut stmt = self.connection.prepare(sql).map_err(|error| error.to_string())?;
+        let mut stmt = self
+            .connection
+            .prepare(sql)
+            .map_err(|error| error.to_string())?;
         let rows = stmt
             .query_map([], live_channel_row)
             .map_err(|error| error.to_string())?;
@@ -754,19 +756,17 @@ mod tests {
     #[test]
     fn live_channels_dead_channel_excluded() {
         let mut db = database();
-        let channels = vec![
-            json!({
-                "name": "Dead Channel",
-                "urls": [],
-                "bestUrl": "",
-                "country": "Test",
-                "category": "Test",
-                "sortOrder": 0.0,
-                "latency": -1,
-                "originalGroups": [],
-                "isAlive": 0
-            }),
-        ];
+        let channels = vec![json!({
+            "name": "Dead Channel",
+            "urls": [],
+            "bestUrl": "",
+            "country": "Test",
+            "category": "Test",
+            "sortOrder": 0.0,
+            "latency": -1,
+            "originalGroups": [],
+            "isAlive": 0
+        })];
 
         db.save_live_channels(&channels).unwrap();
         let tree = db.get_live_tree().unwrap();
@@ -891,7 +891,7 @@ mod tests {
               country TEXT NOT NULL,
               category TEXT NOT NULL,
               sort_order REAL DEFAULT 0,
-              latency INTEGER DEFAULT -1,
+              latency INTEGER DEFAULT -2,
               original_groups TEXT,
               last_test_time INTEGER NOT NULL,
               is_alive INTEGER DEFAULT 1,

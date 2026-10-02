@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,6 +81,10 @@ struct Directives {
 pub fn parse_live_content(content: &str) -> Vec<Group> {
     let trimmed = content.trim();
 
+    if looks_like_html_document(trimmed) {
+        return vec![];
+    }
+
     if trimmed.starts_with('[') {
         return parse_json_format(trimmed);
     }
@@ -89,6 +94,18 @@ pub fn parse_live_content(content: &str) -> Vec<Group> {
     }
 
     parse_txt_format(trimmed)
+}
+
+fn looks_like_html_document(content: &str) -> bool {
+    let lower = content
+        .chars()
+        .take(1024)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.contains("<head")
+        || lower.contains("<body")
 }
 
 // ==================== TXT 格式 ====================
@@ -884,91 +901,144 @@ pub struct TestResult {
     pub error: Option<String>,
 }
 
-const GET_PREFERRED_EXTENSIONS: &[&str] = &["m3u8", "m3u", "mpd", "xml", "json", "txt"];
+const MAX_PROBE_BYTES: usize = 64 * 1024;
+static PROBE_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 
-fn should_prefer_get(url: &str) -> bool {
-    let path = url.split('?').next().unwrap_or(url);
-    GET_PREFERRED_EXTENSIONS
-        .iter()
-        .any(|ext| path.ends_with(ext))
+fn is_media_sample(bytes: &[u8], content_type: &str) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    if looks_like_html_document(trimmed) || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return false;
+    }
+    if bytes.len() >= 12
+        && (matches!(&bytes[4..8], b"ftyp" | b"styp" | b"moof")
+            || bytes.starts_with(b"FLV")
+            || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]))
+    {
+        return true;
+    }
+    if bytes.len() > 188 && bytes[0] == 0x47 && bytes[188] == 0x47 {
+        return true;
+    }
+    bytes.len() >= 512
+        && (content_type.starts_with("video/") || content_type.starts_with("audio/"))
+        && !trimmed.starts_with('<')
+        && std::str::from_utf8(bytes).is_err()
+}
+
+fn has_hls_candidate(bytes: &[u8], base: &url::Url, complete: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return false; };
+    let text = text.trim_start_matches('\u{feff}').trim_start();
+    if text.lines().next().map(str::trim) != Some("#EXTM3U") {
+        return false;
+    }
+    let mut expects_uri = false;
+    for line in text.split_inclusive('\n') {
+        if !complete && !line.ends_with('\n') {
+            break;
+        }
+        let line = line.trim();
+        if line.starts_with("#EXTINF:") || line.starts_with("#EXT-X-STREAM-INF:") {
+            expects_uri = true;
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if expects_uri && base.join(line).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+                return true;
+            }
+            expects_uri = false;
+        }
+    }
+    false
 }
 
 /// 测试单个 URL 连通性
 pub async fn test_url(url: &str, timeout_ms: u64) -> TestResult {
+    test_url_with_headers(url, timeout_ms, &HashMap::new()).await
+}
+
+/// 带播放请求头探测媒体，只读取有限样本；延迟统计到响应头抵达。
+pub async fn test_url_with_headers(url: &str, timeout_ms: u64, headers: &HashMap<String, String>) -> TestResult {
     let start = std::time::Instant::now();
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return TestResult {
-                url: url.to_string(),
-                alive: false,
-                latency: -1,
-                error: Some(e.to_string()),
+    let mut result = TestResult { url: url.to_string(), alive: false, latency: -1, error: None };
+    let probe = async {
+        let parsed = url::Url::parse(url).map_err(|_| "无效的媒体地址".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("暂不支持此协议的线路探测".to_string());
+        }
+        let client = PROBE_CLIENT.get_or_init(|| crate::network::create_client().map_err(|error| error.to_string()))
+            .as_ref().map_err(Clone::clone)?;
+        let mut request = client.get(parsed).timeout(std::time::Duration::from_millis(timeout_ms.max(1)));
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let mut response = request.send().await.map_err(|error| error.to_string())?;
+        result.latency = start.elapsed().as_millis() as i64;
+        if !response.status().is_success() {
+            return Err(format!("HTTP {}", response.status().as_u16()));
+        }
+        let base = response.url().clone();
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+        let mut sample = Vec::new();
+        let mut complete = true;
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            let remaining = MAX_PROBE_BYTES - sample.len();
+            sample.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if has_hls_candidate(&sample, &base, false) || is_media_sample(&sample, &content_type) {
+                return Ok(());
+            }
+            if sample.len() >= MAX_PROBE_BYTES {
+                complete = false;
+                break;
             }
         }
-    };
-
-    let method = if should_prefer_get(url) {
-        "GET"
-    } else {
-        "HEAD"
-    };
-
-    let result = if method == "GET" {
-        client.get(url).send().await
-    } else {
-        // HEAD first, fallback to GET if 405/501
-        match client.head(url).send().await {
-            Ok(resp) if resp.status().as_u16() < 400 => Ok(resp),
-            Ok(resp) if [405u16, 501].contains(&resp.status().as_u16()) => {
-                client.get(url).send().await
-            }
-            Ok(resp) => Ok(resp),
-            Err(e) => Err(e),
+        if has_hls_candidate(&sample, &base, complete) || is_media_sample(&sample, &content_type) {
+            Ok(())
+        } else {
+            Err("响应不是可识别的媒体或有效 HLS 清单".to_string())
         }
     };
-
-    match result {
-        Ok(resp) => {
-            let latency = start.elapsed().as_millis() as i64;
-            let status = resp.status().as_u16();
-            TestResult {
-                url: url.to_string(),
-                alive: status < 400,
-                latency,
-                error: if status >= 400 {
-                    Some(format!("HTTP {}", status))
-                } else {
-                    None
-                },
-            }
-        }
-        Err(e) => TestResult {
-            url: url.to_string(),
-            alive: false,
-            latency: -1,
-            error: if e.is_timeout() {
-                Some("Timeout".to_string())
-            } else if e.is_connect() {
-                Some(format!("Connect error: {}", e))
-            } else {
-                Some(e.to_string())
-            },
-        },
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.max(1)), probe).await {
+        Ok(Ok(())) => result.alive = true,
+        Ok(Err(error)) => result.error = Some(error),
+        Err(_) => result.error = Some("Timeout".to_string()),
     }
+    result
 }
 
 // ==================== 频道去重 ====================
 
 /// 归一化频道名称用于去重比较
 pub fn normalize_name(name: &str) -> String {
-    name.to_lowercase()
+    let mut normalized: String = name.to_lowercase()
         .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect()
+        .filter(|c| c.is_alphanumeric() || *c == '+')
+        .collect();
+    loop {
+        // CCTV 4K/8K 是独立频道，不能把频道名当清晰度尾缀删除。
+        if matches!(normalized.as_str(), "cctv4k" | "cctv8k") { break; }
+        let suffix = ["超高清", "高清", "标清", "蓝光", "uhd", "fhd", "1080p", "720p", "1080i", "4k", "8k", "hd", "sd"]
+            .into_iter().find(|suffix| normalized.len() > suffix.len() && normalized.ends_with(suffix));
+        match suffix {
+            Some(suffix) => normalized.truncate(normalized.len() - suffix.len()),
+            None => break,
+        }
+    }
+    if let Some(channel) = normalized.strip_prefix("cctv") {
+        let number_len = channel.bytes().take_while(u8::is_ascii_digit).count();
+        let (number, rest) = channel.split_at(number_len);
+        let aliases = [("1", "综合"), ("2", "财经"), ("3", "综艺"), ("4", "中文国际"),
+            ("5", "体育"), ("5+", "体育赛事"), ("6", "电影"), ("7", "国防军事"),
+            ("8", "电视剧"), ("9", "纪录"), ("10", "科教"), ("11", "戏曲"),
+            ("12", "社会与法"), ("13", "新闻"), ("14", "少儿"), ("15", "音乐"),
+            ("16", "奥林匹克"), ("17", "农业农村")];
+        let (key, label) = if let Some(rest) = rest.strip_prefix('+') {
+            (format!("{number}+"), rest)
+        } else { (number.to_string(), rest) };
+        if aliases.iter().any(|(id, alias)| key == *id && label == *alias) {
+            return format!("cctv{key}");
+        }
+    }
+    normalized
 }
 
 /// 去重并选择最优 URL
@@ -1024,6 +1094,37 @@ fn country_sort_key(country: &Country) -> i32 {
 }
 
 /// 分类频道
+/// 探测优先级：数字越小越先测。
+///
+/// 时间预算有限（见 `LIVE_PROBE_BUDGET_SECS`），必须先把预算花在用户最可能看的频道上：
+/// 0 = 中文频道（CCTV/卫视/中文名，含港台）；1 = 国际知名电视台；2 = 其它（各种小国/小众源）。
+pub fn probe_priority(name: &str) -> u8 {
+    let lower = name.to_lowercase();
+
+    // 中文频道：名字里含中文字符最直接（CCTV5+、CCTV-1 这类走下面的关键词）
+    if name.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) {
+        return 0;
+    }
+    const CHINESE_KEYWORDS: &[&str] = &[
+        "cctv", "cgtn", "tvb", "凤凰", "翡翠", "明珠", "香港", "澳门", "台湾", "china", "chinese",
+    ];
+    if CHINESE_KEYWORDS.iter().any(|keyword| lower.contains(keyword)) {
+        return 0;
+    }
+
+    const GLOBAL_BRANDS: &[&str] = &[
+        "bbc", "cnn", "nhk", "hbo", "discovery", "national geographic", "nat geo", "natgeo",
+        "fox", "sky ", "bloomberg", "cnbc", "dw ", "france 24", "al jazeera", "euronews",
+        "abc", "cbs", "nbc", "espn", "arirang", "kbs", "mbc", "sbs", "tv5", "rai", "ard",
+        "zdf", "itv", "cartoon network", "nickelodeon", "animal planet", "mtv", "hgtv", "tlc",
+        "rt ", "cgtn", "trt", "ntv", "channel 4", "channel 5", "star ",
+    ];
+    if GLOBAL_BRANDS.iter().any(|keyword| lower.contains(keyword)) {
+        return 1;
+    }
+    2
+}
+
 pub fn classify_channel(name: &str) -> (Country, String, f64) {
     let lower = name.to_lowercase();
 
@@ -1223,6 +1324,32 @@ fn guess_category(name: &str) -> &str {
 }
 
 #[cfg(test)]
+mod probe_priority_tests {
+    use super::probe_priority;
+
+    #[test]
+    fn chinese_channels_come_first() {
+        for name in ["CCTV-1 综合", "CCTV5+", "湖南卫视", "凤凰中文", "TVB翡翠台", "CGTN", "北京新闻"] {
+            assert_eq!(probe_priority(name), 0, "{name} 应属中文优先");
+        }
+    }
+
+    #[test]
+    fn international_brands_second() {
+        for name in ["BBC News", "CNN International", "NHK World", "HBO Asia", "Discovery Channel", "Bloomberg TV"] {
+            assert_eq!(probe_priority(name), 1, "{name} 应属国际知名台");
+        }
+    }
+
+    #[test]
+    fn everything_else_last() {
+        for name in ["Somalia TV", "RTR Planeta", "ZBC TV", "Kanal 7"] {
+            assert_eq!(probe_priority(name), 2, "{name} 应排最后");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1347,12 +1474,63 @@ mod tests {
         assert_eq!(groups.len(), 1);
     }
 
+    #[test]
+    fn auto_rejects_html_documents() {
+        let input = r#"<!doctype html><html><head><meta name="description" content="入口,http://example.com/config.json"></head><body></body></html>"#;
+        let groups = parse_live_content(input);
+        assert!(groups.is_empty());
+    }
+
     // ==================== URL 测试 ====================
 
     #[tokio::test]
     async fn test_url_rejects_bad_url() {
         let result = test_url("not a url", 5000).await;
         assert!(!result.alive);
+    }
+
+    #[test]
+    fn probe_requires_media_content() {
+        let base = url::Url::parse("https://example.com/live/index.m3u8").unwrap();
+        assert!(has_hls_candidate(b"#EXTM3U\n#EXTINF:6,\nsegment.ts\n", &base, true));
+        assert!(has_hls_candidate(b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nlow/index.m3u8", &base, true));
+        assert!(!has_hls_candidate(b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n", &base, true));
+        assert!(!has_hls_candidate(b"#EXTM3U\n#EXTINF:6,\nfile:///tmp/a.ts", &base, true));
+        assert!(!has_hls_candidate(b"#EXTM3U\n#EXTINF:6,\npartial", &base, false));
+        assert!(!is_media_sample(b"<!DOCTYPE html><html>Error</html>", "video/mp2t"));
+        assert!(is_media_sample(b"\0\0\0\x18ftypisom", "application/octet-stream"));
+    }
+
+    #[tokio::test]
+    async fn probe_sends_headers_and_rejects_successful_html() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (body, media_type) in [
+                ("#EXTM3U\n#EXTINF:6,\nsegment.ts\n", "application/vnd.apple.mpegurl"),
+                ("<!doctype html><html>Unavailable</html>", "text/html"),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                assert!(String::from_utf8_lossy(&request).to_ascii_lowercase().contains("referer: https://player.example/"));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let headers = HashMap::from([("Referer".to_string(), "https://player.example/".to_string())]);
+        let url = format!("http://{address}/stream.m3u8");
+        assert!(test_url_with_headers(&url, 3000, &headers).await.alive);
+        let failure = test_url_with_headers(&url, 3000, &headers).await;
+        assert!(!failure.alive);
+        assert!(failure.error.is_some());
+        server.join().unwrap();
     }
 
     // ==================== 去重 ====================
@@ -1362,6 +1540,22 @@ mod tests {
         let n1 = normalize_name("CCTV-1");
         let n2 = normalize_name("cctv1");
         assert_eq!(n1, n2, "normalized '{}' != '{}'", n1, n2);
+    }
+
+    #[test]
+    fn normalizes_known_aliases_without_merging_distinct_channels() {
+        for name in ["CCTV-1", "CCTV 1", "CCTV1高清", "CCTV-1综合", "CCTV 1 综合 FHD"] {
+            assert_eq!(normalize_name(name), "cctv1", "{name}");
+        }
+        assert_eq!(normalize_name("CCTV-5+体育赛事高清"), "cctv5+");
+        assert_ne!(normalize_name("CCTV5+"), normalize_name("CCTV5"));
+        assert_eq!(normalize_name("CCTV4K高清"), "cctv4k");
+        assert_ne!(normalize_name("CCTV4K"), normalize_name("CCTV4"));
+        assert_eq!(normalize_name("湖南卫视(HD)"), "湖南卫视");
+        assert_ne!(normalize_name("湖南卫视"), normalize_name("湖南电视剧"));
+        assert_ne!(normalize_name("北京新闻"), normalize_name("河北新闻"));
+        assert_ne!(normalize_name("CCTV4欧洲"), normalize_name("CCTV4亚洲"));
+        assert_eq!(normalize_name("HD新闻"), "hd新闻");
     }
 
     #[test]
