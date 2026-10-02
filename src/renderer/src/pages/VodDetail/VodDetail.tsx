@@ -630,6 +630,7 @@ export default function VodDetail() {
       {showPlayer && (
         <div className="relative aspect-video bg-black">
           <VideoPlayer
+            kind="vod"
             onSelectEpisode={(index) =>
               void handlePlay(
                 currentSourceIndex,

@@ -58,6 +58,7 @@ export type IpcChannel =
   | 'window:enterMiniMode'
   | 'window:resizeMiniMode'
   | 'window:setFullscreen'
+  | 'window:isFullscreen'
   | 'window:exitMiniMode'
   | 'window:applyMode'
 
@@ -120,6 +121,7 @@ interface IpcArgsMap {
   'window:enterMiniMode': []
   'window:resizeMiniMode': [width: number, height: number]
   'window:setFullscreen': [fullscreen: boolean]
+  'window:isFullscreen': []
   'window:exitMiniMode': []
   'window:applyMode': [mini: boolean]
 }
@@ -349,6 +351,7 @@ export const windowApi = {
   enterMiniMode: () => invoke('window:enterMiniMode'),
   resizeMiniMode: (width: number, height: number) => invoke('window:resizeMiniMode', width, height),
   setFullscreen: (fullscreen: boolean) => invoke('window:setFullscreen', fullscreen),
+  isFullscreen: () => invoke('window:isFullscreen'),
   exitMiniMode: () => invoke('window:exitMiniMode'),
   applyMode: (mini: boolean) => invoke('window:applyMode', mini)
 }

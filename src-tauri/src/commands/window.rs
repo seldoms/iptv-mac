@@ -108,6 +108,16 @@ pub fn handle_window_exit_mini_mode(app: &tauri::AppHandle) -> Result<Value, App
 /// - mini：无边框 + 置顶 + 480x300，与既有精简模式一致；
 /// - normal：恢复系统边框与可缩放，但**不重置窗口尺寸**，
 ///   避免每次启动都把用户调整过的窗口拉回 1280x800。
+/// 查询窗口是否处于全屏：用户可能用系统绿灯键/手势退出全屏，
+/// UI 必须能主动核对，否则会一直停在全屏布局样式上。
+pub fn handle_window_is_fullscreen(app: &tauri::AppHandle) -> Result<Value, AppError> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| AppError::internal("主窗口不存在"))?;
+    let fullscreen = window.is_fullscreen().unwrap_or(false);
+    Ok(serde_json::json!({ "fullscreen": fullscreen }))
+}
+
 pub fn handle_window_apply_mode(app: &tauri::AppHandle, mini: bool) -> Result<Value, AppError> {
     let window = app
         .get_webview_window("main")

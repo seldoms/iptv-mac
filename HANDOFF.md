@@ -14,6 +14,17 @@
 - 直播源「打开就报错」的现状：日志里的 `[live:refresh] 直播源下载失败` 全部是上游问题（域名失效/404/403/
   写死在 TVBox 本地代理 `127.0.0.1:9978`/本机网络不可达，已逐个用 curl + 应用同款 UA 复核）。
   唯一例外的 `clun.top` 经应用自身代码路径复测为 2.2s 成功——当时是并行探针把网络挤占导致的瞬时超时。
+- 最后更新：2026-10-02，**回到页面播放的出口 + 直播「录制」用语与红色录制按钮**：
+  - 出口（都验证过不中断播放）：全屏 → 同一个最大化按钮 / 双击画面 / **ESC**；小窗 → 顶部「返回」/ **ESC** /
+    播放器控制栏同一个按钮（现在是切换语义）。全屏状态新增 `window:isFullscreen` 查询 + `fullscreenchange`/focus/resize 同步，
+    用系统绿灯键退出后 UI 不会再卡在全屏样式上。ESC 在小窗模式下也由播放器兜底（不依赖 MiniChrome 是否渲染）。
+    smoke 增加 ESC 退全屏 / ESC 退小窗两步，实测 `advancing=true`、`stableInstances=true`。
+  - **点播叫「下载」、直播叫「录制」**：播放器加 `kind: 'vod' | 'live'`（Live.tsx 传 live），任务 `live: true` 输出 TS；
+    下载页改「下载 / 录制」，直播任务显示「录制中 + 录像」角标。
+  - **红色录制按钮**（用户指定）：录制中**闪烁**、其余（含录完）**常亮**；状态集中到 `stores/useRecordingStore`，
+    直播页与播放器控制栏共用（原来两套状态会各说各话）；文件名用频道名。
+  - **窄屏被挤占**：下载/录制按钮改为**纯图标**（语义放 title/aria-label），控制栏允许换行、
+    时间文本 `hidden sm:inline`、右侧按钮组 `shrink-0`。
 - 最后更新：2026-10-02，**补齐 JS 宿主契约：rsaX / getPort / getProxy / js2Proxy**：
   - `rsaX(mode, pub, encrypt, input, inBase64, key, outBase64)` 语义对齐 FongMi `Crypto.rsa`：
     PEM→base64 DER（pub 走 X.509 SPKI、私钥走 PKCS#8，内部还要再解一层 SEQUENCE）、

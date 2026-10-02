@@ -65,7 +65,7 @@ export default function Downloads() {
       <div className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[#2a2a2a]">
         <div className="flex items-center gap-2">
           <Download className="w-5 h-5 text-accent" />
-          <h2 className="text-lg font-medium text-text-primary">下载管理</h2>
+          <h2 className="text-lg font-medium text-text-primary">下载 / 录制</h2>
           <span className="text-xs text-text-muted">({tasks.length})</span>
           {running > 0 && (
             <span className="inline-flex items-center gap-1 text-xs text-accent">
@@ -121,7 +121,7 @@ export default function Downloads() {
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Download className="w-8 h-8 text-text-muted" />
             <p className="text-sm text-text-muted">暂无下载任务</p>
-            <p className="text-xs text-text-muted">播放页面控制栏的「下载」按钮可以添加任务</p>
+            <p className="text-xs text-text-muted">点播控制栏的「下载」、直播控制栏/直播页的「录制」都可以添加任务</p>
           </div>
         ) : (
           <div className="flex flex-col gap-3">
@@ -145,7 +145,10 @@ export default function Downloads() {
                             : 'text-text-muted'
                     }`}
                   >
-                    {STATUS_TEXT[task.status] || task.status}
+                    {task.status === 'running' && task.live ? '录制中' : STATUS_TEXT[task.status] || task.status}
+                    {task.live && (
+                      <span className="ml-1 rounded bg-accent/15 px-1 py-0.5 text-[10px] text-accent">录像</span>
+                    )}
                   </span>
                 </div>
 

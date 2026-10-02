@@ -3,9 +3,11 @@ import { useLiveStore, Channel } from '@/stores/useLiveStore'
 import { usePlayerStore } from '@/stores/usePlayerStore'
 import ChannelItem from '@/components/ChannelItem/ChannelItem'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
-import { ChevronDown, ChevronRight, Circle, Loader2, Search } from 'lucide-react'
+import { ChevronDown, ChevronRight, Loader2, Search } from 'lucide-react'
 import { getPlayableMediaUrl } from '@/utils/media'
 import { downloadApi, liveApi, on } from '@/utils/ipc'
+import RecordButton from '@/components/RecordButton/RecordButton'
+import { useRecordingStore } from '@/stores/useRecordingStore'
 
 
 /** 简易媒体查询 hook（与 Tailwind 断点保持一致的判定用） */
@@ -42,7 +44,6 @@ export default function Live() {
   const [selectedLineIndex, setSelectedLineIndex] = useState(0)
   const [sortMode, setSortMode] = useState<'name' | 'latency'>('name')
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
-  const [recordingId, setRecordingId] = useState('')
   const [speedTesting, setSpeedTesting] = useState(false)
   const [speedTestProgress, setSpeedTestProgress] = useState<{ current: number; total: number; message: string } | null>(null)
 
@@ -66,14 +67,21 @@ export default function Live() {
   }, [loadChannelTree])
 
   // 直播录像：复用下载管理（输出 TS，停止后文件仍可播放）
+  // 录制状态与播放器控制栏共用同一个 store，避免两个按钮各说各话。
+  const recordingStatus = useRecordingStore((state) => state.status)
+  useEffect(() => {
+    useRecordingStore.getState().setSourceName(currentChannel?.name || '')
+  }, [currentChannel])
   useEffect(() => {
     const off = on('download:progress', (payload: any) => {
       const task = payload?.task
-      if (!task || task.id !== recordingId) return
-      if (task.status !== 'running') setRecordingId('')
+      if (!task) return
+      const active = useRecordingStore.getState().taskId
+      if (!active || task.id !== active) return
+      if (task.status !== 'running') useRecordingStore.getState().finishRecording()
     })
     return () => { if (typeof off === 'function') off() }
-  }, [recordingId])
+  }, [])
 
   const buildPlaybackQueue = useCallback((channel: Channel): { urls: string[]; headers: Array<Record<string, string> | undefined> } => {
     if (channel.lines?.length) {
@@ -309,9 +317,11 @@ export default function Live() {
   }, [playbackPhase, playbackUrl, playbackQueue.urls, reportPlaybackResult])
 
   const handleRecord = useCallback(async () => {
-    if (recordingId) {
-      await downloadApi.cancel(recordingId).catch(() => {})
-      setRecordingId('')
+    const store = useRecordingStore.getState()
+    if (store.taskId) {
+      // 停止录制：Rust 侧会保留已录部分；状态转「常亮」
+      await downloadApi.cancel(store.taskId).catch(() => {})
+      store.finishRecording()
       return
     }
     if (!currentChannel || playbackQueue.urls.length === 0) return
@@ -325,11 +335,11 @@ export default function Live() {
         fileName: `${currentChannel.name} 录像`,
         live: true
       })
-      setRecordingId(task.id)
+      store.startRecording(task.id)
     } catch (error) {
       setPlaybackError(error instanceof Error ? error.message : String(error))
     }
-  }, [recordingId, currentChannel, playbackQueue, selectedLineIndex, setPlaybackError])
+  }, [currentChannel, playbackQueue, selectedLineIndex, setPlaybackError])
 
 
   // 频道列表宽度：可拖动调整并记住（原先写死 wide:w-56 = 224px，名字被状态文字挤没）
@@ -497,18 +507,7 @@ export default function Live() {
             <div className="shrink-0 flex flex-wrap items-center gap-3 border-b border-[#2a2a2a] bg-bg-secondary px-4 py-2">
               <span className="min-w-0 flex-1 break-words text-sm text-text-primary">{currentChannel.name}</span>
               <label htmlFor="live-line" className="shrink-0 text-xs text-text-muted">{playbackQueue.urls.length} 条线路</label>
-              <button
-                onClick={() => void handleRecord()}
-                title={recordingId ? '停止录像（已录制部分会保留）' : '开始录制当前直播'}
-                className={`shrink-0 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors ${
-                  recordingId
-                    ? 'border-red-400/60 text-red-400 hover:border-red-400'
-                    : 'border-[#3a3a3a] text-text-secondary hover:border-accent hover:text-accent'
-                }`}
-              >
-                {recordingId ? <Circle className="h-2.5 w-2.5 fill-current animate-pulse" /> : <Circle className="h-2.5 w-2.5" />}
-                {recordingId ? '停止录像' : '录像'}
-              </button>
+              <RecordButton onStart={handleRecord} onStop={handleRecord} />
               <select id="live-line" value={selectedLineIndex} onChange={(event) => {
                 const index = Number(event.target.value)
                 if (!playbackQueue.urls[index]) return
@@ -546,7 +545,7 @@ export default function Live() {
           <div className="flex-1 min-h-0 bg-black relative">
             {currentChannel ? (
               <>
-                <VideoPlayer />
+                <VideoPlayer kind="live" />
                 {isLoading && (
                   <div className="pointer-events-none absolute right-4 top-4 z-30 inline-flex items-center gap-2 rounded-md border border-white/10 bg-black/65 px-3 py-2 text-xs text-white/80 shadow-lg backdrop-blur">
                     <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />

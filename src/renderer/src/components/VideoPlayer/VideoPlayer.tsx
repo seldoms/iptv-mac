@@ -29,6 +29,9 @@ import {
   Shuffle
 } from 'lucide-react'
 import { historyApi, invoke, settingsApi, windowApi } from '@/utils/ipc'
+import { leaveMiniMode } from '@/utils/miniMode'
+import RecordButton from '@/components/RecordButton/RecordButton'
+import { useRecordingStore } from '@/stores/useRecordingStore'
 import { redactHeaders, redactText } from '@/utils/redact'
 import { getPlaybackMetricSummary, recordPlaybackMetric } from '@/utils/playbackMetrics'
 
@@ -98,7 +101,14 @@ function formatUrlIdentifier(url: string): string {
   }
 }
 
-export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (index: number) => void } = {}) {
+export default function VideoPlayer({
+  onSelectEpisode,
+  kind = 'vod'
+}: {
+  onSelectEpisode?: (index: number) => void
+  /** 点播=下载，直播=录制（控制栏用语与任务类型据此区分） */
+  kind?: 'vod' | 'live'
+} = {}) {
   const [downloadNotice, setDownloadNotice] = useState('')
   const videoRef = useRef<HTMLVideoElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -867,6 +877,49 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
   }, [isPlaying])
 
   // 全屏切换
+  // 全屏状态与系统保持一致：ESC / 系统绿灯键 / 手势退出全屏后，
+  // 若 UI 还认为在全屏，播放器会一直停在 fixed 全屏样式上回不到页面里。
+  useEffect(() => {
+    const syncFullscreen = () => {
+      void windowApi
+        .isFullscreen()
+        .then((result) => {
+          const fullscreen = Boolean((result as { fullscreen?: boolean } | null)?.fullscreen)
+          setIsActualFullscreen(fullscreen || Boolean(document.fullscreenElement))
+        })
+        .catch(() => {})
+    }
+    const onFullscreenChange = () => {
+      setIsActualFullscreen(Boolean(document.fullscreenElement))
+    }
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+    window.addEventListener('focus', syncFullscreen)
+    window.addEventListener('resize', syncFullscreen)
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange)
+      window.removeEventListener('focus', syncFullscreen)
+      window.removeEventListener('resize', syncFullscreen)
+    }
+  }, [])
+
+  // ESC 退出全屏（小窗模式有自己的 ESC 处理，见 MiniChrome，避免双重触发）
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      // 小窗：交给同一个出口逻辑（MiniChrome 也监听 ESC，重复调用是幂等的）
+      if (useUiStore.getState().miniMode) {
+        event.preventDefault()
+        void leaveMiniMode()
+        return
+      }
+      if (!isActualFullscreenRef.current && !document.fullscreenElement) return
+      event.preventDefault()
+      void exitFullscreenIfNeeded()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [exitFullscreenIfNeeded])
+
   const handleToggleFullscreen = useCallback(async () => {
     const container = containerRef.current
     if (!container) return
@@ -931,6 +984,7 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
       console.log('[continuity] 结果:', JSON.stringify(payload))
     }
 
+    const pressEscape = () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
     const run = async () => {
       await wait(continuityConfig.settleMs)
       const samples = [sample('playing')]
@@ -939,16 +993,20 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
       await wait(continuityConfig.holdMs)
       await ensurePlaying(wasPlaying)
       samples.push(sample('fullscreen'))
-      await handleToggleFullscreen()
-      await wait(1000)
+      // 用 ESC 退出全屏（用户最常用的返回方式），验证画面不中断
+      pressEscape()
+      await wait(1500)
+      await ensurePlaying(true)
+      samples.push(sample('esc-from-fullscreen'))
       await handleEnterMiniMode()
       await wait(continuityConfig.holdMs)
-      samples.push(sample('mini'))
-      await windowApi.exitMiniMode().catch(() => {})
-      useUiStore.getState().setMiniMode(false)
       await ensurePlaying(true)
+      samples.push(sample('mini'))
+      // 用 ESC 退出小窗，回到页面里播放
+      pressEscape()
       await wait(1500)
-      samples.push(sample('restored'))
+      await ensurePlaying(true)
+      samples.push(sample('esc-from-mini'))
       report(samples)
     }
     void run()
@@ -1034,7 +1092,41 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
   }, [isPlaying, volume, handleToggleFullscreen, setIsPlaying, setVolume])
 
   // 进度条拖动
-  // 下载当前播放的媒体（交给 Rust 侧调用 ffmpeg / N_m3u8DL-RE / yt-dlp）
+  // 点播叫「下载」，直播叫「录制」（同一个 Rust 任务通道，live=true 时输出 TS、可随时停止）
+  const isLivePlayback = kind === 'live'
+  const captureLabel = isLivePlayback ? '录制' : '下载'
+
+  // 直播录制：录的就是当前正在播的这条线路（比按选中行号猜更准）
+  const startLiveRecording = useCallback(async () => {
+    if (!currentUrl || currentUrl === '__resolving__') return
+    const store = usePlayerStore.getState()
+    const channelName =
+      useRecordingStore.getState().sourceName || store.currentVod?.vod_name || '直播'
+    try {
+      const task = await downloadApi.start({
+        url: currentUrl,
+        headers: playHeader || undefined,
+        fileName: `${channelName} 录像`,
+        live: true
+      })
+      useRecordingStore.getState().startRecording(task.id)
+      setDownloadNotice('已开始录制，可在「下载/录制」页查看进度')
+      window.setTimeout(() => setDownloadNotice(''), 4000)
+    } catch (error) {
+      console.error('[VideoPlayer] 启动录制失败:', error)
+    }
+  }, [currentUrl, playHeader])
+
+  const stopLiveRecording = useCallback(async () => {
+    const store = useRecordingStore.getState()
+    if (!store.taskId) return
+    await downloadApi.cancel(store.taskId).catch(() => {})
+    store.finishRecording()
+    setDownloadNotice('录制已停止，已录部分保留')
+    window.setTimeout(() => setDownloadNotice(''), 4000)
+  }, [])
+
+  // 抓取当前播放的媒体（交给 Rust 侧调用 ffmpeg / N_m3u8DL-RE / yt-dlp）
   const handleDownload = async () => {
     if (!currentUrl || currentUrl === '__resolving__') return
     const store = usePlayerStore.getState()
@@ -1045,13 +1137,16 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
       await downloadApi.start({
         url: currentUrl,
         headers: playHeader || undefined,
-        fileName
+        fileName,
+        live: isLivePlayback
       })
-      // 下载任务由 Rust 侧管理，进度在「下载」页看；这里给一个就地反馈
-      setDownloadNotice('已加入下载，可在「下载」页查看进度')
+      // 任务由 Rust 侧管理，进度在「下载/录制」页看；这里给一个就地反馈
+      setDownloadNotice(
+        isLivePlayback ? '已开始录制，可在「下载/录制」页查看进度' : '已加入下载，可在「下载/录制」页查看进度'
+      )
       window.setTimeout(() => setDownloadNotice(''), 4000)
     } catch (error) {
-      console.error('[VideoPlayer] 启动下载失败:', error)
+      console.error(`[VideoPlayer] 启动${captureLabel}失败:`, error)
       setPlaybackPhase('failed', error instanceof Error ? error.message : String(error))
     }
   }
@@ -1181,9 +1276,9 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
 
       {currentUrl && (
         <button
-          onClick={handleEnterMiniMode}
+          onClick={() => (miniPlayerMode ? void leaveMiniMode() : void handleEnterMiniMode())}
           className="absolute right-3 top-[4.75rem] z-30 rounded-md border border-white/10 bg-black/55 p-2 text-white/80 shadow-lg backdrop-blur transition hover:bg-black/75 hover:text-white"
-          title="精简模式"
+          title={miniPlayerMode ? '退出精简模式（回到页面里播放）' : '精简模式（弹窗小窗播放）'}
         >
           <PictureInPicture2 className="h-4 w-4" />
         </button>
@@ -1232,9 +1327,9 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
           </div>
         </div>
 
-        {/* 控制按钮 */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        {/* 控制按钮：窄屏允许换行，避免元素被挤到变形 */}
+        <div className="flex flex-wrap items-center justify-between gap-y-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
             <button onClick={prevEpisode} className="p-1 text-white/80 hover:text-white">
               <SkipBack className="w-4 h-4" />
             </button>
@@ -1244,17 +1339,27 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
             <button onClick={nextEpisode} className="p-1 text-white/80 hover:text-white">
               <SkipForward className="w-4 h-4" />
             </button>
-            <span className="text-xs text-white/70 ml-2">
+            <span className="ml-2 hidden text-xs text-white/70 sm:inline">
               {formatClock(currentTime)} / {formatClock(duration)}
             </span>
-            <button
-              onClick={() => void handleDownload()}
-              title="下载当前媒体（m3u8/HLS）"
-              className="ml-2 inline-flex items-center gap-1 rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 transition-colors hover:border-accent hover:text-accent"
-            >
-              <Download className="w-3 h-3" />
-              下载
-            </button>
+            {isLivePlayback ? (
+              // 直播：红色录制按钮（录制中闪烁、其余常亮），只放图标避免窄屏被挤
+              <RecordButton
+                compact
+                className="ml-2"
+                onStart={() => void startLiveRecording()}
+                onStop={() => void stopLiveRecording()}
+              />
+            ) : (
+              <button
+                onClick={() => void handleDownload()}
+                title="下载当前媒体（m3u8/HLS）"
+                aria-label="下载"
+                className="ml-2 shrink-0 p-1 text-white/80 transition-colors hover:text-accent"
+              >
+                <Download className="w-4 h-4" />
+              </button>
+            )}
             {downloadNotice && <span className="ml-2 text-[11px] text-accent">{downloadNotice}</span>}
           </div>
 
@@ -1326,8 +1431,12 @@ export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (in
               <Monitor className="w-4 h-4" />
             </button>
 
-            {/* 精简模式 */}
-            <button onClick={handleEnterMiniMode} className="p-1 text-white/80 hover:text-white" title="精简模式">
+            {/* 精简模式：进入 / 退出（退出等价于小窗顶部的「返回」） */}
+            <button
+              onClick={() => (miniPlayerMode ? void leaveMiniMode() : void handleEnterMiniMode())}
+              className="p-1 text-white/80 hover:text-white"
+              title={miniPlayerMode ? '退出精简模式（回到页面里播放）' : '精简模式（弹窗小窗播放）'}
+            >
               <PictureInPicture2 className="w-4 h-4" />
             </button>
 

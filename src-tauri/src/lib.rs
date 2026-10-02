@@ -430,6 +430,9 @@ fn invoke_ipc(
             )))
         }
         "window:getPlayerState" => Ok(state.player_state.lock().clone().unwrap_or(Value::Null)),
+        "window:isFullscreen" => Ok(to_json_result(commands::handle_window_is_fullscreen(
+            &app,
+        ))),
         "window:enterMiniMode" => Ok(to_json_result(commands::handle_window_enter_mini_mode(
             &app,
         ))),

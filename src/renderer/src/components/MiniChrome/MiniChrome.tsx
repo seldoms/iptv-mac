@@ -1,7 +1,6 @@
 import { useCallback, useEffect } from 'react'
 import { ArrowLeftRight, GripHorizontal } from 'lucide-react'
-import { windowApi } from '@/utils/ipc'
-import { useUiStore } from '@/stores/useUiStore'
+import { leaveMiniMode } from '@/utils/miniMode'
 
 /**
  * 精简模式（小窗）的窗口控件层。
@@ -13,11 +12,7 @@ import { useUiStore } from '@/stores/useUiStore'
  */
 export default function MiniChrome() {
   const exitMiniMode = useCallback(async () => {
-    await windowApi.exitMiniMode().catch(() => {})
-    const url = new URL(window.location.href)
-    url.searchParams.delete('mode')
-    window.history.replaceState(null, '', url.toString())
-    useUiStore.getState().setMiniMode(false)
+    await leaveMiniMode()
   }, [])
 
   // ESC 退出小窗（控制栏被隐藏时也有保底出路）
