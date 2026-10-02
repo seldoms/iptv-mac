@@ -14,6 +14,16 @@
 - 直播源「打开就报错」的现状：日志里的 `[live:refresh] 直播源下载失败` 全部是上游问题（域名失效/404/403/
   写死在 TVBox 本地代理 `127.0.0.1:9978`/本机网络不可达，已逐个用 curl + 应用同款 UA 复核）。
   唯一例外的 `clun.top` 经应用自身代码路径复测为 2.2s 成功——当时是并行探针把网络挤占导致的瞬时超时。
+- 最后更新：2026-10-02，**Hermes 审计 7 项全部处理完毕**：
+  1. 许可：补 GPL-3.0 全文 `LICENSE`（因 `cat.js`/`gbk.js` 被 `include_str!` 编进二进制随包分发）；
+     README「许可」写清边界与第三方清单；package.json/Cargo.toml 标 GPL-3.0-only。**用户已确认按 GPL-3.0 保留**。
+  2. 名称统一为 IPTV Mac（package.json name、窗口标题、文档 19 处）；identifier 保持不动（改会丢数据）。
+  3. `docs/PROGRESS.md` 重写为真实状态（141/191 测试，drpy/DoH/Decoder 已落地）。
+  4. HANDOFF「下一步」重写，删掉"待移植 Decoder/DoH（port-pending）"等过期待办。
+  5. 发布链路做实：修掉"Tauri 打 DMG 会清掉 bundle/macos 里的 .app"导致的三连挂（改为先 zip 后 DMG）；
+     版本 1.0.1→1.0.2，**发布正式 Release v1.0.2**（zip 23MB + dmg 23MB，均 Verify 过可下载）。
+  6. 卫生：删除根目录 536KB 素材图、移除空 `postinstall`、删除死分支 `codex/iptv-mac-product-upgrade`（本地+远端）。
+  7. 测试通道污染：启动自愈 + 回归测试保留，并写入"禁止写入用户持久化设置"的硬约束。
 - 最后更新：2026-10-02，**品牌统一 + 关于页署名 + main 成为维护分支 + CI 上线**：
   - **品牌**：应用图标与界面 logo 统一为**黄色 TV**（`src-tauri/icons` 保持 6 月版黄色 TV 图标；
     `src/renderer/src/assets/logo.svg` 重绘为同一套设计）。曾一度改成猫猫电视图标，用户要求改回黄色 TV。
