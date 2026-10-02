@@ -9,14 +9,23 @@ macOS 上的 TVBox / CatVod 兼容播放器，基于 **Tauri 2 + Rust + React 18
 
 ## 快速开始
 
-### 用现成的构建
+### 直接下载安装（普通用户）
+
+1. 打开 **[Releases](https://github.com/seldoms/iptv-mac/releases)** → 下载 `IPTV-Mac-macos-arm64.zip`
+   （`latest` 是每次推送后自动构建的最新版）
+2. 解压得到 `IPTV Mac.app`，拖进「应用程序」
+3. **首次打开请右键 → 打开**（构建未做 Apple 签名/公证）；若仍被拦，执行一次：
 
 ```bash
-# 已经装在本机（由本地构建同步而来）
-open "/Applications/IPTV Mac.app"
+xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"
 ```
 
-> 目前**没有远程 CI**：推代码不会自动出安装包，`.app` 都是本机构建后拷进 `/Applications` 的（见下文「构建与安装」）。
+> 目前只提供 Apple Silicon（arm64）；Intel 机器请从源码构建（见下）。
+
+### 让 AI 帮你把开发环境装好
+
+把 [部署提示词](docs/SETUP_PROMPT.md) 里的整段内容复制给你的 AI Agent（Claude Code / Codex / Cursor 等），
+它会自动补齐依赖、拉代码、跑测试并启动应用；同一份文档里也有「手动命令」可以直接敲。
 
 ### 从源码构建
 
@@ -24,8 +33,9 @@ open "/Applications/IPTV Mac.app"
 
 ```bash
 npm install
-npm run dev            # 开发模式（Vite + Tauri）
-npm run build:mac      # 产出 .app 与 .dmg
+bash scripts/fetch-ffmpeg.sh   # 内置 ffmpeg：被 .gitignore 排除，但 tauri 把它声明为打包资源
+npm run dev                    # 开发模式（Vite + Tauri）
+npm run build:mac              # 产出 .app 与 .dmg
 ```
 
 构建产物在 `src-tauri/target/release/bundle/`。要装到 `/Applications`：
@@ -36,6 +46,7 @@ cp -R "src-tauri/target/release/bundle/macos/IPTV Mac.app" "/Applications/IPTV M
 ```
 
 > ⚠️ `cp -R` **不能**直接覆盖已存在的 `.app`（会套娃成 `IPTV Mac.app/IPTV Mac.app`），必须先 `rm -rf`。
+> 本机打包若卡在 DMG 步骤，用 `npx tauri build --bundles app` 只出 `.app`，DMG 交给 CI。
 
 ### 首次使用
 
@@ -178,6 +189,7 @@ Tauri 2 · Rust · React 18 + TypeScript · Zustand · Tailwind CSS · SQLite ·
 
 ## 文档索引
 
+- [部署提示词（复制给 AI Agent 即可装环境）](docs/SETUP_PROMPT.md)
 - [文档总索引](docs/README.md)
 - [架构](docs/ARCHITECTURE.md) ｜ [设计蓝图](docs/DESIGN_BLUEPRINT.md) ｜ [开发](docs/DEVELOPMENT.md) ｜ [接口](docs/API.md)
 - [网络层（DoH/重试）](docs/NETWORK_LAYER.md) ｜ [FongMi 兼容矩阵](docs/FONGMI_COMPAT_MATRIX.md)

@@ -1,4 +1,8 @@
-# 推送代码后自动在 GitHub 的 macOS runner 上编译并产出 .app / .dmg
+# 推送代码后在 GitHub 的 macOS runner 上编译，并把可下载的客户端发布到 Releases
+#
+# 下载入口（给普通用户）：
+#   - 手动触发本工作流 → 更新 Releases 里的 `latest`（预发布）→ 下载 zip/dmg
+#   - 打 v* tag     → 生成正式 Release（自动附上 zip/dmg）
 #
 # 说明：
 # - 只在 main 分支和 v* tag 上跑，避免每个功能分支都消耗额度
@@ -13,6 +17,9 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -46,26 +53,57 @@ jobs:
       - name: Rust 测试（单线程）
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
 
-      - name: 打包 .app / .dmg
-        run: npm run build:mac
+      # 只要 .app：DMG 由下一步单独尝试，失败也不影响客户端下载
+      - name: 打包 .app
+        run: npx tauri build --bundles app
+
+      - name: 压缩客户端（zip 便于直接下载解压）
+        run: |
+          cd "src-tauri/target/release/bundle/macos"
+          ditto -c -k --sequesterRsrc --keepParent "IPTV Mac.app" "IPTV-Mac-macos-arm64.zip"
+          ls -lh
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: IPTV-Mac-macos
-          path: |
-            src-tauri/target/release/bundle/macos/*.app
-            src-tauri/target/release/bundle/dmg/*.dmg
+          path: src-tauri/target/release/bundle/macos/IPTV-Mac-macos-arm64.zip
           if-no-files-found: error
 
-      - name: 打 tag 时附到 Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  # 把 zip 发布到 Releases，普通用户可直接下载
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: IPTV-Mac-macos
+          path: dist
+
+      - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
-          files: src-tauri/target/release/bundle/dmg/*.dmg
+          # tag 推送 → 用 tag 名发正式版；手动触发 → 更新滚动预发布 `latest`
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'IPTV Mac（最新构建）' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          files: dist/IPTV-Mac-macos-arm64.zip
+          body: |
+            macOS 客户端（Apple Silicon / arm64），构建自 `${{ github.sha }}`。
+
+            **安装**：下载 zip → 解压得到 `IPTV Mac.app` → 拖进「应用程序」。
+            首次打开请**右键 → 打开**（本构建未做 Apple 签名/公证）；
+            若仍被拦，执行一次：
+            ```bash
+            xattr -d com.apple.quarantine "/Applications/IPTV Mac.app"
+            ```
+
+            从源码构建与开发环境部署（可直接复制给 AI Agent 的提示词）见
+            [docs/SETUP_PROMPT.md](https://github.com/seldoms/iptv-mac/blob/main/docs/SETUP_PROMPT.md)。
 
 # 想做成"下载即可打开"的正规分发，需要：
 #   1. Apple Developer Program 账号，导出 Developer ID Application 证书（.p12）
 #   2. 仓库 Secrets 增加：APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
 #      APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
-#   3. 在上面的打包步骤前导入证书，Tauri 会自动完成签名 + 公证
+#   3. 在打包步骤前导入证书，Tauri 会自动完成签名 + 公证

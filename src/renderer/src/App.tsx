@@ -127,10 +127,8 @@ export default function App() {
       {/* 宽窗口：左侧栏（窄于 900px 换成底部导航） */}
       <Sidebar className="hidden nav:flex" />
       <main className="flex-1 flex flex-col overflow-hidden">
-        {/* 顶部拖动条 - 用于移动窗口 */}
-        <div className="shrink-0 h-8 flex items-center px-4 bg-bg-secondary border-b border-[#2a2a2a]" data-tauri-drag-region="deep">
-          <span className="text-[10px] text-text-muted select-none">IPTV</span>
-        </div>
+        {/* 顶部拖动条：只保留可拖动区域，去掉「IPTV」文字并压到最薄，给内容让出纵向空间 */}
+        <div className="shrink-0 h-4 bg-bg-secondary" data-tauri-drag-region="deep" />
         <SubscriptionBar />
         <div className="flex-1 overflow-hidden">
           <ErrorBoundary>
