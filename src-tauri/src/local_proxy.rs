@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,13 @@ pub struct LocalProxyInfo {
 
 /// 当前本地代理信息（JS 宿主的 `getPort`/`getProxy` 要拿真实端口与 token）
 static CURRENT_PROXY: std::sync::OnceLock<LocalProxyInfo> = std::sync::OnceLock::new();
+
+/// TVBox 约定端口：很多订阅的直播源把地址写成 `http://127.0.0.1:9978/proxy?do=live&url=…`
+/// 或 `http://127.0.0.1:9978/file/…`。我们以前监听随机端口，这类源必然"无法连接"。
+pub const TVBOX_PROXY_PORT: u16 = 9978;
+
+/// `/file/<相对路径>` 的根目录（应用数据目录下的 files/）
+static PROXY_FILES_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// 经过本地代理转发出去的累计字节数与上次采样点。
 /// 播放器右上角的「速度」用它来算——macOS 走原生 HLS 时没有 HLS.js 分片事件，
@@ -117,8 +125,14 @@ pub fn current_proxy_base(local: bool) -> String {
     }
 }
 
-pub fn start_local_proxy() -> Result<LocalProxyInfo, String> {
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+pub fn start_local_proxy(data_dir: PathBuf) -> Result<LocalProxyInfo, String> {
+    // 先试 TVBox 约定的 9978：订阅里写死的代理地址才能命中我们；被占用则回落随机端口
+    let listener = TcpListener::bind(("127.0.0.1", TVBOX_PROXY_PORT))
+        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
+        .map_err(|error| error.to_string())?;
+    let files_root = data_dir.join("files");
+    let _ = std::fs::create_dir_all(&files_root);
+    let _ = PROXY_FILES_ROOT.set(files_root);
     let addr = listener.local_addr().map_err(|error| error.to_string())?;
     let token = make_token();
     let info = LocalProxyInfo {
@@ -254,13 +268,39 @@ fn handle_stream(mut stream: TcpStream, info: &LocalProxyInfo) -> Result<(), Str
         .split_once('?')
         .map(|(path, query)| (path, query))
         .unwrap_or((target, ""));
+    let request_headers = parse_request_headers(&request);
+    let query = parse_query(query);
+
+    // TVBox 约定路由（订阅里写死的地址，不带 token）：
+    //   /proxy?do=live&url=<真实地址>[&header=<JSON>]  → 取回并转发（含 HLS 清单重写）
+    //   /file/<相对路径>                               → 读取 <数据目录>/files/ 下的文件
+    if path == "/proxy" {
+        let Some(url) = query.get("url").filter(|url| is_allowed_media_url(url)) else {
+            write_response(&mut stream, 400, "text/plain; charset=utf-8", b"Invalid URL")?;
+            return Ok(());
+        };
+        let mut headers = query
+            .get("header")
+            .and_then(|value| serde_json::from_str::<HashMap<String, String>>(value).ok())
+            .unwrap_or_default();
+        for (key, value) in &request_headers {
+            headers.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        if let Err(error) = proxy_media(&mut stream, info, url, &headers, &request_headers) {
+            let message = format!("Proxy Error: {error}");
+            write_response(&mut stream, 502, "text/plain; charset=utf-8", message.as_bytes())?;
+        }
+        return Ok(());
+    }
+    if let Some(relative) = path.strip_prefix("/file/") {
+        return serve_local_file(&mut stream, relative);
+    }
+
     if path != "/stream" {
         write_response(&mut stream, 404, "text/plain; charset=utf-8", b"Not Found")?;
         return Ok(());
     }
 
-    let request_headers = parse_request_headers(&request);
-    let query = parse_query(query);
     if query.get("token").map(String::as_str) != Some(info.token.as_str()) {
         write_response(&mut stream, 403, "text/plain; charset=utf-8", b"Forbidden")?;
         return Ok(());
@@ -646,6 +686,51 @@ fn write_media_headers(
         .map_err(|error| error.to_string())
 }
 
+/// 处理 `/file/<相对路径>`：从 `<数据目录>/files/` 读取。
+///
+/// TVBox 生态里直播源常用 `http://127.0.0.1:9978/file/xxx/live.txt` 指本地文件。
+/// 必须防目录穿越：先规范化，再确认解析结果仍在根目录内。
+/// 把 `/file/<relative>` 解析成根目录内的真实路径。
+/// 返回 `Err(status)`：403 = 越界/穿越，404 = 不存在。
+fn resolve_local_file(root: &std::path::Path, relative: &str) -> Result<PathBuf, u16> {
+    let decoded = urlencoding::decode(relative)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| relative.to_string());
+    if decoded.split(['/', '\\']).any(|segment| segment == "..") {
+        return Err(403);
+    }
+    let root_canonical = root.canonicalize().map_err(|_| 404u16)?;
+    let path = root
+        .join(decoded.trim_start_matches('/'))
+        .canonicalize()
+        .map_err(|_| 404u16)?;
+    if !path.starts_with(&root_canonical) {
+        return Err(403);
+    }
+    Ok(path)
+}
+
+fn serve_local_file(stream: &mut TcpStream, relative: &str) -> Result<(), String> {
+    let Some(root) = PROXY_FILES_ROOT.get() else {
+        return write_response(stream, 404, "text/plain; charset=utf-8", b"Not Found");
+    };
+    let path = match resolve_local_file(root, relative) {
+        Ok(path) => path,
+        Err(403) => return write_response(stream, 403, "text/plain; charset=utf-8", b"Forbidden"),
+        Err(_) => return write_response(stream, 404, "text/plain; charset=utf-8", b"Not Found"),
+    };
+    let Ok(body) = std::fs::read(&path) else {
+        return write_response(stream, 404, "text/plain; charset=utf-8", b"Not Found");
+    };
+    let content_type = match path.extension().and_then(|value| value.to_str()) {
+        Some("m3u8") | Some("m3u") => "application/vnd.apple.mpegurl",
+        Some("json") => "application/json; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    write_response(stream, 200, content_type, &body)
+}
+
 fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> Result<(), String> {
     write!(stream, "{:x}\r\n", chunk.len()).map_err(|error| error.to_string())?;
     stream.write_all(chunk).map_err(|error| error.to_string())?;
@@ -656,8 +741,31 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> Result<(), String> {
 mod tests {
     use super::{
         is_allowed_media_url, is_playlist_url, parse_query, parse_request_headers, proxy_prefix,
-        record_proxy_bytes, take_throughput_kbps, LocalProxyInfo,
+        record_proxy_bytes, resolve_local_file, take_throughput_kbps, LocalProxyInfo,
     };
+
+    #[test]
+    fn file_route_serves_inside_root_and_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!("iptv-files-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("XYQTVBox")).unwrap();
+        std::fs::write(root.join("XYQTVBox/live.txt"), b"#EXTM3U\n").unwrap();
+
+        // 正常路径：能解析到根目录内
+        let ok = resolve_local_file(&root, "XYQTVBox/live.txt").expect("正常文件应可解析");
+        assert!(ok.ends_with("XYQTVBox/live.txt"));
+        // URL 编码的斜杠也要能处理
+        assert!(resolve_local_file(&root, "XYQTVBox%2Flive.txt").is_ok());
+
+        // 目录穿越：一律 403
+        assert_eq!(resolve_local_file(&root, "../secrets.txt"), Err(403));
+        assert_eq!(resolve_local_file(&root, "..%2F..%2Fetc%2Fpasswd"), Err(403));
+        assert_eq!(resolve_local_file(&root, "a/../../b"), Err(403));
+        // 不存在的文件：404
+        assert_eq!(resolve_local_file(&root, "XYQTVBox/nope.txt"), Err(404));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn throughput_is_zero_without_traffic_and_positive_after_bytes() {

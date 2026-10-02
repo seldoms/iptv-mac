@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn proxy_shim_exposes_real_port_and_proxy_url() {
         // 启一个真的本地代理（随机端口），再把 shim 放进真实 JS 上下文求值
-        let info = crate::local_proxy::start_local_proxy().expect("启动本地代理");
+        let info = crate::local_proxy::start_local_proxy(std::env::temp_dir()).expect("启动本地代理");
         let port: u16 = info
             .url
             .rsplit(':')

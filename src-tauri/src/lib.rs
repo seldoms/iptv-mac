@@ -1028,7 +1028,7 @@ pub fn run() {
             {
                 let _ = database.update_refresh_status(&serde_json::json!({ "status": "idle" }));
             }
-            let local_proxy = local_proxy::start_local_proxy().map_err(std::io::Error::other)?;
+            let local_proxy = local_proxy::start_local_proxy(data_dir.clone()).map_err(std::io::Error::other)?;
             let mut settings = load_settings(&settings_path);
             // 残留的测试开关必须先清掉，否则会出现"点开就是测试视频、没有界面"
             let scrubbed = scrub_stale_smoke_settings(&mut settings);
