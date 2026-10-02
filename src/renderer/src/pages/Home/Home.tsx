@@ -139,8 +139,7 @@ export default function Home() {
     if (activeCategory && activeCategory !== '首页') {
       fetchCategoryContent(activeCategory, 1, selectedFilters)
     }
-    // contentSiteKey 变化 = 站点内容就绪/切换完成：此时要把当前分类重新拉一次
-  }, [activeCategory, selectedFilters, fetchCategoryContent, contentSiteKey])
+  }, [activeCategory, selectedFilters, fetchCategoryContent])
 
   // Scroll detection for toolbar
   useEffect(() => {

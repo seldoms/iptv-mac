@@ -205,18 +205,6 @@ interface HomeTabs {
   selectedFilters: Record<string, string>
 }
 
-/**
- * 校验"当前选中的分类"是否属于这个站点。
- *
- * 分类按站点记忆后必须校验：记住的 type_id 可能不属于新站点（站点换过分类、
- * 或被写入时正处在切站过程中），那样会一直请求一个不存在的分类 → 界面长期"暂无数据"。
- */
-export function validActiveCategory(categories: Category[], activeCategory: string): string {
-  if (!activeCategory || activeCategory === '首页') return activeCategory
-  if (categories.length === 0) return activeCategory
-  return categories.some((cat) => String(cat.type_id) === String(activeCategory)) ? activeCategory : ''
-}
-
 function readHomeTabs(siteKey: string): HomeTabs {
   if (!siteKey) return { activeCategory: '', selectedFilters: {} }
   try {
@@ -363,7 +351,6 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
               filters: (cached?.filters as any) || {},
               homeVideos: cachedVideos,
               categoryVideos: cached?.firstCategoryPage1 || [],
-              activeCategory: validActiveCategory(cachedCategories, get().activeCategory),
               isLoading: false
             })
             break
@@ -401,7 +388,6 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
               categories,
               filters: result.filters || {},
               homeVideos,
-              activeCategory: validActiveCategory(categories, get().activeCategory),
               isLoading: false
             })
             await writeLastSiteKey(url, site.key)
@@ -465,12 +451,6 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
     const requestId = ++siteHomeRequestId
     homeContentRequestId += 1
     categoryRequestId += 1
-    // 注意：这里**故意保留** contentSiteKey / categories / homeVideos 旧值——
-    // 新站点加载完成前继续显示旧内容，避免闪白（既有回归测试盯着这一点）。
-    // 因此"标签与站点错配"不能靠清空解决，而是靠下面的守卫：
-    //   ① 切站期间（pendingSiteKey 非空）不接受分类请求
-    //   ② 分类请求打到"当前正在显示内容的站点"（contentSiteKey）
-    //   ③ 新分类到达时校验 activeCategory 是否仍属于该站点
     set({
       currentSiteKey: siteKey,
       pendingSiteKey: siteKey,
@@ -489,15 +469,13 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
         if (cached && (cached.class?.length || cached.types?.length || cached.list?.length)) {
           if (requestId !== siteHomeRequestId || get().currentSiteKey !== siteKey) return
           await writeLastSiteKey(currentConfigUrl, siteKey)
-          const cachedCategories: Category[] = cached.class || cached.types || []
           set({
             contentSiteKey: siteKey,
             pendingSiteKey: '',
-            categories: cachedCategories,
+            categories: cached.class || cached.types || [],
             filters: (cached.filters as any) || {},
             homeVideos: cached.list || [],
             categoryVideos: cached.firstCategoryPage1 || [],
-            activeCategory: validActiveCategory(cachedCategories, get().activeCategory),
             isLoading: false,
             error: null
           })
@@ -511,12 +489,10 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
                 get().contentSiteKey === siteKey &&
                 (fresh.class?.length || fresh.types?.length || fresh.list?.length)
               ) {
-                const freshCategories: Category[] = fresh.class || fresh.types || []
                 set({
-                  categories: freshCategories,
+                  categories: fresh.class || fresh.types || [],
                   filters: fresh.filters || {},
-                  homeVideos: fresh.list || [],
-                  activeCategory: validActiveCategory(freshCategories, get().activeCategory)
+                  homeVideos: fresh.list || []
                 })
               }
             })
@@ -529,15 +505,13 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
       const result = await loadSiteHome(siteKey)
       if (requestId !== siteHomeRequestId || get().currentSiteKey !== siteKey) return
       if (currentConfigUrl) await writeLastSiteKey(currentConfigUrl, siteKey)
-      const networkCategories: Category[] = result.class || result.types || []
       set({
         contentSiteKey: siteKey,
         pendingSiteKey: '',
-        categories: networkCategories,
+        categories: result.class || result.types || [],
         filters: result.filters || {},
         homeVideos: result.list || [],
         categoryVideos: [],
-        activeCategory: validActiveCategory(networkCategories, get().activeCategory),
         isLoading: false
       })
     } catch (e: any) {
@@ -593,23 +567,8 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
   },
 
   fetchCategoryContent: async (tid: string, pg: number, extend?: Record<string, string>) => {
-    // 关键：分类 type_id 是站点私有的，必须"标签属于哪个站点就请求哪个站点"。
-    // contentSiteKey 正是"当前屏幕上这套分类/内容所属的站点"：
-    //   - 切站过程中它还是旧站点 → 点旧标签就请求旧站点（配对正确，不会得到空数据）
-    //   - 新站点就绪后它变成新站点 → 自然请求新站点
-    // 之前这里是"切站期间直接忽略请求"，用户点标签毫无反应，体验比空数据更糟，已改掉。
-    const siteKey = get().contentSiteKey || get().currentSiteKey
+    const siteKey = get().currentSiteKey
     if (!siteKey) return
-    // 纵深防御：只有请求的 tid 确实属于"该站点的分类列表"才发出去
-    const currentCategories = get().categories
-    if (
-      tid !== '首页' &&
-      currentCategories.length > 0 &&
-      !currentCategories.some((cat) => String(cat.type_id) === String(tid))
-    ) {
-      console.warn('[ConfigStore] 分类不属于当前展示的站点，已忽略:', tid)
-      return
-    }
     const requestId = ++categoryRequestId
     set({ isLoading: true, error: null })
     try {
@@ -621,8 +580,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
       if (!res.success || !res.data) throw new Error(res.error || '获取分类内容失败')
       const result = res.data || {}
       const newList = result.list || []
-      // 与请求目标保持一致：屏幕上还在展示这个站点的内容就采纳结果
-      if (requestId !== categoryRequestId || (get().contentSiteKey || get().currentSiteKey) !== siteKey) return
+      if (requestId !== categoryRequestId || get().currentSiteKey !== siteKey) return
       const currentCategoryVideos = get().categoryVideos
       set({
         categoryVideos: pg === 1 ? newList : [...currentCategoryVideos, ...newList],
@@ -631,7 +589,7 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
         isLoading: false
       })
     } catch (e: any) {
-      if (requestId !== categoryRequestId || (get().contentSiteKey || get().currentSiteKey) !== siteKey) return
+      if (requestId !== categoryRequestId || get().currentSiteKey !== siteKey) return
       set({ isLoading: false, error: errorMessage(e, '获取分类内容失败') })
     }
   },
@@ -642,26 +600,20 @@ export const useConfigStore = create<ConfigState & ConfigActions>()((set, get) =
 
   setActiveCategory: (typeId: string) =>
     set((state) => {
-      // 只在内容已就绪时落盘：切站过程中 contentSiteKey 为空，写下去会把旧站点的
-      // type_id 记到新站点名下，之后一进这个站点就是"暂无数据"
-      if (state.contentSiteKey) {
-        writeHomeTabs(state.contentSiteKey, {
-          activeCategory: typeId,
-          selectedFilters: state.selectedFilters
-        })
-      }
+      writeHomeTabs(state.contentSiteKey || state.currentSiteKey, {
+        activeCategory: typeId,
+        selectedFilters: state.selectedFilters
+      })
       return { activeCategory: typeId }
     }),
 
   setSelectedFilters: (filters) =>
     set((state) => {
       const next = typeof filters === 'function' ? filters(state.selectedFilters) : filters
-      if (state.contentSiteKey) {
-        writeHomeTabs(state.contentSiteKey, {
-          activeCategory: state.activeCategory,
-          selectedFilters: next
-        })
-      }
+      writeHomeTabs(state.contentSiteKey || state.currentSiteKey, {
+        activeCategory: state.activeCategory,
+        selectedFilters: next
+      })
       return { selectedFilters: next }
     }),
   setFilters: (filters: Record<string, Filter[]>) => set({ filters }),
