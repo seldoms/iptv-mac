@@ -28,6 +28,61 @@ pub struct LocalProxyInfo {
     pub token: String,
 }
 
+/// 当前本地代理信息（JS 宿主的 `getPort`/`getProxy` 要拿真实端口与 token）
+static CURRENT_PROXY: std::sync::OnceLock<LocalProxyInfo> = std::sync::OnceLock::new();
+
+/// 本机在局域网里的地址（`getProxy(false)` 给外部播放器用）；拿不到就回落 127.0.0.1
+fn lan_ip() -> String {
+    let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return "127.0.0.1".to_string();
+    };
+    // 不会真的发包：只是让内核选出默认出口网卡，从而拿到本机地址
+    if socket.connect("8.8.8.8:80").is_err() {
+        return "127.0.0.1".to_string();
+    }
+    socket
+        .local_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// 组装代理前缀（签名对齐 FongMi `Proxy.getUrl(local)`）。
+///
+/// `local=true` 返回回环地址（应用内播放）；`false` 返回局域网地址（投屏/外部播放器）。
+pub fn proxy_prefix(info: &LocalProxyInfo, local: bool) -> String {
+    let port = info
+        .url
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(9978);
+    let host = if local { "127.0.0.1".to_string() } else { lan_ip() };
+    format!("http://{host}:{port}")
+}
+
+/// 当前生效的代理端口；还没启动时返回 0（与 FongMi 行为一致）
+pub fn current_port() -> u16 {
+    CURRENT_PROXY
+        .get()
+        .and_then(|info| info.url.rsplit(':').next())
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0)
+}
+
+/// `getProxy(local)` 的返回值：`<prefix>/stream?token=<token>&do=js`
+///
+/// 站点把 `&url=`/`&header=` 续在后面即可（我们的 `/stream` 路由已经支持这两个参数）。
+pub fn current_proxy_base(local: bool) -> String {
+    match CURRENT_PROXY.get() {
+        Some(info) => format!(
+            "{}/stream?token={}&do=js",
+            proxy_prefix(info, local),
+            urlencoding::encode(&info.token)
+        ),
+        None => String::new(),
+    }
+}
+
 pub fn start_local_proxy() -> Result<LocalProxyInfo, String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
     let addr = listener.local_addr().map_err(|error| error.to_string())?;
@@ -36,6 +91,7 @@ pub fn start_local_proxy() -> Result<LocalProxyInfo, String> {
         url: format!("http://{}", addr),
         token,
     };
+    let _ = CURRENT_PROXY.set(info.clone());
     let shared_info = Arc::new(info.clone());
 
     std::thread::spawn(move || {
@@ -562,7 +618,21 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_media_url, is_playlist_url, parse_query, parse_request_headers};
+    use super::{
+        is_allowed_media_url, is_playlist_url, parse_query, parse_request_headers, proxy_prefix,
+        LocalProxyInfo,
+    };
+
+    #[test]
+    fn builds_proxy_prefix_for_local_and_lan() {
+        let info = LocalProxyInfo {
+            url: "http://127.0.0.1:9978".to_string(),
+            token: "abc".to_string(),
+        };
+        assert_eq!(proxy_prefix(&info, true), "http://127.0.0.1:9978");
+        let lan = proxy_prefix(&info, false);
+        assert!(lan.starts_with("http://") && lan.ends_with(":9978"), "局域网前缀: {lan}");
+    }
 
     #[test]
     fn parses_query_values() {

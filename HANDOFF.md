@@ -14,6 +14,16 @@
 - 直播源「打开就报错」的现状：日志里的 `[live:refresh] 直播源下载失败` 全部是上游问题（域名失效/404/403/
   写死在 TVBox 本地代理 `127.0.0.1:9978`/本机网络不可达，已逐个用 curl + 应用同款 UA 复核）。
   唯一例外的 `clun.top` 经应用自身代码路径复测为 2.2s 成功——当时是并行探针把网络挤占导致的瞬时超时。
+- 最后更新：2026-10-02，**补齐 JS 宿主契约：rsaX / getPort / getProxy / js2Proxy**：
+  - `rsaX(mode, pub, encrypt, input, inBase64, key, outBase64)` 语义对齐 FongMi `Crypto.rsa`：
+    PEM→base64 DER（pub 走 X.509 SPKI、私钥走 PKCS#8，内部还要再解一层 SEQUENCE）、
+    `RSA/PKCS1`（v1.5 填/去填充）与 `RSA/None/NoPadding`、inBase64/outBase64 开关；纯 BigInt 实现，无新依赖。
+    **与 openssl 对拍**：解密 `openssl pkeyutl -encrypt` 的密文得到原文、NoPadding 加密逐字节一致、自往返一致。
+  - `getPort()` 返回真实本地代理端口；`getProxy(local)` 返回 `<回环|局域网>/stream?token=<token>&do=js`
+    （FongMi 约定，站点续 `&url=`/`&header=` 即可）；`js2Proxy(dynamic, siteType, siteKey, url, headers)` 按 FongMi 拼 URL。
+    实现在 Rust 侧生成的 shim（`proxy_shim_source`，单一定义来源），集成测试会真起一个代理再在真实 JS 上下文里校验。
+  - 踩过的坑：JS 位运算只有 32 位，base64 逐字符累积位在大输入上会溢出（改成 4 字符一组）；
+    PKCS#8 私钥里 `AlgorithmIdentifier` 不能漏跳；裸上下文没有 `console`，日志要 try/catch。
 - 最后更新：2026-10-02，**小窗/全屏不打断播放（已自动验证）+ 备选源做实 + 直播状态以真实播放为准**：
   - 小窗中断的根因是**换组件=换播放器实例**；现在同一个 VideoPlayer 始终挂载，小窗只是布局状态
     （`fixed inset-0 z-[9001]` 盖在黑遮罩上），新增 `components/MiniChrome`（拖动条+返回+ESC），

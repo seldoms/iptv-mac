@@ -390,13 +390,45 @@ fn module_error(ctx: &Ctx<'_>, prefix: &str, error: rquickjs::Error) -> AppError
 
 /* --------------------------------- 宿主原语 --------------------------------- */
 
+/// 生成注入本地代理信息的 JS shim（`getPort`/`getProxy` 依赖它）。
+///
+/// 代理没启动时给出 0/空串，让站点明确失败而不是拿到一个假地址。
+fn proxy_shim_source() -> String {
+    let port = crate::local_proxy::current_port();
+    let local = crate::local_proxy::current_proxy_base(true);
+    let lan = crate::local_proxy::current_proxy_base(false);
+    format!(
+        r#"globalThis.__PROXY_PORT = {port};
+globalThis.__PROXY_BASE_LOCAL = {local:?};
+globalThis.__PROXY_BASE_LAN = {lan:?};
+// getPort / getProxy / js2Proxy：签名对齐 FongMi Global.java，端口与 token 来自上面注入的值
+globalThis.getPort = function () {{ return globalThis.__PROXY_PORT || 0; }};
+globalThis.getProxy = function (local) {{
+  var base = local === false ? globalThis.__PROXY_BASE_LAN : globalThis.__PROXY_BASE_LOCAL;
+  return base || '';
+}};
+globalThis.js2Proxy = function (dynamic, siteType, siteKey, url, headers) {{
+  var base = globalThis.getProxy(!dynamic);
+  if (!base) return '';
+  var headerText = '';
+  try {{ headerText = headers && headers.stringify ? headers.stringify() : JSON.stringify(headers || {{}}); }} catch (e) {{ headerText = '{{}}'; }}
+  return base + '&from=catvod&siteType=' + encodeURIComponent(siteType) +
+    '&siteKey=' + encodeURIComponent(siteKey) +
+    '&header=' + encodeURIComponent(headerText) +
+    '&url=' + encodeURIComponent(url);
+}};"#
+    )
+}
+
 /// 安装 `_http`/`local`/`joinUrl` 等低层原语，并用 prelude 定义 `req`/`http`/`pdfh` 等（等价 FongMi `http.js` + TVBox 宿主绑定）
 pub fn install_host_primitives(ctx: &Ctx<'_>) -> Result<(), AppError> {
     install_http(ctx)?;
     install_local(ctx)?;
     install_join_url(ctx)?;
     // prelude 需要 import 内置 cheerio（pdfh/pdfa/pd 的基础），因此按模块求值
-    let module = Module::declare(ctx.clone(), "<host-prelude>", HTTP_PRELUDE)
+    // 代理端口/token 在运行时才知道，作为一小段 shim 追加在 prelude 之后
+    let prelude = format!("{HTTP_PRELUDE}\n{RSA_SHIM}\n{}", proxy_shim_source());
+    let module = Module::declare(ctx.clone(), "<host-prelude>", prelude)
         .map_err(|e| module_error(ctx, "声明宿主 prelude 失败", e))?;
     module
         .eval()
@@ -650,6 +682,170 @@ pub const TIMER_SHIM: &str = r#"
 /// - `_http`/`req`/`http`：等价 FongMi `assets://js/lib/http.js`
 /// - `pdfh`/`pdfa`/`pd`：TVBox 宿主绑定的选择器迷你语法（`a&&b--text`），drpy 站点规则大量依赖
 /// - `joinUrl`/`urljoin`、`global`/`window`/`self` 别名
+/// RSA 实现独立成片段：不依赖 cheerio/crypto-js，可在裸上下文里单测
+const RSA_SHIM: &str = r#"
+// ---- RSA：签名与 FongMi `Crypto.rsa` 一致 ----
+// rsaX(mode, pub, encrypt, input, inBase64, key, outBase64)
+//  - key 是 PEM（去掉头尾与换行后是 base64 DER）：pub → X.509 SPKI，!pub → PKCS#8
+//  - mode: 'RSA/PKCS1'（默认）或 'RSA/None/NoPadding'
+// 纯 BigInt 实现（不引第三方库）：解析 DER 取 n/e/d，自己做 PKCS#1 v1.5 填/去填充与模幂。
+var __rsaLog = function (message) {
+  try { if (typeof console !== 'undefined' && console && console.error) console.error(message); } catch (e) {}
+};
+var __rsaB64ToBytes = function (text) {
+  var normalized = String(text || '').replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  var map = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var bytes = [];
+  // 按 4 字符一组还原 3 字节：JS 位运算只有 32 位，逐字符累积位会在大输入上溢出
+  for (var i = 0; i < normalized.length; i += 4) {
+    var c0 = map.indexOf(normalized.charAt(i));
+    var c1 = map.indexOf(normalized.charAt(i + 1));
+    var c2 = map.indexOf(normalized.charAt(i + 2));
+    var c3 = map.indexOf(normalized.charAt(i + 3));
+    if (c0 < 0 || c1 < 0) continue;
+    bytes.push(((c0 << 2) | (c1 >> 4)) & 0xff);
+    if (c2 >= 0) bytes.push((((c1 & 15) << 4) | (c2 >> 2)) & 0xff);
+    if (c3 >= 0) bytes.push((((c2 & 3) << 6) | c3) & 0xff);
+  }
+  return bytes;
+};
+var __rsaBytesToB64 = function (bytes) {
+  var map = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var out = '';
+  for (var i = 0; i < bytes.length; i += 3) {
+    var b0 = bytes[i] & 0xff;
+    var b1 = i + 1 < bytes.length ? bytes[i + 1] & 0xff : 0;
+    var b2 = i + 2 < bytes.length ? bytes[i + 2] & 0xff : 0;
+    out += map.charAt(b0 >> 2);
+    out += map.charAt(((b0 & 3) << 4) | (b1 >> 4));
+    out += i + 1 < bytes.length ? map.charAt(((b1 & 15) << 2) | (b2 >> 6)) : '=';
+    out += i + 2 < bytes.length ? map.charAt(b2 & 63) : '=';
+  }
+  return out;
+};
+var __rsaBytesToBigInt = function (bytes) {
+  var value = 0n;
+  for (var i = 0; i < bytes.length; i++) value = (value << 8n) | BigInt(bytes[i]);
+  return value;
+};
+var __rsaBigIntToBytes = function (value, length) {
+  var bytes = [];
+  var current = value;
+  while (current > 0n) {
+    bytes.unshift(Number(current & 0xffn));
+    current >>= 8n;
+  }
+  while (length && bytes.length < length) bytes.unshift(0);
+  return bytes;
+};
+// 极简 DER 读取器：够用即可（SEQUENCE / INTEGER / OCTET STRING / BIT STRING）
+var __rsaDerReader = function (bytes) {
+  var offset = 0;
+  return {
+    read: function () {
+      var tag = bytes[offset++];
+      var first = bytes[offset++];
+      var length = first & 0x7f;
+      if (first & 0x80) {
+        length = 0;
+        for (var i = 0; i < (first & 0x7f); i++) length = (length << 8) | bytes[offset++];
+      }
+      var value = bytes.slice(offset, offset + length);
+      offset += length;
+      return { tag: tag, value: value };
+    },
+    done: function () { return offset >= bytes.length; }
+  };
+};
+// BIT STRING / OCTET STRING 里包的都是一层 SEQUENCE（RSAPublicKey / RSAPrivateKey），
+// 必须先把这层壳解开再读字段，否则会把 SEQUENCE 本身当成 modulus。
+var __rsaUnwrapSequence = function (bytes) {
+  var reader = __rsaDerReader(bytes);
+  return reader.read().value;
+};
+var __rsaParseKey = function (pub, key) {
+  var der = __rsaB64ToBytes(String(key || '').replace(/-----[^-]+-----/g, ''));
+  var reader = __rsaDerReader(der);
+  var top = reader.read();               // SEQUENCE
+  var inner = __rsaDerReader(top.value);
+  if (pub) {
+    inner.read();                        // AlgorithmIdentifier
+    var bitString = inner.read();        // BIT STRING → 内含 RSAPublicKey
+    var rsa = __rsaDerReader(__rsaUnwrapSequence(bitString.value.slice(1)));
+    var modulus = rsa.read();
+    var exponent = rsa.read();
+    return { n: __rsaBytesToBigInt(modulus.value), e: __rsaBytesToBigInt(exponent.value), d: null };
+  }
+  inner.read();                          // version
+  inner.read();                          // AlgorithmIdentifier
+  var octet = inner.read();              // OCTET STRING → 内含 RSAPrivateKey
+  var rsa = __rsaDerReader(__rsaUnwrapSequence(octet.value));
+  rsa.read();                            // RSAPrivateKey version
+  var n = rsa.read();
+  var e = rsa.read();
+  var d = rsa.read();
+  // 其余 (p,q,dp,dq,qinv) 不需要：只用 n/d 做模幂
+  return { n: __rsaBytesToBigInt(n.value), e: __rsaBytesToBigInt(e.value), d: __rsaBytesToBigInt(d.value) };
+};
+var __rsaModPow = function (base, exponent, modulus) {
+  var result = 1n;
+  var b = base % modulus;
+  var exp = exponent;
+  while (exp > 0n) {
+    if (exp & 1n) result = (result * b) % modulus;
+    b = (b * b) % modulus;
+    exp >>= 1n;
+  }
+  return result;
+};
+var __rsaPkcs1Pad = function (message, size) {
+  if (message.length > size - 11) throw new Error('RSA 明文过长');
+  var padding = [0x00, 0x02];
+  while (padding.length < size - message.length - 1) {
+    var random = 1 + Math.floor(Math.random() * 255);   // 非零填充字节
+    padding.push(random);
+  }
+  padding.push(0x00);
+  return padding.concat(message);
+};
+var __rsaPkcs1Unpad = function (block) {
+  if (block.length < 11 || block[0] !== 0x00) throw new Error('RSA 填充非法');
+  var type = block[1];
+  if (type !== 0x01 && type !== 0x02) throw new Error('RSA 填充类型非法');
+  var index = 2;
+  while (index < block.length && block[index] !== 0x00) index++;
+  return block.slice(index + 1);
+};
+globalThis.rsaX = function (mode, pub, encrypt, input, inBase64, key, outBase64) {
+  try {
+    var parsed = __rsaParseKey(!!pub, key);
+    var exponent = encrypt ? (!!pub ? parsed.e : parsed.d) : (!!pub ? parsed.e : parsed.d);
+    var size = Math.ceil(__rsaBigIntToBytes(parsed.n, 0).length);
+    var inputBytes = inBase64
+      ? __rsaB64ToBytes(input)
+      : (function () { var out = []; var text = String(input); for (var i = 0; i < text.length; i++) out.push(text.charCodeAt(i) & 0xff); return out; })();
+    var noPadding = /NoPadding/i.test(String(mode || ''));
+    var block;
+    if (encrypt) {
+      block = noPadding ? inputBytes : __rsaPkcs1Pad(inputBytes, size);
+    } else {
+      block = inputBytes;
+    }
+    var result = __rsaModPow(__rsaBytesToBigInt(block), exponent, parsed.n);
+    var outBytes = __rsaBigIntToBytes(result, size);
+    if (!encrypt && !noPadding) outBytes = __rsaPkcs1Unpad(outBytes);
+    if (outBase64) return __rsaBytesToB64(outBytes);
+    var text = '';
+    for (var i = 0; i < outBytes.length; i++) text += String.fromCharCode(outBytes[i]);
+    return text;
+  } catch (e) {
+    __rsaLog('rsaX error: ' + (e && e.message));
+    return '';
+  }
+};
+
+"#;
+
 const HTTP_PRELUDE: &str = r#"
 import cheerio from 'assets://js/lib/cheerio.min.js';
 import 'assets://js/lib/crypto-js.js';
@@ -829,14 +1025,6 @@ globalThis.aesX = function (mode, encrypt, input, inBase64, key, iv, outBase64) 
   }
 };
 
-// rsaX / getPort / getProxy：FongMi 由 Java 侧实现（RSA 与本地代理端口）。
-// 这里先给出明确语义的占位，避免站点以"某个名字未定义"这种无从判断的方式失败。
-globalThis.rsaX = function () {
-  console.error('rsaX 暂未实现（需要 RSA 实现，当前运行时未提供）');
-  return '';
-};
-globalThis.getPort = function () { return 0; };
-globalThis.getProxy = function (url) { return url; };
 
 function defineGlobalAlias(name) {
   var descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -854,6 +1042,109 @@ function defineGlobalAlias(name) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_shim_exposes_real_port_and_proxy_url() {
+        // 启一个真的本地代理（随机端口），再把 shim 放进真实 JS 上下文求值
+        let info = crate::local_proxy::start_local_proxy().expect("启动本地代理");
+        let port: u16 = info
+            .url
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("端口");
+        let runtime = rquickjs::Runtime::new().expect("runtime");
+        let ctx = rquickjs::Context::full(&runtime).expect("context");
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(proxy_shim_source().as_str()).expect("求值 shim");
+            let real_port: u16 = ctx.eval("getPort()").expect("getPort");
+            assert_eq!(real_port, port, "getPort 必须返回真实端口");
+            let proxy: String = ctx.eval("getProxy(true)").expect("getProxy");
+            assert!(
+                proxy.starts_with(&format!("http://127.0.0.1:{port}/stream?token=")),
+                "getProxy(true) 应为回环地址 + token: {proxy}"
+            );
+            assert!(proxy.ends_with("do=js"), "getProxy 需要带 do=js（FongMi 约定）: {proxy}");
+            // js2Proxy 拼出的 URL 必须能被 /stream 解析：带 token/url/header
+            let js2: String = ctx
+                .eval("js2Proxy(false, 1, 'siteA', 'http://example.com/a.m3u8', {})")
+                .expect("js2Proxy");
+            assert!(js2.contains("from=catvod") && js2.contains("siteKey=siteA"), "js2Proxy: {js2}");
+            assert!(js2.contains("url=http%3A%2F%2Fexample.com%2Fa.m3u8"), "js2Proxy url 需编码: {js2}");
+        });
+    }
+
+/// 与 openssl 对拍的 RSA 测试向量（2048 位密钥 + 密文；用 `openssl pkeyutl` 生成）
+const PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDGOsYW38SbIKhX\nMW1BnuUU87QL/0ClfL/hayIMFG27Vf8SfbjOO7HdWV1On7TCFROmf9tq8edGW2Wk\n2lIk4+E5MU9cbw5RuxT6dPw1oqi5/3M3752qZjW4ECTucUjAoh4347rnH1o0aN9u\nhg4xINj4DPugVaWWx5xBd83ndizuYkDmroOpd9++S236vBVLxCoshypK5/KF8cxL\nsE32Dcx1lW8FrKOqk4cFEGD3IldfxzodGxUViFnDQKKi1ZhfU6wGQZc8d4/+CPea\n+9pXCRpHQmhc/c9I8fDUXqPzHrFKwI2G4pVUax9ZI8dD/FF3JPnifvEm7ymQ9RRv\nB6Y8SNJBAgMBAAECggEAHj9rKSPhg/tOfKmT3prAoXsTau463tWjkOHQWvAGE3sq\nlhd9iuikeh5wBLaNdj0Rl8s0P8QkUoHRR3+x36OvIxNBZR0kHfgSWipeLtAAd4tB\neVRUpmL8yPabsA+0toI2Yrha9Xf9A3jKOTr28Ouud+FBRySyhQi18O53Sp2newNZ\nwHBEm2iq8dg93mGvCUy+Qts/lOv8cJtL434XeFEWfzxXnhYpHlxLHEgRGEjyl7Yp\nAD5bA8AclrAA5xPoXWpW9224mD3g1Ioet2PjHVJ9z2LrzUGCVFBRA7zHbWxmNKSX\nUGoIA4a8t/JJv5LukYxAQhGKrr3Zr826ep0+12Q97QKBgQDuaHGPaWeSx18i1QhA\ncFr75PsYuHmeZG5q8RLeY7533bnzJ2tpJvvEsQEIPh8WFxL0WSf92tEdW2YEy7eT\nz5aNOeRFVVb7WdmWfKkJtyThI1mxHQQFIa4RI8+cHFNv/ymseg0DCFtprfUu1Wdg\niS/M5uLFN3yJdL63TJJV2l0OPQKBgQDU21ry8K3utRbpOFzxZPY886bB7zbQRctT\n0TrpR5V4lyUKfY1wYykh2BPkxI6ThjaF5PAiQOn6XvFquQLIFMRZR5HHYRb3WsYW\ny/5JJbwrbBFWUd4+GPBFSssynEJSHo8ULAMICJM1EMrHTtPcV31CrtRzqFGv8iRY\n8LnLHXj4VQKBgQCsS5j+Xtu2bRWpM7JB97EZaFO7et6SBNzztoO/avBk6j4Pp0Zt\n+PltHcq0LUkECurs4l4PjQshn0MsZhmm3hhcuiDpppI1Fqs0oaT8W3pwpr6UTHby\nSnPk+S96D9KRFyQD/TTYIzsFNe4CycFrN9nuyFHM25vKLzABgnojR6uGtQKBgHns\nJ51OVSKNIdF20m4G2bCyE4u0XN5RjBS3nRnwQeKwGKx4nCKK+g2DumloWQ6Ravuo\n1g+YxSz/YyMxVDGNC6bkAtGEgGYw3ZRDRqVZcv4gSZH7FOTW3hGitN+Jd8eX73ar\nexUH7GIR+0TMlzf3+SzP/as994Rjm4RCZvm8KQV9AoGBAMkKYUiO8MiGTLefqnc7\n64EP2RdE4e+ebOuk2FYmhTMais3UvxXrTBClYm4gxsga73JtpHja0UJauQfzZBbl\nU6G1XCp1lhmmxKt7ckin4gvaBIdrU+c8uXuOoRRucByWVhfPLr8XduoOtYGn942O\nTyG7XE5wfvxxAQVtKrUE5yap\n-----END PRIVATE KEY-----";
+const PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxjrGFt/EmyCoVzFtQZ7l\nFPO0C/9ApXy/4WsiDBRtu1X/En24zjux3VldTp+0whUTpn/bavHnRltlpNpSJOPh\nOTFPXG8OUbsU+nT8NaKouf9zN++dqmY1uBAk7nFIwKIeN+O65x9aNGjfboYOMSDY\n+Az7oFWllsecQXfN53Ys7mJA5q6DqXffvktt+rwVS8QqLIcqSufyhfHMS7BN9g3M\ndZVvBayjqpOHBRBg9yJXX8c6HRsVFYhZw0CiotWYX1OsBkGXPHeP/gj3mvvaVwka\nR0JoXP3PSPHw1F6j8x6xSsCNhuKVVGsfWSPHQ/xRdyT54n7xJu8pkPUUbwemPEjS\nQQIDAQAB\n-----END PUBLIC KEY-----";
+const PRIV_CT_B64: &str = "C6qX1hROPr9M2KHXvvU35N1wW+kUuYYaWMRDWMkahxDTZZpsKm5bomocQQT+YZQp5bw+2jhUpU6hPLEm2fQlkH4LqeZMBySEi0sQXhJAu5MMCpfRbac9W5c9IuDOmJP+ZFljTn2ALWqwHXMsSEAyHiBTZprib11HTWN7+X2oAz2q6oeZMLerdAOpUat4sef07n6F8ueRBaM0iiJYROsbBXoktovo9gT6BIWqxqSezoLptIN0NeFjQlFwnN1RwMvkdf4F5E7atE9F015wccNpC+uN+SXJO82BkPHEZ6ZsOB+eDXOAVnPrswoRKgUC52+3ypSTAxgzrPQZNrKp52jt8g==";
+const NP_INPUT_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhlbGxvLXJzYQ==";
+const NP_CT_B64: &str = "AETuu+S6Ost6GcMoDV/zZzMmWja/slYWGjGNgFqOHE1cQuitTTIRKrVNZURoA5vTwrg3z/6SvVPlTuNKfslTIrlwOHiIYUiumbR6CfTU5lFPHWz2PV8+MBVbVpBUdbrTWE7BETHgxyZf7ucdBTBwJCOLCHaURiUlqDT83aRcY7O6eQDkKveTi6H3b7nNSmLOHVGC/BLcXobM6kFKrFjdsx0tBsrM0xA7DqFLOcUEo+YzERbDPDQmU7iYDS6amBG/VFCBJJCGrSy33J5lrngxB9C0nY5VHmJl3dFxGIRXZlTvro0jJbxuiPm5kpe59gzxNTYWuh7dyaXEvSwBKWZWPA==";
+
+    #[test]
+    fn rsa_x_decrypts_openssl_pkcs1_ciphertext() {
+        let runtime = rquickjs::Runtime::new().expect("runtime");
+        let ctx = rquickjs::Context::full(&runtime).expect("context");
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(RSA_SHIM).expect("求值 RSA_SHIM");
+            let script = format!(
+                "rsaX('RSA/PKCS1', false, false, {ct:?}, true, {key:?}, false)",
+                ct = PRIV_CT_B64,
+                key = PRIV_PEM
+            );
+            let out: String = ctx.eval(script.as_str()).expect("rsaX 解密");
+            assert_eq!(out, "hello-rsa", "必须与 Java/OpenSSL 的 PKCS#1 v1.5 解密一致");
+        });
+    }
+
+    #[test]
+    fn rsa_x_encrypt_round_trips_with_openssl_decrypt() {
+        // 我们加密 → 用私钥（同一实现）解密回来；同时输出 base64 供与 openssl 对照
+        let runtime = rquickjs::Runtime::new().expect("runtime");
+        let ctx = rquickjs::Context::full(&runtime).expect("context");
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(RSA_SHIM).expect("求值 RSA_SHIM");
+            let script = format!(
+                "(function(){{ var ct = rsaX('RSA/PKCS1', true, true, 'hello-rsa', false, {pub:?}, true); \
+                  if (!ct) return 'ENCRYPT_FAILED'; \
+                  return rsaX('RSA/PKCS1', false, false, ct, true, {priv:?}, false); }})()",
+                pub = PUB_PEM,
+                priv = PRIV_PEM
+            );
+            let out: String = ctx.eval(script.as_str()).expect("RSA 往返");
+            assert_eq!(out, "hello-rsa", "加密后再解密必须还原");
+        });
+    }
+
+    #[test]
+    fn rsa_x_no_padding_matches_openssl_vector() {
+        let runtime = rquickjs::Runtime::new().expect("runtime");
+        let ctx = rquickjs::Context::full(&runtime).expect("context");
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(RSA_SHIM).expect("求值 RSA_SHIM");
+            // NoPadding 是确定性运算：我们加密的结果必须与 openssl 的密文逐字节相同
+            let script = format!(
+                "rsaX('RSA/None/NoPadding', true, true, {input:?}, true, {pub:?}, true)",
+                input = NP_INPUT_B64,
+                pub = PUB_PEM
+            );
+            let out: String = ctx.eval(script.as_str()).expect("RSA NoPadding 加密");
+            assert_eq!(out, NP_CT_B64, "NoPadding 结果必须与 openssl 完全一致");
+        });
+    }
+
+    #[test]
+    fn rsa_x_returns_empty_on_bad_key() {
+        let runtime = rquickjs::Runtime::new().expect("runtime");
+        let ctx = rquickjs::Context::full(&runtime).expect("context");
+        ctx.with(|ctx| {
+            ctx.eval::<(), _>(RSA_SHIM).expect("求值 RSA_SHIM");
+            let out: String = ctx
+                .eval("rsaX('RSA/PKCS1', true, true, 'x', false, 'not-a-key', true)")
+                .expect("rsaX 容错");
+            assert_eq!(out, "", "坏 key 应返回空串而不是抛错");
+        });
+    }
 
     #[test]
     fn resolves_assets_and_lib_prefixes() {
