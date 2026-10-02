@@ -14,6 +14,16 @@
 - 直播源「打开就报错」的现状：日志里的 `[live:refresh] 直播源下载失败` 全部是上游问题（域名失效/404/403/
   写死在 TVBox 本地代理 `127.0.0.1:9978`/本机网络不可达，已逐个用 curl + 应用同款 UA 复核）。
   唯一例外的 `clun.top` 经应用自身代码路径复测为 2.2s 成功——当时是并行探针把网络挤占导致的瞬时超时。
+- 最后更新：2026-10-02，**品牌统一 + 关于页署名 + main 成为维护分支 + CI 上线**：
+  - **品牌**：应用图标与界面 logo 统一为**黄色 TV**（`src-tauri/icons` 保持 6 月版黄色 TV 图标；
+    `src/renderer/src/assets/logo.svg` 重绘为同一套设计）。曾一度改成猫猫电视图标，用户要求改回黄色 TV。
+  - **关于页**：只有「版本 x.y.z」+「文波事业部荣誉出品，感谢文波先生对本项目的全资赞助」，有契约测试守住。
+  - **分支策略**：`main` 已是维护分支（把 `codex/iptv-mac-product-upgrade` 的工作并入并推送；
+    与远端 1 个 PRODUCT_ROADMAP 编辑做过一次 merge，采纳远端内容）。**后续直接在 main 上提交。**
+  - **CI 上线**：`.github/workflows/build-macos.yml` —— 推送 main / 打 v* tag 时在 GitHub macOS runner 上
+    跑类型检查 + 前端测试 + Rust 测试 + 打包 `.app`/`.dmg`，tag 时自动附到 Release（产物未签名，首次打开需右键→打开）。
+  - **release 版**：`.app` 53M（debug 93M），已装到 `/Applications/IPTV Mac.app` 并核对 md5。
+    ⚠️ 本机 `tauri build --bundles app,dmg` 的 **DMG 步骤会卡住**（hdiutil 挂载未完成），本机只打 `--bundles app`，DMG 交给 CI。
 - 最后更新：2026-10-02，**修掉"点开 App 直接播放测试视频、没有界面"（我造成的）**：
   - 根因：自动化 smoke 的开关（`IPTV_ALPHA_PLAYBACK_SMOKE=1` 等）会被注入 settings 并**持久化到 settings.json**，
     于是之后每次启动都进入"只渲染播放器"的测试模式（用户看到的就是"直接播放动画片、回不到界面"）。
