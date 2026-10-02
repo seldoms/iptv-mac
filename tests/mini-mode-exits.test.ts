@@ -11,7 +11,7 @@ describe('回到页面中播放：出口按钮与快捷键', () => {
   const chrome = read('src/renderer/src/components/MiniChrome/MiniChrome.tsx')
 
   it('小窗有明确的「返回」按钮与 ESC', () => {
-    expect(chrome).toContain('返回完整界面（ESC）')
+    expect(chrome).toContain('返回界面')
     expect(chrome).toContain("event.key !== 'Escape'")
     expect(chrome).toContain('leaveMiniMode')
   })

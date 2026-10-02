@@ -28,21 +28,21 @@ export default function MiniChrome() {
 
   return (
     <div
-      className="fixed inset-x-0 top-0 z-[9002] flex h-7 items-center justify-between bg-gradient-to-b from-black/70 to-transparent px-2 select-none"
+      className="fixed inset-x-0 top-0 z-[9002] flex h-9 items-center justify-between bg-gradient-to-b from-black/80 to-transparent px-2 select-none"
       data-tauri-drag-region="deep"
-      title="拖动此处可移动小窗"
+      title="拖动这里或画面任意位置都能移动小窗"
     >
-      <span className="flex items-center gap-1 text-[10px] text-white/50" data-tauri-drag-region="deep">
-        <GripHorizontal className="h-3 w-3" />
-        精简模式
+      <span className="flex items-center gap-1 text-[11px] text-white/60" data-tauri-drag-region="deep">
+        <GripHorizontal className="h-3.5 w-3.5" />
+        精简模式 · 拖动画面可移动
       </span>
       <button
         onClick={() => void exitMiniMode()}
-        className="flex items-center gap-1 rounded border border-white/20 px-2 py-0.5 text-[10px] text-white/80 transition-colors hover:border-accent hover:text-accent"
-        title="返回完整界面（ESC）"
+        className="flex items-center gap-1 rounded-md border border-accent/70 bg-black/50 px-2.5 py-1 text-[11px] font-medium text-accent transition-colors hover:bg-accent hover:text-bg-primary"
+        title="返回界面（也可以按 ESC）"
       >
-        <ArrowLeftRight className="h-3 w-3" />
-        返回
+        <ArrowLeftRight className="h-3.5 w-3.5" />
+        返回界面
       </button>
     </div>
   )

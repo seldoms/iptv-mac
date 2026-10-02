@@ -193,6 +193,16 @@ export default function VideoPlayer({
     linkSpeedKbps: null
   })
   // 右上角码率/速度面板的显隐开关（用户要求底部有按钮控制），持久化
+  // 进入全屏/小窗后给几秒操作提示——用户反馈"进去以后不知道怎么回来"
+  const [modeHint, setModeHint] = useState<string>('')
+  const modeHintTimerRef = useRef<number>(0)
+  const showModeHint = useCallback((text: string, ms = 5000) => {
+    setModeHint(text)
+    window.clearTimeout(modeHintTimerRef.current)
+    modeHintTimerRef.current = window.setTimeout(() => setModeHint(''), ms)
+  }, [])
+  useEffect(() => () => window.clearTimeout(modeHintTimerRef.current), [])
+
   const [showStreamStats, setShowStreamStats] = useState<boolean>(() => {
     try {
       // 键名带版本：早期调试残留的 '0' 不该再把面板默认藏起来
@@ -547,6 +557,7 @@ export default function VideoPlayer({
         return
       }
       await windowApi.enterMiniMode()
+      showModeHint('已进入小窗：拖动画面可移动 · 点右上角「返回界面」或按 ESC 回到界面', 6000)
       await ensurePlaying(wasPlaying)
       const url = new URL(window.location.href)
       url.searchParams.set('mode', 'mini')
@@ -1019,13 +1030,15 @@ export default function VideoPlayer({
       } else {
         await container.requestFullscreen()
         setIsActualFullscreen(true)
+        showModeHint('已进入全屏：按 ESC 或双击画面退出', 4000)
       }
     } catch {
       const nextFullscreen = !isActualFullscreen
       await windowApi.setFullscreen(nextFullscreen).catch(() => {})
       setIsActualFullscreen(nextFullscreen)
+      if (nextFullscreen) showModeHint('已进入全屏：按 ESC 或双击画面退出', 4000)
     }
-  }, [isActualFullscreen])
+  }, [isActualFullscreen, showModeHint])
 
   /* ---------- 播放连续性 smoke（仅 IPTV_CONTINUITY_SMOKE=1 时运行）----------
    * 目的：用可验证的方式证明「全屏 / 小窗只是换布局」——切换前后 currentTime 必须继续增长，
@@ -1428,6 +1441,15 @@ export default function VideoPlayer({
               应用会尝试自动换源；也可以切换线路或重试当前集。
             </span>
           )}
+        </div>
+      )}
+
+      {/* 全屏/小窗操作提示（几秒后自动消失） */}
+      {modeHint && (
+        <div className="pointer-events-none absolute inset-x-0 top-12 z-40 flex justify-center px-4">
+          <div className="rounded-full border border-white/15 bg-black/70 px-4 py-1.5 text-center text-xs text-white/90 shadow-lg backdrop-blur">
+            {modeHint}
+          </div>
         </div>
       )}
 
