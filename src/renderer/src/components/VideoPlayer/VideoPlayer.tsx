@@ -195,7 +195,8 @@ export default function VideoPlayer({
   // 右上角码率/速度面板的显隐开关（用户要求底部有按钮控制），持久化
   const [showStreamStats, setShowStreamStats] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('iptv.showStreamStats') !== '0'
+      // 键名带版本：早期调试残留的 '0' 不该再把面板默认藏起来
+      return localStorage.getItem('iptv.showStreamStats.v2') !== '0'
     } catch {
       return true
     }
@@ -215,7 +216,7 @@ export default function VideoPlayer({
 
   useEffect(() => {
     try {
-      localStorage.setItem('iptv.showStreamStats', showStreamStats ? '1' : '0')
+      localStorage.setItem('iptv.showStreamStats.v2', showStreamStats ? '1' : '0')
     } catch {
       /* 隐私模式下写入失败可忽略 */
     }
@@ -394,11 +395,12 @@ export default function VideoPlayer({
 
   // 原生路径统计采样：只在需要显示统计时跑，避免无谓开销
   useEffect(() => {
-    if (!showStreamStats || !isPlaying) return
+    if (!isPlaying) return
     let lastDecoded: { bytes: number; at: number } | null = null
     // 码率不能直接用瞬时下载速度（起播时会突发灌缓冲，几十 Mbps 是假象）。
-    // 用「代理转发字节增量 ÷ 已缓冲时长增量」算媒体码率：突发阶段缓冲时长同步增长，比值稳定。
-    let firstSample: { bytes: number; buffered: number } | null = null
+    // 用「代理转发字节增量 ÷ 已播放媒体时长增量」：窗口越长越准（缓冲超前量是有限常数，
+    // 占比随时间衰减）。不能用"已缓冲时长"——直播的缓冲是**滑动窗口**，长度不增长。
+    let baseline: { bytes: number; mediaTime: number } | null = null
     const timer = window.setInterval(() => {
       const video = videoRef.current as
         | (HTMLVideoElement & { webkitVideoDecodedByteCount?: number })
@@ -417,17 +419,18 @@ export default function VideoPlayer({
           const payload = result as { kbps?: number; totalBytes?: number } | null
           const kbps = Number(payload?.kbps ?? 0)
           const totalBytes = Number(payload?.totalBytes ?? 0)
-          const bufferedEnd = video && video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0
-          const bufferedStart = video && video.buffered.length ? video.buffered.start(0) : 0
-          const buffered = Math.max(0, bufferedEnd - bufferedStart)
-          if (!firstSample && totalBytes > 0 && buffered > 0) {
-            firstSample = { bytes: totalBytes, buffered }
+          const mediaTime = video && Number.isFinite(video.currentTime) ? video.currentTime : 0
+          // 回退/换源导致时间倒流时重设基准，避免负数或离谱值
+          if (baseline && mediaTime < baseline.mediaTime) baseline = null
+          if (!baseline && totalBytes > 0 && mediaTime > 0) {
+            baseline = { bytes: totalBytes, mediaTime }
           }
           let mediaBitrate: number | null = null
-          if (firstSample && buffered > firstSample.buffered) {
-            const bytesDelta = totalBytes - firstSample.bytes
-            if (bytesDelta > 0) {
-              mediaBitrate = (bytesDelta * 8) / (buffered - firstSample.buffered) / 1000
+          if (baseline) {
+            const bytesDelta = totalBytes - baseline.bytes
+            const timeDelta = mediaTime - baseline.mediaTime
+            if (bytesDelta > 0 && timeDelta >= 3) {
+              mediaBitrate = (bytesDelta * 8) / timeDelta / 1000
             }
           }
           setNativeStats((prev) => ({
@@ -436,10 +439,12 @@ export default function VideoPlayer({
             linkSpeedKbps: kbps > 0 ? smoothThroughput(prev.linkSpeedKbps, kbps) : prev.linkSpeedKbps
           }))
         })
-        .catch(() => {})
+        .catch((error) => {
+          console.warn('[stats] proxy:throughput 调用失败:', error)
+        })
     }, 2000)
     return () => window.clearInterval(timer)
-  }, [showStreamStats, isPlaying])
+  }, [isPlaying])
 
   useEffect(() => {
     if (!miniPlayerMode) return
@@ -1061,10 +1066,10 @@ export default function VideoPlayer({
         linkSpeedKbps: statsRef.current.linkSpeedKbps
       }
     }
-    const report = (samples: ReturnType<typeof sample>[]) => {
+    const report = (samples: ReturnType<typeof sample>[], extra: Record<string, unknown> = {}) => {
       const advancing = samples.every((item, index) => index === 0 || item.currentTime > samples[index - 1].currentTime)
       const stableInstances = new Set(samples.map((item) => item.hlsInstances)).size === 1
-      const payload = { advancing, stableInstances, samples }
+      const payload = { advancing, stableInstances, samples, ...extra }
       void invoke('log:frontend', 'info', `[continuity] ${JSON.stringify(payload)}`).catch(() => {})
       void settingsApi.set('__continuitySmokeResult', payload).catch(() => {})
       console.log('[continuity] 结果:', JSON.stringify(payload))
@@ -1093,10 +1098,39 @@ export default function VideoPlayer({
       await wait(1500)
       await ensurePlaying(true)
       samples.push(sample('esc-from-mini'))
-      report(samples)
+      // 拖动接口（小窗整块可拖依赖它）也顺手验证：权限没配时这里会失败
+      let dragApiOk = false
+      try {
+        await windowApi.startDragging()
+        dragApiOk = true
+      } catch (error) {
+        console.warn('[smoke] startDragging 失败:', error)
+      }
+      report(samples, { dragApiOk })
     }
     void run()
   }, [continuityConfig, handleEnterMiniMode, handleToggleFullscreen])
+
+  // 小窗模式：按住画面任意位置即可拖动窗口（不必去找顶部那条很窄的拖动条）。
+  // 按钮/进度条/下拉等可交互元素要排除，否则点它们会变成拖窗口。
+  const handlePlayerPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (!miniPlayerMode) return
+      if (event.button !== 0) return
+      const target = event.target as HTMLElement | null
+      if (
+        target?.closest(
+          'button, input, select, textarea, a, label, [role="button"], [data-no-window-drag]'
+        )
+      ) {
+        return
+      }
+      void windowApi
+        .startDragging()
+        .catch((error) => console.warn('[VideoPlayer] 拖动小窗失败:', error))
+    },
+    [miniPlayerMode]
+  )
 
   const handleDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement
@@ -1343,9 +1377,17 @@ export default function VideoPlayer({
       style={miniPlayerMode ? undefined : miniTransitionStyle || undefined}
       onMouseMove={resetHideTimer}
       onMouseLeave={() => isPlaying && setShowControls(false)}
+      onPointerDown={handlePlayerPointerDown}
       onDoubleClick={handleDoubleClick}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} x-webkit-airplay="allow" />
+      <video
+        ref={videoRef}
+        className="w-full h-full object-contain"
+        playsInline
+        muted={volume <= 0}
+        x-webkit-airplay="allow"
+        draggable={false}
+      />
 
       {showStreamStats && currentUrl && (
         <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
@@ -1402,7 +1444,7 @@ export default function VideoPlayer({
         }`}
       >
         {/* 进度条 */}
-        <div className="mb-2 cursor-pointer group/progress" onClick={handleProgressClick}>
+        <div className="mb-2 cursor-pointer group/progress" data-no-window-drag onClick={handleProgressClick}>
           <div className="h-1 group-hover/progress:h-2 bg-white/20 rounded-full transition-all relative">
             <div
               className="h-full bg-accent rounded-full relative"

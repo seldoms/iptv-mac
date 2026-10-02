@@ -354,6 +354,8 @@ export const windowApi = {
   resizeMiniMode: (width: number, height: number) => invoke('window:resizeMiniMode', width, height),
   setFullscreen: (fullscreen: boolean) => invoke('window:setFullscreen', fullscreen),
   isFullscreen: () => invoke('window:isFullscreen'),
+  /** 开始拖动窗口（小窗模式下按住画面任意位置即可移动窗口） */
+  startDragging: () => tauriInvoke('plugin:window|start_dragging'),
   exitMiniMode: () => invoke('window:exitMiniMode'),
   applyMode: (mini: boolean) => invoke('window:applyMode', mini)
 }

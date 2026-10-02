@@ -22,13 +22,15 @@ describe('码率/速度面板：能显示（含原生播放路径）+ 有开关�
 
   it('底部控制栏有显隐开关，且状态持久化', () => {
     expect(player).toContain('setShowStreamStats')
-    expect(player).toContain("localStorage.getItem('iptv.showStreamStats')")
-    expect(player).toContain("localStorage.setItem('iptv.showStreamStats'")
+    expect(player).toContain("localStorage.getItem('iptv.showStreamStats.v2')")
+    expect(player).toContain("localStorage.setItem('iptv.showStreamStats.v2'")
     expect(player).toContain("'隐藏码率/速度'")
     expect(player).toContain('aria-pressed={showStreamStats}')
   })
 
-  it('面板渲染受开关控制', () => {
+  it('面板渲染受开关控制，但采样不受开关影响（否则关一次就长期没数据）', () => {
     expect(player).toContain('{showStreamStats && currentUrl && (')
+    expect(player).not.toContain('if (!showStreamStats || !isPlaying) return')
+    expect(player).toContain('if (!isPlaying) return')
   })
 })
