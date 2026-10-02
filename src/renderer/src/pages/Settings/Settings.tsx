@@ -947,8 +947,10 @@ export default function Settings() {
 
         {/* 关于：只保留版本号 */}
         {activeTab === 'about' && (
-          <div className="max-w-2xl">
+          <div className="max-w-2xl space-y-2">
             <p className="text-sm text-text-muted">版本 {version}</p>
+            {/* 出品/赞助署名 */}
+            <p className="text-sm text-text-secondary">文波事业部荣誉出品，感谢文波先生对本项目的全资赞助</p>
           </div>
         )}
 

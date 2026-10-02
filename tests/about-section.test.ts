@@ -14,6 +14,7 @@ describe('设置页「关于」区块契约', () => {
     const about = settings.slice(start, settings.indexOf('{/* Delete confirmation dialog */}', start))
 
     expect(about).toContain('版本 {version}')
+    expect(about).toContain('文波事业部荣誉出品，感谢文波先生对本项目的全资赞助')
     for (const removed of ['检查更新', 'FomgMi', 'FongMi', '本地服务', 'API Token', 'text-lg font-semibold']) {
       expect(about).not.toContain(removed)
     }
