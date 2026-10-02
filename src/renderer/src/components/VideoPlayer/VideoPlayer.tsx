@@ -26,7 +26,8 @@ import {
   Copy,
   X,
   RotateCw,
-  Shuffle
+  Shuffle,
+  Activity
 } from 'lucide-react'
 import { historyApi, invoke, settingsApi, windowApi } from '@/utils/ipc'
 import { leaveMiniMode } from '@/utils/miniMode'
@@ -185,6 +186,40 @@ export default function VideoPlayer({
   // 小窗模式：只换布局、不重挂载（下面的 HLS 初始化 effect 不依赖它，所以流不会重来）
   const miniPlayerMode = useUiStore((state) => state.miniMode)
   const [streamStats, setStreamStats] = useState<StreamStats>(emptyStreamStats)
+  // 原生播放路径（macOS HLS 走 video.src，没有 HLS.js 分片事件）的统计：
+  // 速度取本地代理真实吞吐，码率取已解码字节增量
+  const [nativeStats, setNativeStats] = useState<{ bitrateKbps: number | null; linkSpeedKbps: number | null }>({
+    bitrateKbps: null,
+    linkSpeedKbps: null
+  })
+  // 右上角码率/速度面板的显隐开关（用户要求底部有按钮控制），持久化
+  const [showStreamStats, setShowStreamStats] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('iptv.showStreamStats') !== '0'
+    } catch {
+      return true
+    }
+  })
+
+  // smoke 采样时需要读到最新统计值（effect 闭包里的 state 是旧快照）
+  const statsRef = useRef<{ bitrateKbps: number | null; linkSpeedKbps: number | null }>({
+    bitrateKbps: null,
+    linkSpeedKbps: null
+  })
+  useEffect(() => {
+    statsRef.current = {
+      bitrateKbps: streamStats.bitrateKbps ?? nativeStats.bitrateKbps,
+      linkSpeedKbps: nativeStats.linkSpeedKbps ?? streamStats.linkSpeedKbps
+    }
+  }, [streamStats, nativeStats])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('iptv.showStreamStats', showStreamStats ? '1' : '0')
+    } catch {
+      /* 隐私模式下写入失败可忽略 */
+    }
+  }, [showStreamStats])
 
   // ==================== 换源：触发失败事件 ====================
   // 稳定的 ref 函数，不依赖外部 state 变化
@@ -356,6 +391,55 @@ export default function VideoPlayer({
   useEffect(() => {
     return () => savePlaybackHistory(true)
   }, [savePlaybackHistory])
+
+  // 原生路径统计采样：只在需要显示统计时跑，避免无谓开销
+  useEffect(() => {
+    if (!showStreamStats || !isPlaying) return
+    let lastDecoded: { bytes: number; at: number } | null = null
+    // 码率不能直接用瞬时下载速度（起播时会突发灌缓冲，几十 Mbps 是假象）。
+    // 用「代理转发字节增量 ÷ 已缓冲时长增量」算媒体码率：突发阶段缓冲时长同步增长，比值稳定。
+    let firstSample: { bytes: number; buffered: number } | null = null
+    const timer = window.setInterval(() => {
+      const video = videoRef.current as
+        | (HTMLVideoElement & { webkitVideoDecodedByteCount?: number })
+        | null
+      const decoded = video?.webkitVideoDecodedByteCount
+      let instantBitrate: number | null = null
+      if (typeof decoded === 'number' && decoded > 0) {
+        const now = performance.now()
+        if (lastDecoded && now > lastDecoded.at) {
+          instantBitrate = ((decoded - lastDecoded.bytes) * 8) / ((now - lastDecoded.at) / 1000) / 1000
+        }
+        lastDecoded = { bytes: decoded, at: now }
+      }
+      void invoke('proxy:throughput')
+        .then((result) => {
+          const payload = result as { kbps?: number; totalBytes?: number } | null
+          const kbps = Number(payload?.kbps ?? 0)
+          const totalBytes = Number(payload?.totalBytes ?? 0)
+          const bufferedEnd = video && video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0
+          const bufferedStart = video && video.buffered.length ? video.buffered.start(0) : 0
+          const buffered = Math.max(0, bufferedEnd - bufferedStart)
+          if (!firstSample && totalBytes > 0 && buffered > 0) {
+            firstSample = { bytes: totalBytes, buffered }
+          }
+          let mediaBitrate: number | null = null
+          if (firstSample && buffered > firstSample.buffered) {
+            const bytesDelta = totalBytes - firstSample.bytes
+            if (bytesDelta > 0) {
+              mediaBitrate = (bytesDelta * 8) / (buffered - firstSample.buffered) / 1000
+            }
+          }
+          setNativeStats((prev) => ({
+            // 码率优先：解码字节增量 → 缓冲窗口法；速度仍是瞬时下载吞吐
+            bitrateKbps: smoothThroughput(prev.bitrateKbps, instantBitrate ?? mediaBitrate),
+            linkSpeedKbps: kbps > 0 ? smoothThroughput(prev.linkSpeedKbps, kbps) : prev.linkSpeedKbps
+          }))
+        })
+        .catch(() => {})
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [showStreamStats, isPlaying])
 
   useEffect(() => {
     if (!miniPlayerMode) return
@@ -972,7 +1056,9 @@ export default function VideoPlayer({
         paused: video ? video.paused : true,
         hlsInstances: counter.__hlsInstanceCount ?? 0,
         mini: useUiStore.getState().miniMode,
-        fullscreen: isActualFullscreenRef.current
+        fullscreen: isActualFullscreenRef.current,
+        bitrateKbps: statsRef.current.bitrateKbps,
+        linkSpeedKbps: statsRef.current.linkSpeedKbps
       }
     }
     const report = (samples: ReturnType<typeof sample>[]) => {
@@ -1170,8 +1256,8 @@ export default function VideoPlayer({
   const elapsedMs = playbackStartedAt ? Math.max(0, Date.now() - playbackStartedAt) : 0
   const redactedUrl = currentUrl ? redactText(currentUrl) : ''
   const redactedHeaders = redactHeaders(playHeader)
-  const bitrateText = formatThroughput(streamStats.bitrateKbps)
-  const linkSpeedText = formatThroughput(streamStats.linkSpeedKbps)
+  const bitrateText = formatThroughput(streamStats.bitrateKbps ?? nativeStats.bitrateKbps)
+  const linkSpeedText = formatThroughput(nativeStats.linkSpeedKbps ?? streamStats.linkSpeedKbps)
 
   const buildDiagnosticsText = async () => {
     const metricSummary = await getPlaybackMetricSummary()
@@ -1261,9 +1347,9 @@ export default function VideoPlayer({
     >
       <video ref={videoRef} className="w-full h-full object-contain" playsInline muted={volume <= 0} x-webkit-airplay="allow" />
 
-      {currentUrl && (
+      {showStreamStats && currentUrl && (
         <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
-          <div className="flex items-center justify-between gap-3" title="当前清晰度的声明码率（来自 HLS 清单；无声明时用分片平均码率）">
+          <div className="flex items-center justify-between gap-3" title="当前清晰度的声明码率（来自 HLS 清单；原生播放路径下为实测均值）">
             <span className="text-white/45">码率</span>
             <span className="font-mono text-white">{bitrateText}</span>
           </div>
@@ -1429,6 +1515,17 @@ export default function VideoPlayer({
               title="投屏到电视"
             >
               <Monitor className="w-4 h-4" />
+            </button>
+
+            {/* 码率/速度面板开关 */}
+            <button
+              onClick={() => setShowStreamStats((value) => !value)}
+              className={`p-1 transition-colors ${showStreamStats ? 'text-accent' : 'text-white/80 hover:text-white'}`}
+              title={showStreamStats ? '隐藏码率/速度' : '显示码率/速度'}
+              aria-label={showStreamStats ? '隐藏码率/速度' : '显示码率/速度'}
+              aria-pressed={showStreamStats}
+            >
+              <Activity className="w-4 h-4" />
             </button>
 
             {/* 精简模式：进入 / 退出（退出等价于小窗顶部的「返回」） */}

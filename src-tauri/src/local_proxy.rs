@@ -31,6 +31,40 @@ pub struct LocalProxyInfo {
 /// 当前本地代理信息（JS 宿主的 `getPort`/`getProxy` 要拿真实端口与 token）
 static CURRENT_PROXY: std::sync::OnceLock<LocalProxyInfo> = std::sync::OnceLock::new();
 
+/// 经过本地代理转发出去的累计字节数与上次采样点。
+/// 播放器右上角的「速度」用它来算——macOS 走原生 HLS 时没有 HLS.js 分片事件，
+/// 只有代理这一层知道真实吞吐。
+static PROXY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROXY_SAMPLE: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+
+fn record_proxy_bytes(bytes: usize) {
+    PROXY_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 取上次采样以来的吞吐（Kbps），并重置采样点。没有新数据时返回 0。
+/// 累计转发字节数（前端用「字节增量 ÷ 已缓冲时长」估算真实媒体码率）
+pub fn total_bytes() -> u64 {
+    PROXY_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn take_throughput_kbps() -> f64 {
+    let now = std::time::Instant::now();
+    let total = PROXY_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let previous = match PROXY_SAMPLE.lock() {
+        Ok(mut guard) => guard.replace((total, now)),
+        Err(_) => None,
+    };
+    let Some((previous_total, previous_at)) = previous else {
+        return 0.0;
+    };
+    let elapsed = now.duration_since(previous_at).as_secs_f64();
+    if elapsed <= 0.0 {
+        return 0.0;
+    }
+    let delta = total.saturating_sub(previous_total);
+    (delta as f64 * 8.0) / elapsed / 1000.0
+}
+
 /// 本机在局域网里的地址（`getProxy(false)` 给外部播放器用）；拿不到就回落 127.0.0.1
 fn lan_ip() -> String {
     let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
@@ -372,6 +406,8 @@ fn proxy_media(
         let mut streamed_bytes: u64 = 0;
         while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
             streamed_bytes += chunk.len() as u64;
+            // 统计真实转发吞吐（右上角「速度」的数据源）；两条写出分支都要计
+            record_proxy_bytes(chunk.len());
             if content_length.is_some() {
                 stream
                     .write_all(&chunk)
@@ -620,8 +656,17 @@ fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> Result<(), String> {
 mod tests {
     use super::{
         is_allowed_media_url, is_playlist_url, parse_query, parse_request_headers, proxy_prefix,
-        LocalProxyInfo,
+        record_proxy_bytes, take_throughput_kbps, LocalProxyInfo,
     };
+
+    #[test]
+    fn throughput_is_zero_without_traffic_and_positive_after_bytes() {
+        assert_eq!(take_throughput_kbps(), 0.0, "没有历史采样点时应为 0");
+        record_proxy_bytes(250_000);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let kbps = take_throughput_kbps();
+        assert!(kbps > 0.0, "有转发字节后吞吐应大于 0（实测 {kbps}）");
+    }
 
     #[test]
     fn builds_proxy_prefix_for_local_and_lan() {

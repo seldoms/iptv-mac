@@ -430,6 +430,15 @@ fn invoke_ipc(
             )))
         }
         "window:getPlayerState" => Ok(state.player_state.lock().clone().unwrap_or(Value::Null)),
+        // 播放器右上角「速度」的数据源：本地代理的真实转发吞吐
+        "proxy:throughput" => Ok(json!({
+            "kbps": crate::local_proxy::take_throughput_kbps(),
+            "totalBytes": crate::local_proxy::total_bytes(),
+            "updatedAt": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as u64)
+                .unwrap_or(0),
+        })),
         "window:isFullscreen" => Ok(to_json_result(commands::handle_window_is_fullscreen(
             &app,
         ))),

@@ -59,6 +59,7 @@ export type IpcChannel =
   | 'window:resizeMiniMode'
   | 'window:setFullscreen'
   | 'window:isFullscreen'
+  | 'proxy:throughput'
   | 'window:exitMiniMode'
   | 'window:applyMode'
 
@@ -122,6 +123,7 @@ interface IpcArgsMap {
   'window:resizeMiniMode': [width: number, height: number]
   'window:setFullscreen': [fullscreen: boolean]
   'window:isFullscreen': []
+  'proxy:throughput': []
   'window:exitMiniMode': []
   'window:applyMode': [mini: boolean]
 }
