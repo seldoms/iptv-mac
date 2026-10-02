@@ -5,67 +5,7 @@ import { configApi } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
 import AppLogo from '@/components/AppLogo/AppLogo'
 import type { ConfigInspection } from '@shared/types'
-
-// ==================== 内置推荐源 ====================
-// 来自 docs/TEST_SOURCES.md 中经 tvbox_probe 验证可用的源
-const DEFAULT_SOURCES = [
-  {
-    name: '多多影音',
-    url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json',
-    sites: 435,
-    lives: 1,
-    desc: '435 个点播站点 + 直播',
-  },
-  {
-    name: '心魔在线',
-    url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json',
-    sites: 151,
-    lives: 1,
-    desc: '151 个点播站点',
-  },
-  {
-    name: '高天流云',
-    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json',
-    sites: 298,
-    lives: 2,
-    desc: '298 个点播站点 + 直播',
-  },
-  {
-    name: '宝盒备用',
-    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json',
-    sites: 77,
-    lives: 1,
-    desc: '77 个点播站点 + 直播',
-  },
-  {
-    name: 'D佬线路',
-    url: 'http://rihou.cc:555/nzk/nzk0722.json',
-    sites: 37,
-    lives: 20,
-    desc: '37 个点播站点 + 20 直播源',
-  },
-  {
-    name: '小盒子单仓',
-    url: 'http://xhztv.top/xhz',
-    sites: 54,
-    lives: 1,
-    desc: '54 个点播站点 + 直播',
-  },
-  {
-    name: '香雅晴线',
-    url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json',
-    sites: 48,
-    lives: 3,
-    desc: '48 个点播站点 + 直播',
-  },
-  {
-    name: '多多内置',
-    url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin',
-    sites: 91,
-    lives: 10,
-    desc: '91 个点播站点 + 10 直播源',
-  },
-]
+import { DEFAULT_SOURCES } from '@/defaultSources'
 
 function compatibilityBadgeClass(compatibility: ConfigInspection['compatibility']) {
   if (compatibility === 'ready') return 'text-green-400'
@@ -145,13 +85,12 @@ export default function Onboarding() {
         return
       }
 
-      const result = await configApi.load(importUrl) as { success: boolean; error?: string }
+      const result = await loadConfig(importUrl)
       if (!result.success) {
         showMessage('error', result.error || '配置导入失败')
         return
       }
 
-      await loadConfig(importUrl)
       showMessage('success', '配置导入成功')
 
       if (hasUsableVodSites(currentInspection)) {

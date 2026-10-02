@@ -7,7 +7,6 @@ import {
   Globe,
   Monitor,
   Info,
-  ChevronRight,
   Link,
   Check,
   AlertCircle,
@@ -15,24 +14,17 @@ import {
   Loader2,
   Save,
   X,
-  Tv
+  Tv,
+  CheckSquare,
+  Square
 } from 'lucide-react'
-import { configApi, invoke, localApi, on, settingsApi } from '@/utils/ipc'
+import { configApi, invoke, on, settingsApi } from '@/utils/ipc'
 import { useConfigStore } from '@/stores/useConfigStore'
 import type { ConfigInspection } from '@shared/types'
 import { useNavigate } from 'react-router-dom'
-
-// ==================== 内置推荐源 ====================
-const DEFAULT_SOURCES = [
-  { name: '多多影音', url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json', sites: 435, lives: 1, desc: '435 个点播站点 + 直播' },
-  { name: '心魔在线', url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json', sites: 151, lives: 1, desc: '151 个点播站点' },
-  { name: '高天流云', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json', sites: 298, lives: 2, desc: '298 个点播站点 + 直播' },
-  { name: '宝盒备用', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json', sites: 77, lives: 1, desc: '77 个点播站点 + 直播' },
-  { name: 'D佬线路', url: 'http://rihou.cc:555/nzk/nzk0722.json', sites: 37, lives: 20, desc: '37 个点播站点 + 20 直播源' },
-  { name: '小盒子单仓', url: 'http://xhztv.top/xhz', sites: 54, lives: 1, desc: '54 个点播站点 + 直播' },
-  { name: '香雅晴线', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json', sites: 48, lives: 3, desc: '48 个点播站点 + 直播' },
-  { name: '多多内置', url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin', sites: 91, lives: 10, desc: '91 个点播站点 + 10 直播源' },
-]
+import { DEFAULT_SOURCES } from '@/defaultSources'
+import Dialog, { DialogFooter } from '@/components/Dialog/Dialog'
+import ConfirmDialog from '@/components/ConfirmDialog/ConfirmDialog'
 
 interface ConfigItem {
   url: string
@@ -58,6 +50,12 @@ function probeMetric(inspection: ConfigInspection) {
   return `${inspection.probePassedSiteCount}/${inspection.probeInspectedSiteCount}`
 }
 
+interface SourceSpeedInfo {
+  latency: number
+  ok: boolean
+  error?: string
+}
+
 export default function Settings() {
   const navigate = useNavigate()
   const [activeTab, setActiveTab] = useState('config')
@@ -71,10 +69,19 @@ export default function Settings() {
   const [editingConfigName, setEditingConfigName] = useState('')
   const [deleteConfirmUrl, setDeleteConfirmUrl] = useState('')
   const [deletingConfigUrl, setDeletingConfigUrl] = useState('')
+  const [confirmDeleteConfig, setConfirmDeleteConfig] = useState<{ url: string; name: string } | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [version, setVersion] = useState('1.0.0')
-  const [localServer, setLocalServer] = useState<{ url: string; token: string }>({ url: '', token: '' })
   const { loadConfig } = useConfigStore()
+
+  // 批量检测与失效清理状态
+  const [isBatchChecking, setIsBatchChecking] = useState(false)
+  const [batchCheckProgress, setBatchCheckProgress] = useState<{ current: number; total: number } | null>(null)
+  const [sourceSpeeds, setSourceSpeeds] = useState<Record<string, SourceSpeedInfo>>({})
+  const [showBatchDeleteModal, setShowBatchDeleteModal] = useState(false)
+  const [failedSources, setFailedSources] = useState<Array<{ url: string; name: string; error: string }>>([])
+  const [selectedDeleteUrls, setSelectedDeleteUrls] = useState<Set<string>>(new Set())
+  const [isBatchDeleting, setIsBatchDeleting] = useState(false)
 
   // 播放/网络设置状态
   const [dohUrl, setDohUrl] = useState('')
@@ -88,7 +95,6 @@ export default function Settings() {
 
   // 加载所有设置
   useEffect(() => {
-    localApi.getServerInfo().then(setLocalServer).catch(() => {})
     Promise.all([
       settingsApi.get('dohUrl').catch(() => ''),
       settingsApi.get('proxyUrl').catch(() => ''),
@@ -199,22 +205,13 @@ export default function Settings() {
     setLoading(true)
     try {
       const url = newConfigUrl.trim()
-      const currentInspection = inspection?.url === url ? inspection : await handleInspectConfig()
-      if (!currentInspection) return
-      if (!currentInspection.canImport) {
-        showMessage('error', '该配置暂不兼容：没有可用的 HTTP API 点播站点或直播源')
-        return
-      }
-
-      const result = await configApi.load(url) as { success: boolean; error?: string; data?: any }
+      const result = await configApi.save(url)
       if (result?.success) {
         setNewConfigUrl('')
         setInspection(null)
-        setCurrentUrl(url)
-        // 刷新首页内容
-        await loadConfig(url)
         await loadData()
-        showMessage('success', `配置添加成功：${usableVodSiteCount(currentInspection)} 个可用点播站点，${currentInspection.liveCount} 个直播源`)
+        void useConfigStore.getState().reloadSubscriptions()
+        showMessage('success', '订阅已保存')
       } else {
         showMessage('error', '加载配置失败: ' + (result?.error || '未知错误'))
       }
@@ -245,35 +242,42 @@ export default function Settings() {
 
   const handleRequestDeleteConfig = (config: ConfigItem) => {
     if (deletingConfigUrl) return
-    setDeleteConfirmUrl(config.url)
+    setConfirmDeleteConfig({ url: config.url, name: config.name })
     if (editingConfigUrl === config.url) {
       setEditingConfigUrl('')
       setEditingConfigName('')
     }
   }
 
-  // 删除配置
-  const handleDeleteConfig = async (config: ConfigItem) => {
-    const url = config.url
-    const wasCurrent = url === currentUrl
-    setDeletingConfigUrl(url)
+  const handleConfirmDelete = async () => {
+    const target = confirmDeleteConfig
+    if (!target) return
+    const wasCurrent = target.url === currentUrl
+    setDeletingConfigUrl(target.url)
+    setConfirmDeleteConfig(null)
 
     try {
-      const result = await configApi.remove(url) as { success: boolean; error?: string }
+      const result = await configApi.remove(target.url) as { success: boolean; error?: string }
       if (!result?.success) {
         showMessage('error', result?.error || '删除失败')
         return
       }
 
-      const [freshList, freshUrl] = await Promise.all([
+      const [freshList, freshUrl] = (await Promise.all([
         configApi.list(),
         configApi.getCurrentUrl()
-      ])
+      ])) as [ConfigItem[], string]
       const nextUrl = freshUrl || ''
 
       setConfigs(freshList || [])
       setCurrentUrl(nextUrl)
       setDeleteConfirmUrl('')
+
+      if (useConfigStore.getState().liveConfigUrl === target.url) {
+        useConfigStore.setState({ liveConfigUrl: '', liveConfig: null, liveConfigError: null })
+        await settingsApi.set('lastLiveConfigUrl', '')
+      }
+      void useConfigStore.getState().reloadSubscriptions()
 
       if (wasCurrent) {
         if (nextUrl) {
@@ -290,6 +294,8 @@ export default function Settings() {
       setDeletingConfigUrl('')
     }
   }
+
+  // 旧的 handleDeleteConfig 保留用作直接删除（保留向后兼容）
 
   const handleStartRename = (config: ConfigItem) => {
     setEditingConfigUrl(config.url)
@@ -309,6 +315,7 @@ export default function Settings() {
     }
     try {
       const result = await configApi.rename(url, name) as { success: boolean; error?: string }
+      void useConfigStore.getState().reloadSubscriptions()
       if (result.success) {
         setEditingConfigUrl('')
         setEditingConfigName('')
@@ -333,11 +340,9 @@ export default function Settings() {
   const handleSwitchConfig = async (url: string) => {
     setLoading(true)
     try {
-      const result = await configApi.load(url) as { success: boolean; error?: string }
+      const result = await loadConfig(url)
       if (result?.success) {
         setCurrentUrl(url)
-        // 刷新首页内容
-        await loadConfig(url)
         await loadData()
         showMessage('success', '配置切换成功')
       } else {
@@ -350,6 +355,123 @@ export default function Settings() {
     }
   }
 
+  // 批量检测所有订阅源并统计状态
+  const handleBatchCheckSources = async () => {
+    if (isBatchChecking || configs.length === 0) return
+    setIsBatchChecking(true)
+    setBatchCheckProgress({ current: 0, total: configs.length })
+    const newSpeeds: Record<string, SourceSpeedInfo> = { ...sourceSpeeds }
+    const failedList: Array<{ url: string; name: string; error: string }> = []
+
+    for (let i = 0; i < configs.length; i++) {
+      const cfg = configs[i]
+      setBatchCheckProgress({ current: i + 1, total: configs.length })
+      const startTime = performance.now()
+      try {
+        const res = (await configApi.inspect(cfg.url)) as {
+          success: boolean
+          data?: ConfigInspection
+          error?: string
+        }
+        const latency = Math.round(performance.now() - startTime)
+        if (res.success && res.data) {
+          const insp = res.data
+          const usableSites = insp.visibleSiteCount || 0
+          const lives = insp.liveCount || 0
+          if (usableSites === 0 && lives === 0) {
+            const err = '无可用点播或直播内容'
+            newSpeeds[cfg.url] = { latency, ok: false, error: err }
+            failedList.push({ url: cfg.url, name: cfg.name, error: err })
+          } else if (insp.compatibility === 'unsupported') {
+            const err = '爬虫暂不兼容 (JAR/CSP)'
+            newSpeeds[cfg.url] = { latency, ok: false, error: err }
+            failedList.push({ url: cfg.url, name: cfg.name, error: err })
+          } else {
+            newSpeeds[cfg.url] = { latency, ok: true }
+          }
+        } else {
+          const err = res.error || '获取配置失败'
+          newSpeeds[cfg.url] = { latency, ok: false, error: err }
+          failedList.push({ url: cfg.url, name: cfg.name, error: err })
+        }
+      } catch (err: any) {
+        const latency = Math.round(performance.now() - startTime)
+        const errText = err.message || '连接超时或失败'
+        newSpeeds[cfg.url] = { latency, ok: false, error: errText }
+        failedList.push({ url: cfg.url, name: cfg.name, error: errText })
+      }
+      setSourceSpeeds({ ...newSpeeds })
+    }
+
+    setIsBatchChecking(false)
+    setBatchCheckProgress(null)
+
+    if (failedList.length > 0) {
+      setFailedSources(failedList)
+      setSelectedDeleteUrls(new Set(failedList.map((f) => f.url)))
+      setShowBatchDeleteModal(true)
+    } else {
+      const validLatencies = Object.values(newSpeeds).filter((s) => s.ok).map((s) => s.latency)
+      const minLatency = validLatencies.length > 0 ? Math.min(...validLatencies) : 0
+      showMessage('success', `全部 ${configs.length} 个订阅源检测正常！最快响应延迟 ${minLatency}ms`)
+    }
+  }
+
+  const handleToggleSelectDeleteUrl = (url: string) => {
+    setSelectedDeleteUrls((prev) => {
+      const next = new Set(prev)
+      if (next.has(url)) next.delete(url)
+      else next.add(url)
+      return next
+    })
+  }
+
+  const handleSelectAllFailed = () => {
+    setSelectedDeleteUrls(new Set(failedSources.map((f) => f.url)))
+  }
+
+  const handleDeselectAllFailed = () => {
+    setSelectedDeleteUrls(new Set())
+  }
+
+  const handleConfirmBatchDelete = async () => {
+    if (selectedDeleteUrls.size === 0) {
+      setShowBatchDeleteModal(false)
+      return
+    }
+    setIsBatchDeleting(true)
+    try {
+      const toDelete = Array.from(selectedDeleteUrls)
+      for (const url of toDelete) {
+        await configApi.remove(url)
+      }
+      const [freshList, freshUrl] = (await Promise.all([
+        configApi.list(),
+        configApi.getCurrentUrl()
+      ])) as [ConfigItem[], string]
+      setConfigs(freshList || [])
+      setCurrentUrl(freshUrl || '')
+
+      // 如果当前配置被删除了，自动切到剩余最快可用的源
+      if (selectedDeleteUrls.has(currentUrl) && freshList && freshList.length > 0) {
+        const available = freshList
+          .filter((c: ConfigItem) => sourceSpeeds[c.url]?.ok)
+          .sort((a: ConfigItem, b: ConfigItem) => (sourceSpeeds[a.url]?.latency || 9999) - (sourceSpeeds[b.url]?.latency || 9999))
+        const nextTarget = available[0] || freshList[0]
+        if (nextTarget) {
+          await loadConfig(nextTarget.url)
+        }
+      }
+      void useConfigStore.getState().reloadSubscriptions()
+      setShowBatchDeleteModal(false)
+      showMessage('success', `已批量删除 ${toDelete.length} 个失效订阅源`)
+    } catch (err: any) {
+      showMessage('error', '删除失败: ' + (err.message || String(err)))
+    } finally {
+      setIsBatchDeleting(false)
+    }
+  }
+
   const tabs = [
     { key: 'config', label: '配置管理', icon: Link },
     { key: 'live', label: '直播测活', icon: Tv },
@@ -359,21 +481,21 @@ export default function Settings() {
   ]
 
   return (
-    <div className="h-full flex">
+    <div className="h-full flex flex-col nav:flex-row">
       {/* 左侧标签 */}
-      <div className="w-48 shrink-0 border-r border-[#2a2a2a] py-4 px-3">
-        <div className="flex items-center gap-2 px-3 mb-4">
+      <div className="w-full nav:w-48 shrink-0 border-b nav:border-b-0 nav:border-r border-[#2a2a2a] py-3 nav:py-4 px-3">
+        <div className="flex items-center gap-2 px-3 mb-2 nav:mb-4">
           <SettingsIcon className="w-5 h-5 text-accent" />
           <h2 className="text-base font-medium text-text-primary">设置</h2>
         </div>
-        <nav className="space-y-1">
+        <nav className="flex nav:block gap-1 overflow-x-auto scrollbar-dark pb-1 nav:pb-0 nav:space-y-1">
           {tabs.map((tab) => {
             const Icon = tab.icon
             return (
               <button
                 key={tab.key}
                 onClick={() => setActiveTab(tab.key)}
-                className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors ${
+                className={`shrink-0 whitespace-nowrap flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-colors nav:w-full ${
                   activeTab === tab.key
                     ? 'bg-accent-muted text-accent'
                     : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
@@ -388,7 +510,7 @@ export default function Settings() {
       </div>
 
       {/* 右侧内容 */}
-      <div className="flex-1 overflow-y-auto scrollbar-dark p-6">
+      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-dark p-4 nav:p-6">
         {/* 消息提示 */}
         {message && (
           <div className={`mb-4 flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm ${
@@ -437,10 +559,10 @@ export default function Settings() {
                 </button>
                 <button
                   onClick={handleAddConfig}
-                  disabled={!newConfigUrl.trim() || loading || inspectLoading || (inspection?.url === newConfigUrl.trim() && !inspection.canImport)}
+                  disabled={!newConfigUrl.trim() || loading || inspectLoading}
                   className="flex items-center gap-1.5 px-4 py-2 bg-accent hover:bg-accent-hover disabled:opacity-50 text-bg-primary text-sm font-medium rounded-lg transition-colors"
                 >
-                  <Plus className="w-4 h-4" /> {loading ? '加载中...' : '添加'}
+                  <Plus className="w-4 h-4" /> {loading ? '保存中...' : '保存订阅'}
                 </button>
               </div>
               <p className="text-xs text-text-muted mt-2">
@@ -490,7 +612,22 @@ export default function Settings() {
             </div>
 
             <div>
-              <h3 className="text-sm font-medium text-text-primary mb-3">配置列表</h3>
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-medium text-text-primary">配置列表 ({configs.length})</h3>
+                {configs.length > 0 && (
+                  <button
+                    onClick={handleBatchCheckSources}
+                    disabled={isBatchChecking}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-white/[0.06] hover:bg-white/10 disabled:opacity-50 text-text-secondary hover:text-text-primary text-xs font-medium rounded-lg transition-colors"
+                    title="批量检测全部订阅源的连通性与响应速度，快速清理失效源"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isBatchChecking ? 'animate-spin text-accent' : ''}`} />
+                    {isBatchChecking
+                      ? `检测中 (${batchCheckProgress?.current}/${batchCheckProgress?.total})...`
+                      : '⚡ 批量检测订阅源'}
+                  </button>
+                )}
+              </div>
               {configs.length === 0 ? (
                 <div>
                   <div className="py-6 text-center">
@@ -506,14 +643,15 @@ export default function Settings() {
                           setNewConfigUrl(src.url)
                           const insp = await inspectConfigUrl(src.url, { silent: true })
                           if (insp?.canImport) {
-                            const result = await configApi.load(src.url) as { success: boolean; error?: string }
+                            const result = await loadConfig(src.url)
                             if (result.success) {
                               setNewConfigUrl('')
                               setInspection(null)
                               setCurrentUrl(src.url)
-                              await loadConfig(src.url)
                               await loadData()
                               showMessage('success', `${src.name} 已添加`)
+                            } else {
+                              showMessage('error', result.error || '加载配置失败')
                             }
                           }
                         }}
@@ -531,6 +669,7 @@ export default function Settings() {
                     const isActive = config.url === currentUrl
                     const isConfirmingDelete = deleteConfirmUrl === config.url
                     const isDeleting = deletingConfigUrl === config.url
+                    const speed = sourceSpeeds[config.url]
                     return (
                       <div
                         key={config.url}
@@ -553,31 +692,37 @@ export default function Settings() {
                               autoFocus
                             />
                           ) : (
-                            <p className={`text-sm truncate ${isActive ? 'text-accent' : 'text-text-primary'}`}>
-                              {config.name}
-                            </p>
+                            <div className="flex items-center gap-2">
+                              <p className={`text-sm truncate ${isActive ? 'text-accent font-medium' : 'text-text-primary'}`}>
+                                {config.name}
+                              </p>
+                              {speed && speed.ok && (
+                                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded leading-tight shrink-0 ${
+                                  speed.latency < 500
+                                    ? 'text-emerald-400 bg-emerald-500/15'
+                                    : speed.latency < 1500
+                                      ? 'text-amber-400 bg-amber-500/15'
+                                      : 'text-orange-400 bg-orange-500/15'
+                                }`}>
+                                  {speed.latency}ms
+                                </span>
+                              )}
+                              {speed && !speed.ok && (
+                                <span className="text-[10px] text-red-400 bg-red-500/15 font-mono px-1.5 py-0.5 rounded leading-tight shrink-0" title={speed.error}>
+                                  失效 ({speed.error || '不可用'})
+                                </span>
+                              )}
+                            </div>
                           )}
                           <p className="text-xs text-text-muted truncate mt-0.5">{config.url}</p>
                         </div>
                         {isConfirmingDelete ? (
                           <div className="shrink-0 flex items-center gap-1.5">
-                            <span className="text-xs text-red-300">确认删除？</span>
-                            <button
-                              onClick={() => handleDeleteConfig(config)}
-                              disabled={isDeleting}
-                              className="shrink-0 p-1.5 text-red-300 hover:text-red-200 disabled:opacity-50 transition-colors"
-                              title="确认删除"
-                            >
-                              {isDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                            </button>
-                            <button
-                              onClick={() => setDeleteConfirmUrl('')}
-                              disabled={isDeleting}
-                              className="shrink-0 p-1.5 text-text-muted hover:text-text-primary disabled:opacity-50 transition-colors"
-                              title="取消删除"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
+                            {isDeleting ? (
+                              <Loader2 className="w-4 h-4 animate-spin text-red-300" />
+                            ) : (
+                              <span className="text-xs text-red-300">删除中...</span>
+                            )}
                           </div>
                         ) : (
                           <>
@@ -800,43 +945,125 @@ export default function Settings() {
           </div>
         )}
 
-        {/* 关于 */}
+        {/* 关于：只保留版本号 */}
         {activeTab === 'about' && (
-          <div className="space-y-6 max-w-2xl">
-            <div className="flex items-center gap-4">
-              <div className="w-14 h-14 rounded-2xl bg-accent flex items-center justify-center">
-                <Monitor className="w-8 h-8 text-bg-primary" />
-              </div>
-              <div>
-                <h3 className="text-lg font-semibold text-text-primary">IPTV Mac</h3>
-                <p className="text-sm text-text-muted">版本 {version}</p>
-              </div>
-            </div>
-            <div className="space-y-3">
-              <div className="flex items-center justify-between py-2">
-                <span className="text-sm text-text-secondary">当前版本</span>
-                <span className="text-sm text-text-primary">{version}</span>
-              </div>
-              <button className="flex items-center justify-between w-full py-2 group">
-                <span className="text-sm text-text-secondary">检查更新</span>
-                <ChevronRight className="w-4 h-4 text-text-muted group-hover:text-accent transition-colors" />
-              </button>
-              <div className="flex items-center justify-between py-2">
-                <span className="text-sm text-text-secondary">基于</span>
-                <span className="text-sm text-accent">FongMi/TV</span>
-              </div>
-              <div className="flex items-center justify-between py-2">
-                <span className="text-sm text-text-secondary">本地服务</span>
-                <span className="text-sm text-text-primary">{localServer.url || '未启动'}</span>
-              </div>
-              <div className="flex items-start justify-between gap-6 py-2">
-                <span className="text-sm text-text-secondary">API Token</span>
-                <span className="text-xs text-text-primary font-mono break-all text-right">
-                  {localServer.token}
-                </span>
-              </div>
-            </div>
+          <div className="max-w-2xl">
+            <p className="text-sm text-text-muted">版本 {version}</p>
           </div>
+        )}
+
+        {/* Delete confirmation dialog */}
+        {confirmDeleteConfig && (
+          <ConfirmDialog
+            open={true}
+            onClose={() => setConfirmDeleteConfig(null)}
+            onConfirm={handleConfirmDelete}
+            title="删除配置"
+            message={`确认删除「${confirmDeleteConfig.name}」？此操作不可撤销。`}
+            confirmLabel="删除"
+            confirmVariant="danger"
+            loading={Boolean(deletingConfigUrl)}
+          />
+        )}
+
+        {/* Batch Delete Failed Sources Dialog */}
+        {showBatchDeleteModal && (
+          <Dialog
+            open={showBatchDeleteModal}
+            onClose={() => !isBatchDeleting && setShowBatchDeleteModal(false)}
+            title="批量检测完成 - 清理失效源"
+            width="max-w-xl"
+          >
+            <div className="space-y-4">
+              <p className="text-sm text-text-secondary leading-relaxed">
+                共检测 <span className="text-text-primary font-medium">{configs.length}</span> 个订阅源，发现 <span className="text-red-400 font-medium">{failedSources.length}</span> 个源已失效或无法使用。清理失效源可大幅提升软件加载速度与稳定性：
+              </p>
+
+              {/* 批量操作控制栏 */}
+              <div className="flex items-center justify-between text-xs text-text-muted px-1">
+                <span>已勾选 {selectedDeleteUrls.size} / {failedSources.length} 个失效源</span>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSelectAllFailed}
+                    className="hover:text-accent transition-colors"
+                  >
+                    全选
+                  </button>
+                  <span>|</span>
+                  <button
+                    type="button"
+                    onClick={handleDeselectAllFailed}
+                    className="hover:text-accent transition-colors"
+                  >
+                    取消全选
+                  </button>
+                </div>
+              </div>
+
+              {/* 失效源列表 */}
+              <div className="max-h-60 overflow-y-auto scrollbar-dark space-y-2 pr-1">
+                {failedSources.map((item) => {
+                  const isChecked = selectedDeleteUrls.has(item.url)
+                  return (
+                    <div
+                      key={item.url}
+                      onClick={() => handleToggleSelectDeleteUrl(item.url)}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-all ${
+                        isChecked
+                          ? 'border-red-500/40 bg-red-500/10'
+                          : 'border-[#2a2a2a] bg-bg-secondary hover:bg-bg-hover opacity-70'
+                      }`}
+                    >
+                      <span className={`mt-0.5 shrink-0 w-4 h-4 rounded border flex items-center justify-center ${
+                        isChecked ? 'bg-red-500 border-red-500 text-white' : 'border-white/30'
+                      }`}>
+                        {isChecked && <CheckSquare className="w-3 h-3 text-white" />}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-sm font-medium text-text-primary truncate">{item.name}</p>
+                          <span className="text-xs text-red-400 shrink-0 font-mono">
+                            {item.error}
+                          </span>
+                        </div>
+                        <p className="text-xs text-text-muted truncate mt-0.5">{item.url}</p>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <DialogFooter align="end">
+                <button
+                  type="button"
+                  onClick={() => setShowBatchDeleteModal(false)}
+                  disabled={isBatchDeleting}
+                  className="px-3.5 py-1.5 text-sm rounded-lg border border-[#2a2a2a] text-text-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+                >
+                  暂不删除
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmBatchDelete}
+                  disabled={isBatchDeleting || selectedDeleteUrls.size === 0}
+                  className="flex items-center gap-1.5 px-4 py-1.5 text-sm rounded-lg font-medium bg-red-600 hover:bg-red-500 text-white transition-colors disabled:opacity-50"
+                >
+                  {isBatchDeleting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>删除中...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="w-4 h-4" />
+                      <span>一键删除所选失效源 ({selectedDeleteUrls.size})</span>
+                    </>
+                  )}
+                </button>
+              </DialogFooter>
+            </div>
+          </Dialog>
         )}
       </div>
     </div>

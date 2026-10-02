@@ -2,7 +2,9 @@ import { useRef, useEffect, useCallback, useState } from 'react'
 import Hls from 'hls.js'
 import dashjs from 'dashjs'
 import { windowApi } from '@/utils/ipc'
+import { formatClock } from '@/utils/format'
 import { usePlayerStore } from '@/stores/usePlayerStore'
+import { useUiStore } from '@/stores/useUiStore'
 import {
   Play,
   Pause,
@@ -66,6 +68,7 @@ export default function MiniPlayer() {
   const [duration, setDuration] = useState(0)
   const [showControls, setShowControls] = useState(true)
   const [isLoaded, setIsLoaded] = useState(false)
+  const [playbackFailed, setPlaybackFailed] = useState(false)
   /** 需要恢复的播放进度 */
   const restoreTimeRef = useRef<number | null>(null)
 
@@ -80,6 +83,10 @@ export default function MiniPlayer() {
           if (state.currentTime && state.currentTime > 0) {
             restoreTimeRef.current = state.currentTime
           }
+        } else {
+          // 没有播放状态时以前是纯黑窗口，用户只能强杀应用；这里走「播放失败」的出路
+          console.error('[MiniPlayer] 未取到播放状态，无法恢复播放')
+          setPlaybackFailed(true)
         }
       } catch (err) {
         console.error('[MiniPlayer] 获取播放状态失败:', err)
@@ -259,8 +266,20 @@ export default function MiniPlayer() {
     const url = new URL(window.location.href)
     url.searchParams.delete('mode')
     window.history.replaceState(null, '', url.toString())
-    window.dispatchEvent(new CustomEvent('app:miniModeChanged', { detail: false }))
+    useUiStore.getState().setMiniMode(false)
   }, [currentUrl, playHeader])
+
+  // ESC 直接退出小窗：播放失败时控制栏可能不可用，这是保底出路
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        void handleExitMiniMode()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [handleExitMiniMode])
 
   const handleToggleFullscreen = useCallback(async () => {
     const container = containerRef.current
@@ -303,19 +322,18 @@ export default function MiniPlayer() {
     }
   }
 
-  const formatTime = (s: number) => {
-    if (!s || isNaN(s)) return '00:00'
-    const m = Math.floor(s / 60)
-    const sec = Math.floor(s % 60)
-    return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`
-  }
-
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
 
   if (!currentUrl) {
     return (
-      <div className="w-full h-full bg-black flex items-center justify-center">
+      <div className="w-full h-full bg-black flex flex-col items-center justify-center gap-3">
         <p className="text-white/50 text-sm">无播放内容</p>
+        <button
+          onClick={() => void handleExitMiniMode()}
+          className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/80 transition-colors hover:border-accent hover:text-accent"
+        >
+          返回完整界面（ESC）
+        </button>
       </div>
     )
   }
@@ -328,15 +346,33 @@ export default function MiniPlayer() {
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onDoubleClick={handleDoubleClick}
     >
-      <video ref={videoRef} className="w-full h-full object-contain" />
+      <video
+        ref={videoRef}
+        className="w-full h-full object-contain"
+        onError={() => setPlaybackFailed(true)}
+        onPlaying={() => setPlaybackFailed(false)}
+      />
+
+      {/* 播放失败：给出明确出路，避免困在小窗里出不去 */}
+      {playbackFailed && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/70 px-4 text-center">
+          <p className="text-sm text-white/80">{currentUrl ? '播放失败' : '未能恢复播放（播放状态为空）'}</p>
+          <button
+            onClick={() => void handleExitMiniMode()}
+            className="rounded-md border border-white/20 px-3 py-1.5 text-xs text-white/80 transition-colors hover:border-accent hover:text-accent"
+          >
+            返回完整界面（ESC）
+          </button>
+        </div>
+      )}
 
       {/* 顶部拖动区域 + 关闭按钮 */}
       <div
         className={`absolute inset-x-0 top-0 bg-gradient-to-b from-black/60 to-transparent px-2 pt-1 pb-6 transition-opacity duration-300 ${
-          showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          showControls || playbackFailed ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
-        <div className="flex items-center justify-between" data-tauri-drag-region>
+        <div className="flex items-center justify-between" data-tauri-drag-region="deep">
           <div className="flex items-center gap-1">
             <GripHorizontal className="w-4 h-4 text-white/40" />
           </div>
@@ -374,7 +410,7 @@ export default function MiniPlayer() {
       {/* 底部控制栏 */}
       <div
         className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-3 pb-2 pt-8 transition-opacity duration-300 ${
-          showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          showControls || playbackFailed ? 'opacity-100' : 'opacity-0 pointer-events-none'
         }`}
       >
         {/* 进度条 */}
@@ -404,7 +440,7 @@ export default function MiniPlayer() {
               {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
             </button>
             <span className="text-[10px] text-white/60 ml-1">
-              {formatTime(currentTime)} / {formatTime(duration)}
+              {formatClock(currentTime)} / {formatClock(duration)}
             </span>
           </div>
 

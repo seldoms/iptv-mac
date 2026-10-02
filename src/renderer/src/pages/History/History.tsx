@@ -2,12 +2,16 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Clock, Trash2 } from 'lucide-react'
 import { historyApi } from '@/utils/ipc'
+import { useConfigStore } from '@/stores/useConfigStore'
 import type { History as HistoryItem } from '@shared/types'
+import { formatDuration, formatRelativeTime } from '@/utils/format'
 
 export default function History() {
   const navigate = useNavigate()
   const [list, setList] = useState<HistoryItem[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  // 历史里只存了 siteKey，显示站点名才能一眼看出"这是哪个站点的片"（用户反馈找不到记录）
+  const sites = useConfigStore((state) => state.sites)
 
   const loadHistory = async () => {
     setIsLoading(true)
@@ -35,26 +39,14 @@ export default function History() {
   }
 
   const handleClick = (item: HistoryItem) => {
-    navigate(`/vod/${item.siteKey}/${item.vodId}`)
+    navigate(`/vod/${encodeURIComponent(item.siteKey)}/${encodeURIComponent(item.vodId)}`)
   }
 
-  const formatDate = (timestamp: number) => {
-    const d = new Date(timestamp)
-    const now = new Date()
-    const diff = now.getTime() - d.getTime()
-    if (diff < 60000) return '刚刚'
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}分钟前`
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}小时前`
-    return d.toLocaleDateString('zh-CN')
-  }
-
-  const formatDuration = (seconds = 0) => {
-    const safeSeconds = Math.max(0, Math.floor(seconds))
-    const h = Math.floor(safeSeconds / 3600)
-    const m = Math.floor((safeSeconds % 3600) / 60)
-    const s = safeSeconds % 60
-    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    return `${m}:${String(s).padStart(2, '0')}`
+  const siteLabel = (item: HistoryItem) => {
+    const site = sites.find((entry) => entry.key === item.siteKey)
+    if (site) return site.name
+    if (!item.siteKey) return '未知站点'
+    return `${item.siteKey}（不在当前订阅）`
   }
 
   const progressText = (item: HistoryItem) => {
@@ -122,11 +114,10 @@ export default function History() {
                   <p className="text-xs text-text-muted mt-1">
                     {item.episodeName || item.source || '未知播放源'}
                   </p>
-                  {item.sourceName && (
-                    <p className="text-[11px] text-text-muted/80 mt-1 truncate">
-                      {item.sourceName}
-                    </p>
-                  )}
+                  <p className="text-[11px] text-text-muted/80 mt-1 truncate">
+                    {siteLabel(item)}
+                    {item.sourceName ? ` · ${item.sourceName}` : ''}
+                  </p>
                   <div className="flex items-center gap-2 mt-2">
                     {/* 进度条 */}
                     <div className="flex-1 h-1 bg-bg-tertiary rounded-full overflow-hidden">
@@ -143,7 +134,7 @@ export default function History() {
 
                 {/* 时间和操作 */}
                 <div className="shrink-0 flex flex-col items-end gap-2">
-                  <span className="text-[10px] text-text-muted">{formatDate((item.updateTime || 0) * 1000)}</span>
+                  <span className="text-[10px] text-text-muted">{formatRelativeTime((item.updateTime || 0) * 1000)}</span>
                   <button
                     onClick={(e) => {
                       e.stopPropagation()

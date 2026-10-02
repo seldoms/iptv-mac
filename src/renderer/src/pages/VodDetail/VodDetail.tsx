@@ -10,6 +10,7 @@ import {
 } from '@/stores/usePlayerStore'
 import { historyApi, keepApi, siteApi } from '@/utils/ipc'
 import { getPlayableMediaUrl } from '@/utils/media'
+import { isResumable, pickResumeTarget, resumePositionForEpisode } from '@/utils/resume'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
 import type { History as HistoryItem } from '@shared/types'
 
@@ -24,6 +25,7 @@ function isVideoFormat(url: string): boolean {
 interface LineSource {
   key: string         // 唯一标识: siteKey::vodId 或 'current::siteKey::vodId'
   name: string        // 站点名或线路名
+  flag?: string
   siteKey: string
   vodId: string
   episodes: Episode[]
@@ -40,7 +42,7 @@ function formatResumeTime(seconds = 0): string {
 }
 
 function canResume(history: HistoryItem | null): history is HistoryItem {
-  return Boolean(history && !history.completed && (history.positionSeconds || 0) > 5)
+  return isResumable(history)
 }
 
 export default function VodDetail() {
@@ -48,6 +50,7 @@ export default function VodDetail() {
   const { currentConfig } = useConfigStore()
   const {
     currentVod, episodes, currentEpisodeIndex, currentSourceIndex,
+    currentTime: playerCurrentTime, currentUrl: playerCurrentUrl, currentSiteKey: playerCurrentSiteKey,
     setVod, setCurrentEpisodeIndex, setCurrentSourceIndex,
     alternativeSources, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
     setAlternativeSources, markCurrentSourceBroken,
@@ -59,6 +62,7 @@ export default function VodDetail() {
   const [detail, setDetail] = useState<VodDetailType | null>(null)
   const [lineSources, setLineSources] = useState<LineSource[]>([])
   const [activeLineIndex, setActiveLineIndex] = useState(0)
+  const [pendingAutoPlay, setPendingAutoPlay] = useState<number | null>(null)
   const [isKept, setIsKept] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
   const [showPlayer, setShowPlayer] = useState(false)
@@ -73,11 +77,12 @@ export default function VodDetail() {
   const switchingRef = useRef(false)
   const failureHandledRef = useRef(false)
   const mountedRef = useRef(true)
+  const playRequestRef = useRef(0)
   const activeLine = lineSources[activeLineIndex]
 
   useEffect(() => {
     mountedRef.current = true
-    return () => { mountedRef.current = false }
+    return () => { mountedRef.current = false; playRequestRef.current += 1 }
   }, [])
 
   // 加载详情
@@ -237,6 +242,7 @@ export default function VodDetail() {
           // 尝试队列中的下一个
           const next = popNextAlternativeSource()
           if (next) {
+            switchingRef.current = false
             await switchToAlternativeSource(next)
           } else {
             setAllSourcesExhausted(true)
@@ -263,6 +269,7 @@ export default function VodDetail() {
             newLines.push({
               key: `alt::${source.siteKey}::${source.vodId}::${from}`,
               name: `${source.siteName} · ${from}`,
+              flag: from,
               siteKey: source.siteKey,
               vodId: source.vodId,
               episodes: eps,
@@ -302,7 +309,9 @@ export default function VodDetail() {
         const prevCount = lineSources.length
         setLineSources(prev => [...prev, ...newLines])
         const bestNewIdx = newLines.findIndex((l) => /m3u8|mp4|mpd|flv|ts/i.test(l.name) && l.episodes.length > 0)
-        setActiveLineIndex(prevCount + (bestNewIdx >= 0 ? bestNewIdx : 0))
+        const nextLineIndex = prevCount + (bestNewIdx >= 0 ? bestNewIdx : 0)
+        setActiveLineIndex(nextLineIndex)
+        setPendingAutoPlay(nextLineIndex)
         setDetail(vod)
         setSourceSwitchState('idle', `已切换到「${source.siteName}」`)
         setTimeout(() => { if (mountedRef.current) setSourceSwitchState('idle', '') }, 2000)
@@ -329,47 +338,58 @@ export default function VodDetail() {
     await switchToAlternativeSource(next)
   }, [popNextAlternativeSource, setSourceSwitchState, switchToAlternativeSource])
 
-  // 播放失败事件
-  useEffect(() => {
-    const handlePlayFailed = (event: CustomEvent) => {
-      const { siteKey: failedSiteKey, vodId: failedVodId, autoSwitch } = event.detail || {}
-      if (failureHandledRef.current) return
-      failureHandledRef.current = true
-      if (failedSiteKey && failedVodId) {
-        markCurrentSourceBroken(failedSiteKey, failedVodId)
-      }
-      setTimeout(() => { failureHandledRef.current = false }, 1000)
-      if (autoSwitch !== false && autoSwitchSource) {
-        switchToNextSource()
-      }
+  // 用户手动点选一个备选源（以前 UI 只显示数量，pickAlternativeSource 从未被调用）
+  const handlePickAlternative = useCallback(
+    async (index: number) => {
+      const picked = pickAlternativeSource(index)
+      if (!picked) return
+      await switchToAlternativeSource(picked)
+    },
+    [pickAlternativeSource, switchToAlternativeSource]
+  )
+
+  // 播放失败处理（供本页直接用，也供播放器信号触发）
+  const handleVodPlayFailed = useCallback((failedSiteKey?: string, failedVodId?: string, autoSwitch?: boolean) => {
+    if (failureHandledRef.current) return
+    failureHandledRef.current = true
+    if (failedSiteKey && failedVodId) {
+      markCurrentSourceBroken(failedSiteKey, failedVodId)
     }
-    window.addEventListener('vod:playFailed', handlePlayFailed as EventListener)
-    return () => {
-      window.removeEventListener('vod:playFailed', handlePlayFailed as EventListener)
+    setTimeout(() => { failureHandledRef.current = false }, 1000)
+    if (autoSwitch !== false && autoSwitchSource) {
+      void switchToNextSource()
     }
   }, [autoSwitchSource, markCurrentSourceBroken, switchToNextSource])
 
+  // 播放器信号（显式状态，替代 window 事件）
+  const playerSignal = usePlayerStore((state) => state.playerSignal)
+  const playerSignalToken = playerSignal?.token ?? 0
+  // 信号放在 store 里不会自动消失：挂载时先记下当前 token，避免把旧信号当新信号再处理一次
+  const handledSignalRef = useRef(usePlayerStore.getState().playerSignal?.token ?? 0)
   useEffect(() => {
-    const handleRetry = () => {
-      if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0)
-    }
-    const handleNextSource = () => {
+    if (playerSignalToken === handledSignalRef.current) return
+    handledSignalRef.current = playerSignalToken
+    if (!playerSignal || playerSignal.scope !== 'vod') return
+    if (playerSignal.type === 'playFailed') {
+      handleVodPlayFailed(playerSignal.siteKey, playerSignal.vodId, playerSignal.autoSwitch)
+    } else if (playerSignal.type === 'retry') {
+      if (activeLine) {
+        void handlePlay(activeLineIndex, currentEpisodeIndex || 0, currentPlaybackPosition())
+      }
+    } else if (playerSignal.type === 'nextSource') {
       void switchToNextSource()
     }
-    window.addEventListener('player:retry', handleRetry)
-    window.addEventListener('player:nextSource', handleNextSource)
-    return () => {
-      window.removeEventListener('player:retry', handleRetry)
-      window.removeEventListener('player:nextSource', handleNextSource)
-    }
-  }, [activeLine, activeLineIndex, currentEpisodeIndex, switchToNextSource])
+  }, [playerSignalToken, playerSignal, handleVodPlayFailed, activeLine, activeLineIndex, currentEpisodeIndex, switchToNextSource])
 
   // 播放集数
   const handlePlay = async (lineIdx: number, epIdx: number, startPositionSeconds = 0) => {
     const line = lineSources[lineIdx]
     if (!line || !line.episodes[epIdx]) return
+    const requestId = ++playRequestRef.current
+    const subscription = useConfigStore.getState().configUrl
+    const isCurrentRequest = () => mountedRef.current && requestId === playRequestRef.current && subscription === useConfigStore.getState().configUrl
 
-    window.dispatchEvent(new Event('player:flushHistory'))
+    usePlayerStore.getState().sendPlayerSignal({ type: 'flushHistory', scope: 'vod' })
     setIsResolving(true)
     setPlaybackPhase('resolving', '正在获取播放信息...')
     setCurrentSourceIndex(lineIdx)
@@ -383,7 +403,9 @@ export default function VodDetail() {
     const targetVodId = line.vodId
 
     try {
-      const playerRes = await siteApi.playerContent(line.siteKey, line.name, episode.url, [])
+      const playerRes = await siteApi.playerContent(line.siteKey, line.flag ?? line.name, episode.url, [])
+      if (!isCurrentRequest()) return
+      if (playerRes.success === false) throw new Error(playerRes.error || '获取播放信息失败')
       const playerResult = playerRes.data || playerRes
       setPlaybackPhase('resolving', '正在判断播放地址...')
 
@@ -407,6 +429,7 @@ export default function VodDetail() {
         // 直接可播放，立即开始
         setPlaybackPhase('connecting', '正在连接播放地址...')
         const playableUrl = await getPlayableMediaUrl(initialUrl, initialHeader)
+        if (!isCurrentRequest()) return
         setCurrentPlaySource({ siteKey: targetSiteKey, vodId: targetVodId })
         setVod(targetDetail!, line.episodes, lineIdx, playableUrl, initialHeader, targetSiteKey, line.name, startPositionSeconds)
         setCurrentEpisodeIndex(epIdx, playableUrl, startPositionSeconds)
@@ -422,10 +445,11 @@ export default function VodDetail() {
         try {
           const parseRes = await siteApi.superParse({
             url: episode.url,
-            flag: line.name,
+            flag: line.flag ?? line.name,
             siteKey: targetSiteKey,
             playerResult
           })
+          if (!isCurrentRequest()) return
 
           if (parseRes.success && parseRes.data.url) {
             setPlaybackPhase('connecting', '解析成功，正在连接...')
@@ -433,8 +457,10 @@ export default function VodDetail() {
               parseRes.data.url,
               parseRes.data.header || initialHeader
             )
+            if (!isCurrentRequest()) return
             const header = parseRes.data.header || initialHeader
             const store = usePlayerStore.getState()
+            usePlayerStore.setState({ playHeader: header || null })
             setCurrentEpisodeIndex(epIdx, url, startPositionSeconds)
             store.play(url)
             if (startPositionSeconds > 0) store.setCurrentTime(startPositionSeconds)
@@ -447,11 +473,10 @@ export default function VodDetail() {
               sourceId: `${targetSiteKey}::${targetVodId}`,
               nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
             })
-            window.dispatchEvent(new CustomEvent('vod:playFailed', {
-              detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析失败：未找到可播放地址', autoSwitch: true }
-            }))
+            handleVodPlayFailed(targetSiteKey, targetVodId, true)
           }
         } catch {
+          if (!isCurrentRequest()) return
           setPlaybackError('解析异常：无法完成播放地址解析', {
             stage: 'parse',
             errorKind: 'parse_failed',
@@ -459,9 +484,7 @@ export default function VodDetail() {
             sourceId: `${targetSiteKey}::${targetVodId}`,
             nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
           })
-          window.dispatchEvent(new CustomEvent('vod:playFailed', {
-            detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: '解析异常：无法完成播放地址解析', autoSwitch: true }
-          }))
+          handleVodPlayFailed(targetSiteKey, targetVodId, true)
         }
       }
 
@@ -491,6 +514,7 @@ export default function VodDetail() {
         completed: false
       }).catch(() => {})
     } catch (err: any) {
+      if (!isCurrentRequest()) return
       setIsResolving(false)
       setLoadError(err?.message || '获取播放信息失败')
       setPlaybackError(err?.message || '获取播放信息失败', {
@@ -500,11 +524,15 @@ export default function VodDetail() {
         sourceId: `${targetSiteKey}::${targetVodId}`,
         nextAction: autoSwitchSource ? '自动尝试下一个备选源' : '可手动切换线路或重试当前集'
       })
-      window.dispatchEvent(new CustomEvent('vod:playFailed', {
-        detail: { siteKey: targetSiteKey, vodId: targetVodId, reason: 'playerContent 失败', autoSwitch: true }
-      }))
+      handleVodPlayFailed(targetSiteKey, targetVodId, true)
     }
   }
+
+  useEffect(() => {
+    if (pendingAutoPlay === null || !lineSources[pendingAutoPlay]) return
+    setPendingAutoPlay(null)
+    void handlePlay(pendingAutoPlay, 0)
+  }, [pendingAutoPlay, lineSources])
 
   // 收藏
   const handleToggleKeep = async () => {
@@ -568,12 +596,48 @@ export default function VodDetail() {
     ? lineSources[resumeLineIndex]?.episodes[resumeEpisodeIndex]?.name || resumeHistory?.episodeName
     : ''
 
+  // 断点续播：本次会话已开播则以播放器实时状态为准，否则回到历史那一集和进度
+  const activeEpisodeCount = activeLine?.episodes.length || 0
+  const sessionActive = Boolean(
+    playerCurrentUrl &&
+    playerCurrentUrl !== '__resolving__' &&
+    currentVod &&
+    String(currentVod.vod_id) === String(vodId) &&
+    (!playerCurrentSiteKey || playerCurrentSiteKey === siteKey)
+  )
+  const playTarget = pickResumeTarget({
+    history: resumeHistory,
+    sessionActive,
+    sessionEpisodeIndex: currentEpisodeIndex || 0,
+    sessionPositionSeconds: playerCurrentTime || 0,
+    episodeCount: activeEpisodeCount,
+    activeLineIsHistory: activeLineIndex === resumeLineIndex
+  })
+  const highlightEpisodeIndex = showPlayer
+    ? currentEpisodeIndex
+    : canResume(resumeHistory) || sessionActive
+      ? playTarget.episodeIndex
+      : -1
+  /** 重试当前集时保留已看进度，避免把历史位置写成 0 */
+  const currentPlaybackPosition = () => {
+    const live = usePlayerStore.getState().currentTime || 0
+    return live > 3 ? Math.round(live) : 0
+  }
+
   return (
     <div className="h-full overflow-y-auto scrollbar-dark">
       {/* 播放器 */}
       {showPlayer && (
         <div className="relative aspect-video bg-black">
-          <VideoPlayer />
+          <VideoPlayer
+            onSelectEpisode={(index) =>
+              void handlePlay(
+                currentSourceIndex,
+                index,
+                resumePositionForEpisode(resumeHistory, currentSourceIndex, index, resumeLineIndex, resumeEpisodeIndex)
+              )
+            }
+          />
           <button
             onClick={() => setShowPlayer(false)}
             className="absolute top-3 left-3 z-30 p-2 bg-black/50 rounded-full text-white/80 hover:text-white"
@@ -590,7 +654,7 @@ export default function VodDetail() {
               <div className="flex gap-2">
                 <button
                   onClick={() => {
-                    if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0)
+                    if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0, currentPlaybackPosition())
                   }}
                   className="flex items-center gap-2 px-4 py-2 bg-accent text-bg-primary rounded-lg font-medium hover:bg-accent-hover"
                 >
@@ -622,10 +686,10 @@ export default function VodDetail() {
         </div>
       )}
 
-      <div className="p-6">
+      <div className="p-4 nav:p-6">
         {/* 详情信息 */}
-        <div className="flex gap-6">
-          <div className="shrink-0 w-48">
+        <div className="flex flex-col nav:flex-row gap-4 nav:gap-6">
+          <div className="shrink-0 w-32 nav:w-48 self-center nav:self-auto">
             <img
               src={detail?.vod_pic}
               alt={detail?.vod_name}
@@ -658,7 +722,7 @@ export default function VodDetail() {
               )}
               <button
                 onClick={() => {
-                  if (activeLine) handlePlay(activeLineIndex, currentEpisodeIndex || 0)
+                  if (activeLine) handlePlay(activeLineIndex, playTarget.episodeIndex, playTarget.positionSeconds)
                 }}
                 disabled={isResolving || lineSources.length === 0}
                 className={`flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
@@ -698,10 +762,46 @@ export default function VodDetail() {
               <span className="text-sm font-medium text-text-secondary">多线路片源</span>
               {alternativeSources.length > 0 && (
                 <span className="text-xs text-text-muted ml-auto">
-                  {alternativeSources.length} 个备选源
+                  {alternativeSources.length} 个备选源（可在下方直接切换）
                 </span>
               )}
             </div>
+
+            {/* 备选源：一字排开，点了就切（原来只显示"N 个备选源"这个数字，没有列表也切不了） */}
+            {(alternativeSources.length > 0 || sourceSwitchState === 'searching') && (
+              <div className="mb-3">
+                <div className="mb-1.5 flex items-center gap-2">
+                  <span className="text-xs text-text-muted">其他站点的同名片源</span>
+                  {sourceSwitchState === 'searching' && (
+                    <span className="flex items-center gap-1 text-[11px] text-text-muted">
+                      <Loader2 className="h-3 w-3 animate-spin" /> 搜索中
+                    </span>
+                  )}
+                  <button
+                    onClick={() => detail?.vod_name && void fetchAlternativeSources(detail.vod_name)}
+                    disabled={sourceSwitchState !== 'idle' || !detail?.vod_name}
+                    className="ml-auto flex items-center gap-1 text-[11px] text-text-muted transition-colors hover:text-accent disabled:opacity-50"
+                    title="重新搜索其他站点的同名片源"
+                  >
+                    <RefreshCw className="h-3 w-3" /> 重新搜索
+                  </button>
+                </div>
+                <div className="flex gap-2 overflow-x-auto scrollbar-dark pb-1">
+                  {alternativeSources.map((source, index) => (
+                    <button
+                      key={`${source.siteKey}:${source.vodId}`}
+                      onClick={() => void handlePickAlternative(index)}
+                      disabled={sourceSwitchState === 'switching'}
+                      title={`${source.siteName} · ${source.vodName}${source.vodRemarks ? ` · ${source.vodRemarks}` : ''}（点击切换）`}
+                      className="shrink-0 max-w-[220px] truncate rounded-md bg-bg-tertiary px-3 py-1.5 text-xs text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
+                    >
+                      <span className="font-medium text-text-primary">{source.siteName}</span>
+                      {source.vodRemarks && <span className="ml-1 text-text-muted">{source.vodRemarks}</span>}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* 线路 Tab 列表 */}
             <div className="flex gap-2 overflow-x-auto scrollbar-dark pb-1">
@@ -727,10 +827,16 @@ export default function VodDetail() {
                 {activeLine.episodes.map((ep, idx) => (
                   <button
                     key={ep.url}
-                    onClick={() => handlePlay(activeLineIndex, idx)}
+                    onClick={() =>
+                      handlePlay(
+                        activeLineIndex,
+                        idx,
+                        resumePositionForEpisode(resumeHistory, activeLineIndex, idx, resumeLineIndex, resumeEpisodeIndex)
+                      )
+                    }
                     disabled={isResolving}
                     className={`px-2 py-1.5 text-xs rounded-md truncate transition-colors disabled:opacity-50 ${
-                      showPlayer && currentEpisodeIndex === idx
+                      highlightEpisodeIndex === idx
                         ? 'bg-accent text-bg-primary font-medium'
                         : 'bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary'
                     }`}

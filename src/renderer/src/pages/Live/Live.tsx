@@ -1,111 +1,84 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { useLiveStore, Channel } from '@/stores/useLiveStore'
-import { useConfigStore } from '@/stores/useConfigStore'
 import { usePlayerStore } from '@/stores/usePlayerStore'
 import ChannelItem from '@/components/ChannelItem/ChannelItem'
 import VideoPlayer from '@/components/VideoPlayer/VideoPlayer'
-import { Loader2, Radio, Search } from 'lucide-react'
+import { ChevronDown, ChevronRight, Circle, Loader2, Search } from 'lucide-react'
 import { getPlayableMediaUrl } from '@/utils/media'
-import EmptyState from '@/components/EmptyState/EmptyState'
-import { cacheApi, invoke, on } from '@/utils/ipc'
-import { useNavigate } from 'react-router-dom'
+import { downloadApi, liveApi, on } from '@/utils/ipc'
 
-const LAST_LIVE_SOURCE_KEY = 'iptv:last-live-source'
 
-function getLiveSourceKey(live: { name: string; url: string }) {
-  return `${live.name}\n${live.url}`
-}
-
-async function readLastLiveSourceKey() {
-  try {
-    const value = await cacheApi.get(LAST_LIVE_SOURCE_KEY) as string | null
-    return value || ''
-  } catch {
-    return ''
-  }
-}
-
-async function writeLastLiveSourceKey(key: string) {
-  try {
-    await cacheApi.set(LAST_LIVE_SOURCE_KEY, key)
-  } catch {
-    // ignore storage failures
-  }
+/** 简易媒体查询 hook（与 Tailwind 断点保持一致的判定用） */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia(query).matches : false
+  )
+  useEffect(() => {
+    const media = window.matchMedia(query)
+    const handler = (event: MediaQueryListEvent) => setMatches(event.matches)
+    setMatches(media.matches)
+    media.addEventListener('change', handler)
+    return () => media.removeEventListener('change', handler)
+  }, [query])
+  return matches
 }
 
 export default function Live() {
-  const navigate = useNavigate()
   const {
     groups, channels, currentGroup, currentChannel, epgData,
-    isLoading, error, loadLive, switchGroup, switchChannel, fetchEpg, reset,
+    isLoading, error, loadChannelTree, switchGroup, switchChannel, fetchEpg,
+    reportPlaybackResult
   } = useLiveStore()
   const play = usePlayerStore((state) => state.play)
   const autoSwitchSource = usePlayerStore((state) => state.autoSwitchSource)
   const setPlaybackError = usePlayerStore((state) => state.setPlaybackError)
   const setSourceSwitchState = usePlayerStore((state) => state.setSourceSwitchState)
-  const currentConfig = useConfigStore((state) => state.currentConfig)
-  const liveConfig = useConfigStore((state) => state.liveConfig)
-
-  const livesConfig = liveConfig || currentConfig
-
-  const loadedLiveKeyRef = useRef('')
-  const loadEffectRequestRef = useRef(0)
   const channelUrlIndexRef = useRef(0)
   const playRequestRef = useRef(0)
   const channelPlaybackQueueRef = useRef<string[]>([])
   const channelHeadersQueueRef = useRef<Array<Record<string, string> | undefined>>([])
 
   const [searchKeyword, setSearchKeyword] = useState('')
-  const [selectedLiveIndex, setSelectedLiveIndex] = useState(0)
+  const [selectedLineIndex, setSelectedLineIndex] = useState(0)
   const [sortMode, setSortMode] = useState<'name' | 'latency'>('name')
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+  const [recordingId, setRecordingId] = useState('')
   const [speedTesting, setSpeedTesting] = useState(false)
   const [speedTestProgress, setSpeedTestProgress] = useState<{ current: number; total: number; message: string } | null>(null)
 
-  const liveSources = useMemo(
-    () => (livesConfig?.lives || []).filter((live) => live.name && live.url),
-    [livesConfig?.lives]
-  )
-
-  // 用 ref 保持 speed test 回调的实时引用
-  const selectedLiveIndexRef = useRef(selectedLiveIndex)
-  selectedLiveIndexRef.current = selectedLiveIndex
-  const loadLiveRef = useRef(loadLive)
-  loadLiveRef.current = loadLive
-  const liveSourcesRef = useRef(liveSources)
-  liveSourcesRef.current = liveSources
-  const speedTestingRef = useRef(speedTesting)
-  speedTestingRef.current = speedTesting
-
-  // 进入直播页时自动触发后台测速
   useEffect(() => {
+    let cancelled = false
+    let receivedProgress = false
     const cleanup = on('live:refreshProgress', (progress: any) => {
+      receivedProgress = true
       setSpeedTestProgress(progress)
-      if (progress.phase === 'done' || progress.phase === 'error') {
-        setSpeedTesting(false)
-        setSpeedTestProgress(null)
-        // 重新加载当前直播源以获取测速结果（latency/bestUrl 会更新）
-        const srcs = liveSourcesRef.current
-        const idx = selectedLiveIndexRef.current
-        const live = srcs[Math.min(idx, srcs.length - 1)]
-        if (live) loadLiveRef.current(live.name)
-      }
+      setSpeedTesting(progress.phase !== 'done' && progress.phase !== 'error')
+      if (progress.phase === 'cached' || progress.phase === 'done') void loadChannelTree()
     })
-    return cleanup as () => void
-  }, [])
-
-  useEffect(() => {
-    // 页面加载后自动触发测速（不阻塞 UI）
-    const timer = setTimeout(() => {
-      if (liveSources.length > 0 && !speedTestingRef.current) {
-        setSpeedTesting(true)
-        setSpeedTestProgress({ current: 0, total: 0, message: '正在后台测速...' })
-        invoke('live:refresh').catch(() => setSpeedTesting(false))
+    void loadChannelTree()
+    void liveApi.getRefreshStatus().then((status: any) => {
+      if (!cancelled && !receivedProgress) {
+        setSpeedTesting(Boolean(status?.isRefreshing))
+        setSpeedTestProgress(status?.progress || null)
       }
-    }, 5000) // 延迟 5 秒，让用户先看到频道
-    return () => clearTimeout(timer)
-  }, [liveSources.length]) // eslint-disable-line react-hooks/exhaustive-deps
+    }).catch(() => {})
+    return () => { cancelled = true; cleanup() }
+  }, [loadChannelTree])
+
+  // 直播录像：复用下载管理（输出 TS，停止后文件仍可播放）
+  useEffect(() => {
+    const off = on('download:progress', (payload: any) => {
+      const task = payload?.task
+      if (!task || task.id !== recordingId) return
+      if (task.status !== 'running') setRecordingId('')
+    })
+    return () => { if (typeof off === 'function') off() }
+  }, [recordingId])
 
   const buildPlaybackQueue = useCallback((channel: Channel): { urls: string[]; headers: Array<Record<string, string> | undefined> } => {
+    if (channel.lines?.length) {
+      return { urls: channel.lines.map((line) => line.url), headers: channel.lines.map((line) => line.header) }
+    }
     const candidates: Array<{ url: string; best: boolean; headers?: Record<string, string> }> = []
     const bestUrl = (channel as Channel & { bestUrl?: string }).bestUrl
     const channelUrlHeaders = (channel as any).urlHeaders as Record<string, Record<string, string>> | undefined
@@ -135,46 +108,21 @@ export default function Live() {
     return { urls: uniqueUrls, headers: uniqueHeaders }
   }, [])
 
-  useEffect(() => {
-    const restoreLastLiveSource = async () => {
-      const savedKey = await readLastLiveSourceKey()
-      const savedIndex = liveSources.findIndex((live) => getLiveSourceKey(live) === savedKey || live.url === savedKey)
-      setSelectedLiveIndex(savedIndex >= 0 ? savedIndex : 0)
-      loadedLiveKeyRef.current = ''
-    }
-    void restoreLastLiveSource()
-  }, [liveSources])
-
-  useEffect(() => {
-    if (!livesConfig || liveSources.length === 0) {
-      loadEffectRequestRef.current += 1
-      reset()
-      loadedLiveKeyRef.current = ''
-      return
-    }
-    const live = liveSources[Math.min(selectedLiveIndex, liveSources.length - 1)]
-    if (!live) return
-    const liveKey = getLiveSourceKey(live)
-    if (loadedLiveKeyRef.current === liveKey) return
-
-    const loadSelected = async () => {
-      const requestId = ++loadEffectRequestRef.current
-      console.log('[Live] 加载当前选择的直播源:', live.name, 'url:', live.url)
-      await loadLive(live.name)
-      if (requestId !== loadEffectRequestRef.current) return
-      loadedLiveKeyRef.current = liveKey
-      await writeLastLiveSourceKey(liveKey)
-    }
-
-    void loadSelected()
-  }, [livesConfig, liveSources, selectedLiveIndex, loadLive, reset])
-
   const playLiveUrl = useCallback(async (url: string, headers?: Record<string, string>) => {
     const requestId = ++playRequestRef.current
-    const playableUrl = await getPlayableMediaUrl(url, headers)
-    if (requestId !== playRequestRef.current) return
-    play(playableUrl)
-  }, [play])
+    try {
+      const playableUrl = await getPlayableMediaUrl(url, headers)
+      if (requestId !== playRequestRef.current) return
+      usePlayerStore.setState({ currentVod: null, currentSiteKey: '', episodes: [], currentEpisodeIndex: 0, currentSourceIndex: 0, playHeader: null })
+      play(playableUrl)
+    } catch (error) {
+      if (requestId !== playRequestRef.current) return
+      setPlaybackError(error instanceof Error ? error.message : String(error || '直播线路加载失败'))
+      usePlayerStore.getState().sendPlayerSignal({ type: 'playFailed', scope: 'live' })
+    }
+  }, [play, setPlaybackError])
+
+  useEffect(() => () => { playRequestRef.current += 1 }, [])
 
   useEffect(() => {
     if (!currentChannel || currentChannel.urls.length === 0) return
@@ -182,6 +130,7 @@ export default function Live() {
     channelPlaybackQueueRef.current = queue.urls
     channelHeadersQueueRef.current = queue.headers
     channelUrlIndexRef.current = 0
+    setSelectedLineIndex(0)
     void playLiveUrl(queue.urls[0], queue.headers[0])
   }, [buildPlaybackQueue, currentChannel, playLiveUrl])
 
@@ -193,6 +142,7 @@ export default function Live() {
       const headersQueue = channelHeadersQueueRef.current
       if (nextIndex < queue.length) {
         channelUrlIndexRef.current = nextIndex
+        setSelectedLineIndex(nextIndex)
         setSourceSwitchState('switching', `正在切换直播线路 ${nextIndex + 1}/${queue.length}`)
         console.warn(
           `[Live] 当前线路失败，切换备用线路 ${nextIndex + 1}/${queue.length}:`,
@@ -224,29 +174,26 @@ export default function Live() {
   const playLiveUrlRef = useRef(playLiveUrl)
   playLiveUrlRef.current = playLiveUrl
 
+  // 播放器信号（显式状态，替代 window 事件）
+  const playerSignal = usePlayerStore((state) => state.playerSignal)
+  const playerSignalToken = playerSignal?.token ?? 0
+  // 信号放在 store 里不会自动消失：挂载时先记下当前 token，避免把旧信号当新信号再处理一次
+  const handledSignalRef = useRef(usePlayerStore.getState().playerSignal?.token ?? 0)
   useEffect(() => {
-    const handlePlayFailed = () => {
+    if (playerSignalToken === handledSignalRef.current) return
+    handledSignalRef.current = playerSignalToken
+    if (!playerSignal || playerSignal.scope !== 'live') return
+    if (playerSignal.type === 'playFailed') {
       if (autoSwitchSourceRef.current) switchToNextLiveLineRef.current()
+    } else if (playerSignal.type === 'retry') {
+      const url = channelPlaybackQueueRef.current[channelUrlIndexRef.current]
+      if (url) {
+        void playLiveUrlRef.current(url, channelHeadersQueueRef.current[channelUrlIndexRef.current])
+      }
+    } else if (playerSignal.type === 'nextSource') {
+      switchToNextLiveLineRef.current()
     }
-    window.addEventListener('live:playFailed', handlePlayFailed)
-    return () => window.removeEventListener('live:playFailed', handlePlayFailed)
-  }, [])
-
-  useEffect(() => {
-    const handleRetry = () => {
-      const queue = channelPlaybackQueueRef.current
-      const headersQueue = channelHeadersQueueRef.current
-      const url = queue[channelUrlIndexRef.current]
-      if (url) void playLiveUrlRef.current(url, headersQueue[channelUrlIndexRef.current])
-    }
-    const handleNextSource = () => switchToNextLiveLineRef.current()
-    window.addEventListener('player:retry', handleRetry)
-    window.addEventListener('player:nextSource', handleNextSource)
-    return () => {
-      window.removeEventListener('player:retry', handleRetry)
-      window.removeEventListener('player:nextSource', handleNextSource)
-    }
-  }, [])
+  }, [playerSignalToken, playerSignal])
 
   useEffect(() => {
     const ch = currentChannel as Channel & { epgUrl?: string }
@@ -299,27 +246,133 @@ export default function Live() {
         return aLat - bLat
       })
     }
-    return filtered
+    return [...filtered].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }))
   }, [channels, groups, searchKeyword, sortMode])
+  // 组内排序：可达的在前 → 延时升序 → 名称
+  const speedFirst = useCallback((list: Channel[]) => [...list].sort((a, b) => {
+    const aAlive = (a.latency ?? -1) > 0 ? 0 : 1
+    const bAlive = (b.latency ?? -1) > 0 ? 0 : 1
+    if (aAlive !== bAlive) return aAlive - bAlive
+    const aLat = (a.latency ?? -1) > 0 ? (a.latency as number) : Number.MAX_SAFE_INTEGER
+    const bLat = (b.latency ?? -1) > 0 ? (b.latency as number) : Number.MAX_SAFE_INTEGER
+    if (aLat !== bLat) return aLat - bLat
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true })
+  }), [])
 
-  if (!currentConfig && !liveConfig) {
-    return (
-      <EmptyState
-        icon={Radio}
-        title="还没有直播配置"
-        description="导入包含直播源的配置后，这里会自动加载频道列表。"
-        primaryLabel="去导入配置"
-        onPrimaryClick={() => navigate('/onboarding')}
-      />
-    )
-  }
+  const groupBestLatency = useCallback((list: Channel[]) => {
+    const alive = list.map((c) => c.latency ?? -1).filter((v) => v > 0)
+    return alive.length ? Math.min(...alive) : -1
+  }, [])
+
+  // 分组排序：组内最快频道越快的组越靠前
+  const sortedGroups = useMemo(() => [...groups].sort((a, b) => {
+    const aBest = groupBestLatency(a.channels)
+    const bBest = groupBestLatency(b.channels)
+    const aScore = aBest > 0 ? aBest : Number.MAX_SAFE_INTEGER
+    const bScore = bBest > 0 ? bBest : Number.MAX_SAFE_INTEGER
+    if (aScore !== bScore) return aScore - bScore
+    return a.name.localeCompare(b.name, 'zh-CN', { numeric: true })
+  }), [groups, groupBestLatency])
+
+  // 当前分组默认展开
+  useEffect(() => {
+    if (!currentGroup) return
+    setExpandedGroups((prev) => (prev.has(currentGroup) ? prev : new Set(prev).add(currentGroup)))
+  }, [currentGroup])
+
+  const toggleGroup = useCallback((name: string) => {
+    const willExpand = !expandedGroups.has(name)
+    setExpandedGroups((prev) => {
+      const next = new Set(prev)
+      if (willExpand) next.add(name)
+      else next.delete(name)
+      return next
+    })
+    if (willExpand) switchGroup(name)
+  }, [expandedGroups, switchGroup])
+
+  const playbackQueue = useMemo(() => currentChannel ? buildPlaybackQueue(currentChannel) : { urls: [], headers: [] }, [currentChannel, buildPlaybackQueue])
+
+  // 真实播放结果回写：探测会因超时/嗅探条件误判「无信号」，而用户双击却能播。
+  // 这里把播放器实际结果写回缓存，状态立刻自我纠正（同一 URL 只回写一次）。
+  const playbackPhase = usePlayerStore((state) => state.playbackPhase)
+  const playbackUrl = usePlayerStore((state) => state.currentUrl)
+  const reportedPlaybackRef = useRef<Map<string, string>>(new Map())
+  useEffect(() => {
+    if (!playbackUrl || !playbackQueue.urls.includes(playbackUrl)) return
+    const outcome = playbackPhase === 'playing' ? 'alive' : playbackPhase === 'failed' ? 'dead' : null
+    if (!outcome) return
+    if (reportedPlaybackRef.current.get(playbackUrl) === outcome) return
+    reportedPlaybackRef.current.set(playbackUrl, outcome)
+    console.log(`[Live] 播放结果回写: ${outcome} ${playbackUrl.slice(0, 80)}`)
+    void reportPlaybackResult([playbackUrl], outcome === 'alive')
+  }, [playbackPhase, playbackUrl, playbackQueue.urls, reportPlaybackResult])
+
+  const handleRecord = useCallback(async () => {
+    if (recordingId) {
+      await downloadApi.cancel(recordingId).catch(() => {})
+      setRecordingId('')
+      return
+    }
+    if (!currentChannel || playbackQueue.urls.length === 0) return
+    const index = selectedLineIndex
+    const url = playbackQueue.urls[index] || playbackQueue.urls[0]
+    const headers = playbackQueue.headers[index]
+    try {
+      const task = await downloadApi.start({
+        url,
+        headers,
+        fileName: `${currentChannel.name} 录像`,
+        live: true
+      })
+      setRecordingId(task.id)
+    } catch (error) {
+      setPlaybackError(error instanceof Error ? error.message : String(error))
+    }
+  }, [recordingId, currentChannel, playbackQueue, selectedLineIndex, setPlaybackError])
+
+
+  // 频道列表宽度：可拖动调整并记住（原先写死 wide:w-56 = 224px，名字被状态文字挤没）
+  const isWideLayout = useMediaQuery('(min-width: 1200px)')
+  const [listWidth, setListWidth] = useState<number>(() => {
+    const saved = Number(window.localStorage.getItem('iptv.liveListWidth'))
+    return Number.isFinite(saved) && saved >= 200 ? Math.min(600, saved) : 264
+  })
+  const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null)
+  const startResize = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault()
+      dragStateRef.current = { startX: event.clientX, startWidth: listWidth }
+      const onMove = (moveEvent: MouseEvent) => {
+        const drag = dragStateRef.current
+        if (!drag) return
+        const next = Math.max(200, Math.min(600, drag.startWidth + (moveEvent.clientX - drag.startX)))
+        setListWidth(next)
+      }
+      const onUp = () => {
+        dragStateRef.current = null
+        window.removeEventListener('mousemove', onMove)
+        window.removeEventListener('mouseup', onUp)
+        setListWidth((current) => {
+          window.localStorage.setItem('iptv.liveListWidth', String(current))
+          return current
+        })
+      }
+      window.addEventListener('mousemove', onMove)
+      window.addEventListener('mouseup', onUp)
+    },
+    [listWidth]
+  )
 
   return (
     <div className="h-full min-h-0 flex flex-col">
       {/* 主内容区 */}
-      <div className="flex-1 min-h-0 flex">
+      <div className="flex-1 min-h-0 flex flex-col wide:flex-row">
         {/* 左侧 - 当前源频道 */}
-        <div className="w-56 min-h-0 shrink-0 border-r border-[#2a2a2a] flex flex-col">
+        <div
+          className="w-full wide:w-auto min-h-0 shrink-0 max-h-[38vh] wide:max-h-none border-b wide:border-b-0 wide:border-r border-[#2a2a2a] flex flex-col"
+          style={isWideLayout ? { width: listWidth } : undefined}
+        >
           <div className="px-3 py-2 border-b border-[#2a2a2a] space-y-1.5">
             <div className="flex items-center justify-between">
               <span className="text-xs text-text-secondary font-medium">
@@ -338,36 +391,15 @@ export default function Live() {
               </button>
             </div>
             {/* 后台测速进度 */}
-            {speedTesting && speedTestProgress && (
+            {speedTesting && (
               <div className="flex items-center gap-1.5">
                 <Loader2 className="w-2.5 h-2.5 animate-spin text-accent shrink-0" />
                 <span className="text-[10px] text-text-muted truncate">
-                  {speedTestProgress.message || '测速中...'}
+                  {speedTestProgress?.message || '后台巡检中...'}
                 </span>
               </div>
             )}
           </div>
-
-          {liveSources.length > 1 && (
-            <div className="px-3 py-2 border-b border-[#2a2a2a]">
-              <select
-                value={selectedLiveIndex}
-                onChange={(event) => {
-                  const nextIndex = Number(event.target.value)
-                  setSelectedLiveIndex(nextIndex)
-                  const live = liveSources[nextIndex]
-                  if (live) void writeLastLiveSourceKey(getLiveSourceKey(live))
-                }}
-                className="w-full bg-bg-tertiary border border-[#2a2a2a] rounded-md px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent"
-              >
-                {liveSources.map((live, index) => (
-                  <option key={`${live.name}:${live.url}:${index}`} value={index}>
-                    {live.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
 
           {/* 搜索框 */}
           <div className="px-3 py-2 border-b border-[#2a2a2a]">
@@ -383,27 +415,44 @@ export default function Live() {
             </div>
           </div>
 
-          {groups.length > 1 && !searchKeyword && (
-            <div className="shrink-0 max-h-36 overflow-y-auto scrollbar-dark border-b border-[#2a2a2a] py-1">
-              {groups.map((group) => (
-                <button
-                  key={group.name}
-                  onClick={() => switchGroup(group.name)}
-                  className={`w-full px-3 py-1.5 text-left text-xs transition-colors ${
-                    currentGroup === group.name
-                      ? 'bg-accent-muted text-accent'
-                      : 'text-text-muted hover:text-text-secondary hover:bg-bg-hover'
-                  }`}
-                >
-                  <span className="block truncate">{group.name}</span>
-                </button>
-              ))}
-            </div>
-          )}
 
-          {/* 当前直播源频道列表 */}
+          {/* 分组 → 点开 → 组内按速度最快排序 */}
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-dark py-1">
-            {displayChannels.length === 0 ? (
+            {!searchKeyword && sortedGroups.length > 0 ? (
+              sortedGroups.map((group) => {
+                const expanded = expandedGroups.has(group.name)
+                const best = groupBestLatency(group.channels)
+                return (
+                  <div key={group.name}>
+                    <button
+                      onClick={() => toggleGroup(group.name)}
+                      className={`w-full flex items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors ${
+                        currentGroup === group.name
+                          ? 'text-accent'
+                          : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
+                      }`}
+                    >
+                      {expanded ? <ChevronDown className="w-3 h-3 shrink-0" /> : <ChevronRight className="w-3 h-3 shrink-0" />}
+                      <span className="min-w-0 flex-1 truncate font-medium">{group.name}</span>
+                      {best > 0 && <span className="shrink-0 text-[10px] font-mono text-green-400">{best}ms</span>}
+                      <span className="shrink-0 text-[10px] text-text-muted">{group.channels.length}</span>
+                    </button>
+                    {expanded && (
+                      <div className="pl-2">
+                        {speedFirst(group.channels).map((channel) => (
+                          <ChannelItem
+                            key={`${group.name}:${channel.name}:${channel.urls[0] || 'no-url'}`}
+                            channel={channel}
+                            isActive={currentChannel?.name === channel.name}
+                            onClick={(ch) => switchChannel(ch)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })
+            ) : displayChannels.length === 0 ? (
               <div className="flex items-center justify-center py-8 text-text-muted text-xs">
                 {isLoading && !searchKeyword ? (
                   <span className="inline-flex items-center gap-2">
@@ -413,9 +462,9 @@ export default function Live() {
                 ) : searchKeyword ? '未找到匹配频道' : '暂无可用频道'}
               </div>
             ) : (
-              displayChannels.map((channel, index) => (
+              displayChannels.map((channel) => (
                 <ChannelItem
-                  key={`${channel.name}:${channel.urls[0] || 'no-url'}:${index}`}
+                  key={`${channel.name}:${channel.urls[0] || 'no-url'}`}
                   channel={channel}
                   isActive={currentChannel?.name === channel.name}
                   onClick={(ch) => switchChannel(ch)}
@@ -425,8 +474,75 @@ export default function Live() {
           </div>
         </div>
 
+        {/* 拖动条：调整频道列表宽度（仅宽屏布局；双击复位） */}
+        {isWideLayout && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖动调整频道列表宽度"
+            title="拖动调整频道列表宽度（双击复位）"
+            onMouseDown={startResize}
+            onDoubleClick={() => {
+              setListWidth(264)
+              window.localStorage.setItem('iptv.liveListWidth', '264')
+            }}
+            className="hidden wide:block w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-accent/40 transition-colors"
+          />
+        )}
+
         {/* 右侧 - 播放器 */}
         <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+          {error && <p role="alert" className="shrink-0 px-4 py-2 text-xs text-red-400 break-words">{error}</p>}
+          {currentChannel && (
+            <div className="shrink-0 flex flex-wrap items-center gap-3 border-b border-[#2a2a2a] bg-bg-secondary px-4 py-2">
+              <span className="min-w-0 flex-1 break-words text-sm text-text-primary">{currentChannel.name}</span>
+              <label htmlFor="live-line" className="shrink-0 text-xs text-text-muted">{playbackQueue.urls.length} 条线路</label>
+              <button
+                onClick={() => void handleRecord()}
+                title={recordingId ? '停止录像（已录制部分会保留）' : '开始录制当前直播'}
+                className={`shrink-0 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition-colors ${
+                  recordingId
+                    ? 'border-red-400/60 text-red-400 hover:border-red-400'
+                    : 'border-[#3a3a3a] text-text-secondary hover:border-accent hover:text-accent'
+                }`}
+              >
+                {recordingId ? <Circle className="h-2.5 w-2.5 fill-current animate-pulse" /> : <Circle className="h-2.5 w-2.5" />}
+                {recordingId ? '停止录像' : '录像'}
+              </button>
+              <select id="live-line" value={selectedLineIndex} onChange={(event) => {
+                const index = Number(event.target.value)
+                if (!playbackQueue.urls[index]) return
+                channelUrlIndexRef.current = index
+                setSelectedLineIndex(index)
+                void playLiveUrl(playbackQueue.urls[index], playbackQueue.headers[index])
+              }} className="w-40 max-w-full rounded border border-[#3a3a3a] bg-bg-primary px-2 py-1 text-xs text-text-primary">
+                {playbackQueue.urls.map((url, index) => {
+                  // 巡检哨兵：-2=未探测（不标注）、-1=探测不通、>=0=可达
+                  const line = currentChannel.lines?.[index]
+                  const monitor = line
+                    ? line.latency === -2
+                      ? ''
+                      : line.alive
+                        ? ` · ${line.latency >= 0 ? `${line.latency}ms` : '可达'}`
+                        : ' · 不可用'
+                    : ''
+                  return (
+                    <option key={`${index}:${url}`} value={index}>
+                      线路 {index + 1}
+                      {currentChannel.lines?.length
+                        ? index === 0 && currentChannel.lines[0].alive
+                          ? ' (优选)'
+                          : ''
+                        : url === currentChannel.bestUrl
+                          ? ' (优选)'
+                          : ''}
+                      {monitor}
+                    </option>
+                  )
+                })}
+              </select>
+            </div>
+          )}
           <div className="flex-1 min-h-0 bg-black relative">
             {currentChannel ? (
               <>

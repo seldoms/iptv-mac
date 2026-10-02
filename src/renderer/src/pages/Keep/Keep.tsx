@@ -32,7 +32,7 @@ export default function Keep() {
   }
 
   const handleVodClick = (vod: Vod, item: KeepItem) => {
-    navigate(`/vod/${item.siteKey}/${item.vodId}`)
+    navigate(`/vod/${encodeURIComponent(item.siteKey)}/${encodeURIComponent(item.vodId)}`)
   }
 
   return (

@@ -3,9 +3,13 @@ import type { CSSProperties, ReactNode } from 'react'
 import Hls from 'hls.js'
 import dashjs from 'dashjs'
 import { usePlayerStore } from '@/stores/usePlayerStore'
+import { useUiStore } from '@/stores/useUiStore'
+import { downloadApi } from '@/utils/ipc'
+import { formatClock, formatThroughput, smoothThroughput } from '@/utils/format'
 import DanmakuLayer from '@/components/DanmakuLayer/DanmakuLayer'
 import SubtitleLayer from '@/components/SubtitleLayer/SubtitleLayer'
 import {
+  Download,
   Play,
   Pause,
   Volume2,
@@ -24,7 +28,7 @@ import {
   RotateCw,
   Shuffle
 } from 'lucide-react'
-import { historyApi, windowApi } from '@/utils/ipc'
+import { historyApi, invoke, settingsApi, windowApi } from '@/utils/ipc'
 import { redactHeaders, redactText } from '@/utils/redact'
 import { getPlaybackMetricSummary, recordPlaybackMetric } from '@/utils/playbackMetrics'
 
@@ -45,6 +49,9 @@ declare global {
   }
 }
 
+/* StrictMode 下 effect 会跑两遍，用模块级标记保证连续性 smoke 只跑一次（ref 会随重挂载重置） */
+let continuitySmokeRan = false
+
 interface StreamStats {
   bitrateKbps: number | null
   linkSpeedKbps: number | null
@@ -55,12 +62,6 @@ const emptyStreamStats: StreamStats = {
   bitrateKbps: null,
   linkSpeedKbps: null,
   updatedAt: 0
-}
-
-function formatThroughput(kbps: number | null): string {
-  if (!kbps || !Number.isFinite(kbps) || kbps <= 0) return '--'
-  if (kbps >= 1000) return `${(kbps / 1000).toFixed(kbps >= 10000 ? 0 : 1)} Mbps`
-  return `${Math.round(kbps)} Kbps`
 }
 
 function inferProtocol(url: string): 'hls' | 'dash' | 'native' | 'unknown' {
@@ -97,7 +98,8 @@ function formatUrlIdentifier(url: string): string {
   }
 }
 
-export default function VideoPlayer() {
+export default function VideoPlayer({ onSelectEpisode }: { onSelectEpisode?: (index: number) => void } = {}) {
+  const [downloadNotice, setDownloadNotice] = useState('')
   const videoRef = useRef<HTMLVideoElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const hlsRef = useRef<Hls | null>(null)
@@ -115,6 +117,11 @@ export default function VideoPlayer() {
   const loadedUrlRef = useRef<string>('')
   /** 上一个 HLS 分片加载完成时间，用于估算链路速度 */
   const lastFragLoadedAtRef = useRef<number>(0)
+  // 码率/速度统计用的平滑状态：速度按「本次分片实际下载耗时」算，并做指数平滑；
+  // 码率优先取声明值，退化时用分片平均码率。
+  const fragLoadStartedAtRef = useRef<number>(0)
+  const smoothedSpeedKbpsRef = useRef<number | null>(null)
+  const smoothedBitrateKbpsRef = useRef<number | null>(null)
   /** stalled 防抖定时器 - 持续停滞超过阈值才显示覆盖层 */
   const stalledTimerRef = useRef<number>(0)
   const pendingSeekRef = useRef<number>(0)
@@ -131,9 +138,16 @@ export default function VideoPlayer() {
     playbackStartedAt, playbackFirstFrameAt, playbackLastErrorAt, playbackDiagnostic,
     alternativeSources, brokenSources, sourceSwitchState, sourceSwitchMessage, autoSwitchSource,
     setIsPlaying, setCurrentTime, setDuration, setSpeed, setVolume,
-    toggleDanmaku, toggleFullscreen, nextEpisode, prevEpisode,
+    toggleDanmaku, toggleFullscreen,
     setPlaybackPhase, markPlaybackFirstFrame, setAutoSwitchSource
   } = usePlayerStore()
+
+  const nextEpisode = useCallback(() => {
+    if (currentEpisodeIndex + 1 < episodes.length) onSelectEpisode?.(currentEpisodeIndex + 1)
+  }, [currentEpisodeIndex, episodes.length, onSelectEpisode])
+  const prevEpisode = useCallback(() => {
+    if (currentEpisodeIndex > 0) onSelectEpisode?.(currentEpisodeIndex - 1)
+  }, [currentEpisodeIndex, onSelectEpisode])
 
   // 同步 siteKey/vodId 到 ref（变化时不影响 effect）
   useEffect(() => {
@@ -153,7 +167,13 @@ export default function VideoPlayer() {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const [isDragging, setIsDragging] = useState(false)
   const [isActualFullscreen, setIsActualFullscreen] = useState(false)
+  const isActualFullscreenRef = useRef(false)
+  useEffect(() => {
+    isActualFullscreenRef.current = isActualFullscreen
+  }, [isActualFullscreen])
   const [miniTransitionStyle, setMiniTransitionStyle] = useState<CSSProperties | null>(null)
+  // 小窗模式：只换布局、不重挂载（下面的 HLS 初始化 effect 不依赖它，所以流不会重来）
+  const miniPlayerMode = useUiStore((state) => state.miniMode)
   const [streamStats, setStreamStats] = useState<StreamStats>(emptyStreamStats)
 
   // ==================== 换源：触发失败事件 ====================
@@ -204,8 +224,14 @@ export default function VideoPlayer() {
       protocol,
       sourceId: siteKey && vodId ? `${siteKey}::${vodId}` : undefined
     })
-    const detail = { siteKey, vodId, reason, autoSwitch: true, diagnostic: usePlayerStore.getState().playbackDiagnostic }
-    window.dispatchEvent(new CustomEvent(siteKey || vodId ? 'vod:playFailed' : 'live:playFailed', { detail }))
+    usePlayerStore.getState().sendPlayerSignal({
+      type: 'playFailed',
+      scope: siteKey || vodId ? 'vod' : 'live',
+      siteKey,
+      vodId,
+      reason,
+      autoSwitch: true
+    })
   })
 
   // 清除加载超时的工具函数
@@ -305,20 +331,63 @@ export default function VideoPlayer() {
     }).catch(() => {})
   }, [])
 
+  const playerSignal = usePlayerStore((state) => state.playerSignal)
+  const playerSignalToken = playerSignal?.token ?? 0
+  // 信号放在 store 里不会自动消失：挂载时先记下当前 token，避免把旧信号当新信号再处理一次
+  const handledSignalRef = useRef(usePlayerStore.getState().playerSignal?.token ?? 0)
+
   useEffect(() => {
-    const handleFlushHistory = () => savePlaybackHistory(true)
-    window.addEventListener('player:flushHistory', handleFlushHistory)
-    return () => window.removeEventListener('player:flushHistory', handleFlushHistory)
-  }, [savePlaybackHistory])
+    if (playerSignalToken === handledSignalRef.current) return
+    handledSignalRef.current = playerSignalToken
+    if (!playerSignal || playerSignal.type !== 'flushHistory') return
+    void savePlaybackHistory(true)
+  }, [playerSignalToken, playerSignal, savePlaybackHistory])
 
   useEffect(() => {
     return () => savePlaybackHistory(true)
   }, [savePlaybackHistory])
 
+  useEffect(() => {
+    if (!miniPlayerMode) return
+    setMiniTransitionStyle(null)
+    // 运行时证据：进入小窗只换布局。若日志里同时出现「初始化 HLS 实例」，说明流被重建了。
+    console.log('[VideoPlayer] 进入小窗：复用当前播放器实例（未重建流）')
+  }, [miniPlayerMode])
+
+  // 小窗/精简模式必须先把全屏退掉：全屏窗口 + 小窗布局叠加会出现"小窗里仍是全屏布局"、
+  // 装饰状态错位，也会让窗口尺寸还原到错误的值。
+  const exitFullscreenIfNeeded = useCallback(async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+      }
+    } catch {
+      /* 忽略：部分 WKWebView 版本会拒绝退出 */
+    }
+    if (isActualFullscreenRef.current) {
+      await windowApi.setFullscreen(false).catch(() => {})
+    }
+    setIsActualFullscreen(false)
+  }, [])
+
+  // 布局变化（全屏/小窗/还原）后浏览器可能把视频暂停，这里补一次续播，
+  // 保证"切换布局不打断播放"这个承诺真的成立。
+  const ensurePlaying = useCallback(async (wasPlaying: boolean) => {
+    const video = videoRef.current
+    if (!video || !wasPlaying || !video.paused) return
+    try {
+      await video.play()
+    } catch {
+      /* 自动播放策略拒绝时会由后续交互恢复，不阻断流程 */
+    }
+  }, [])
+
   // 进入精简模式
   const handleEnterMiniMode = useCallback(async () => {
     if (!currentUrl) return
     if (miniTransitionStyle) return
+    const wasPlaying = videoRef.current ? !videoRef.current.paused : false
+    await exitFullscreenIfNeeded()
     const video = videoRef.current
     const container = containerRef.current
     const savedTime = video?.currentTime || currentTime
@@ -364,21 +433,36 @@ export default function VideoPlayer() {
         windowApi.savePlayerState({ url: currentUrl, header: playHeader || undefined, currentTime: savedTime }),
         new Promise((resolve) => window.setTimeout(resolve, rect ? 230 : 0))
       ])
+      // 关键校验：状态没存住就绝不进小窗——否则主界面被替换成 MiniPlayer 而它拿不到地址，
+      // 结果就是一个纯黑窗口（按钮"失效"+黑屏就是这么来的）。
+      const stored = (await windowApi.getPlayerState()) as { url?: string } | null
+      if (!stored?.url) {
+        console.error('[VideoPlayer] 播放状态未保存成功，放弃进入精简模式')
+        setMiniTransitionStyle(null)
+        usePlayerStore.getState().setPlaybackError('进入精简模式失败：播放状态未能保存', {
+          stage: 'unknown',
+          errorKind: 'unknown',
+          protocol: inferProtocol(currentUrl),
+          nextAction: '可继续在本页观看，或稍后重试'
+        })
+        return
+      }
       await windowApi.enterMiniMode()
+      await ensurePlaying(wasPlaying)
       const url = new URL(window.location.href)
       url.searchParams.set('mode', 'mini')
       window.history.replaceState(null, '', url.toString())
-      window.dispatchEvent(new CustomEvent('app:miniModeChanged', { detail: true }))
+      useUiStore.getState().setMiniMode(true)
     } catch (err) {
       console.error('[VideoPlayer] 进入精简模式失败:', err)
       setMiniTransitionStyle(null)
     }
-  }, [currentUrl, playHeader, currentTime, miniTransitionStyle])
+  }, [currentUrl, playHeader, currentTime, miniTransitionStyle, exitFullscreenIfNeeded, ensurePlaying])
 
   // 初始化播放器 - 仅在 URL/header 变化时重跑
   useEffect(() => {
     const video = videoRef.current
-    if (!video || !currentUrl) return
+    if (!video || !currentUrl || currentUrl === '__resolving__') return
     const currentProtocol = inferProtocol(currentUrl)
     window.__alphaPlaybackDebug = {
       protocol: currentProtocol,
@@ -402,6 +486,9 @@ export default function VideoPlayer() {
     failureReportedRef.current = false
     hasPlaybackStartedRef.current = false
     lastFragLoadedAtRef.current = 0
+    fragLoadStartedAtRef.current = 0
+    smoothedSpeedKbpsRef.current = null
+    smoothedBitrateKbpsRef.current = null
     setStreamStats(emptyStreamStats)
     loadStartTimeRef.current = Date.now()
     setPlaybackPhase('connecting', '正在连接播放地址...')
@@ -412,12 +499,12 @@ export default function VideoPlayer() {
     loadedUrlRef.current = currentUrl
 
     // 启动加载超时检测（25秒无任何播放进度视为失败）
+    const loadTimeoutMs = currentVod ? LOAD_TIMEOUT_MS : 5000
     loadTimeoutRef.current = window.setTimeout(() => {
       if (!failureReportedRef.current && !hasPlaybackStartedRef.current) {
-        console.error('[VideoPlayer] 加载超时（25秒）')
-        reportPlayFailureRef.current('加载超时（25秒）')
+        reportPlayFailureRef.current(`加载超时（${loadTimeoutMs / 1000}秒）`)
       }
-    }, LOAD_TIMEOUT_MS)
+    }, loadTimeoutMs)
 
     let hlsRecoveryTimer = 0
 
@@ -436,6 +523,9 @@ export default function VideoPlayer() {
       let mediaRecoveryAttempts = 0
 
       // HLS.js 回退（MSE 解码）
+      console.log('[VideoPlayer] 初始化 HLS 实例（切小窗不应再出现此行）:', currentUrl)
+      const counter = window as unknown as { __hlsInstanceCount?: number }
+      counter.__hlsInstanceCount = (counter.__hlsInstanceCount ?? 0) + 1
       const hls = new Hls({
         // 桌面 WebView 的 CSP 不允许 blob worker；主线程解析可避免创建失败导致黑屏。
         enableWorker: false,
@@ -478,6 +568,7 @@ export default function VideoPlayer() {
         })
       })
       hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
+        fragLoadStartedAtRef.current = performance.now()
         appendHlsDebugEvent({
           event: 'frag_loading',
           sn: data.frag?.sn,
@@ -497,24 +588,35 @@ export default function VideoPlayer() {
         networkRecoveryAttempts = 0
         const now = performance.now()
         const payloadBytes = data.payload?.byteLength || 0
-        const elapsedMs = lastFragLoadedAtRef.current ? now - lastFragLoadedAtRef.current : 0
         const fragmentDuration = data.part?.duration || data.frag?.duration || 0
-        const currentLevel = hls.levels[hls.currentLevel]
-        const levelBitrateKbps = currentLevel?.bitrate ? currentLevel.bitrate / 1000 : null
-        const fragmentBitrateKbps = payloadBytes && fragmentDuration > 0
-          ? (payloadBytes * 8) / fragmentDuration / 1000
-          : null
-        const hlsBandwidthKbps = hls.bandwidthEstimate ? hls.bandwidthEstimate / 1000 : null
-        const linkSpeedKbps = payloadBytes && elapsedMs > 100
-          ? (payloadBytes * 8) / (elapsedMs / 1000) / 1000
-          : null
+        // 自动清晰度时 hls.currentLevel 是 -1，直接用它会取到 undefined（旧实现因此常显示 --）；
+        // 回退到正在加载的 level。
+        const level = hls.levels[hls.currentLevel >= 0 ? hls.currentLevel : hls.loadLevel]
+        const levelBitrateKbps = level?.bitrate ? level.bitrate / 1000 : null
+        const fragmentBitrateKbps =
+          payloadBytes && fragmentDuration > 0 ? (payloadBytes * 8) / fragmentDuration / 1000 : null
+
+        // 速度必须是「本次分片真正下载的耗时」，而不是两次分片完成的间隔
+        // （直播分片之间有等待时间，用间隔会把速度算成接近 0；用 bandwidthEstimate
+        // 又会显示成链路容量，动辄几十 Mbps，与实际码率完全不符）。
+        const downloadMs = fragLoadStartedAtRef.current ? now - fragLoadStartedAtRef.current : 0
+        const instantSpeedKbps =
+          payloadBytes && downloadMs > 30 ? (payloadBytes * 8) / (downloadMs / 1000) / 1000 : null
 
         lastFragLoadedAtRef.current = now
-        setStreamStats((prev) => ({
-          bitrateKbps: levelBitrateKbps || fragmentBitrateKbps || prev.bitrateKbps,
-          linkSpeedKbps: hlsBandwidthKbps || linkSpeedKbps || prev.linkSpeedKbps,
+        fragLoadStartedAtRef.current = 0
+
+        smoothedSpeedKbpsRef.current = smoothThroughput(smoothedSpeedKbpsRef.current, instantSpeedKbps)
+        smoothedBitrateKbpsRef.current = smoothThroughput(
+          smoothedBitrateKbpsRef.current,
+          levelBitrateKbps ?? fragmentBitrateKbps
+        )
+
+        setStreamStats({
+          bitrateKbps: smoothedBitrateKbpsRef.current,
+          linkSpeedKbps: smoothedSpeedKbpsRef.current,
           updatedAt: Date.now()
-        }))
+        })
       })
       hls.on(Hls.Events.ERROR, (_event, data) => {
         console.error('[VideoPlayer] HLS错误:', data.type, data.details, data.fatal)
@@ -783,6 +885,75 @@ export default function VideoPlayer() {
     }
   }, [isActualFullscreen])
 
+  /* ---------- 播放连续性 smoke（仅 IPTV_CONTINUITY_SMOKE=1 时运行）----------
+   * 目的：用可验证的方式证明「全屏 / 小窗只是换布局」——切换前后 currentTime 必须继续增长，
+   * 且 HLS 实例数不能增加（增加即说明播放器被重建、画面必然中断）。
+   */
+
+  const [continuityConfig, setContinuityConfig] = useState<{ enabled: boolean; settleMs: number; holdMs: number } | null>(null)
+
+  useEffect(() => {
+    void settingsApi
+      .get('__continuitySmoke')
+      .then((value) => {
+        const config = value as { enabled?: boolean; settleMs?: number; holdMs?: number } | null
+        if (config?.enabled) {
+          setContinuityConfig({ enabled: true, settleMs: config.settleMs ?? 6000, holdMs: config.holdMs ?? 5000 })
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!continuityConfig?.enabled || continuitySmokeRan) return
+    if (!hasPlaybackStartedRef.current || !videoRef.current) return
+    continuitySmokeRan = true
+
+    const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+    const sample = (label: string) => {
+      const video = videoRef.current
+      const counter = window as unknown as { __hlsInstanceCount?: number }
+      return {
+        label,
+        currentTime: video ? Number(video.currentTime.toFixed(2)) : -1,
+        paused: video ? video.paused : true,
+        hlsInstances: counter.__hlsInstanceCount ?? 0,
+        mini: useUiStore.getState().miniMode,
+        fullscreen: isActualFullscreenRef.current
+      }
+    }
+    const report = (samples: ReturnType<typeof sample>[]) => {
+      const advancing = samples.every((item, index) => index === 0 || item.currentTime > samples[index - 1].currentTime)
+      const stableInstances = new Set(samples.map((item) => item.hlsInstances)).size === 1
+      const payload = { advancing, stableInstances, samples }
+      void invoke('log:frontend', 'info', `[continuity] ${JSON.stringify(payload)}`).catch(() => {})
+      void settingsApi.set('__continuitySmokeResult', payload).catch(() => {})
+      console.log('[continuity] 结果:', JSON.stringify(payload))
+    }
+
+    const run = async () => {
+      await wait(continuityConfig.settleMs)
+      const samples = [sample('playing')]
+      const wasPlaying = videoRef.current ? !videoRef.current.paused : false
+      await handleToggleFullscreen()
+      await wait(continuityConfig.holdMs)
+      await ensurePlaying(wasPlaying)
+      samples.push(sample('fullscreen'))
+      await handleToggleFullscreen()
+      await wait(1000)
+      await handleEnterMiniMode()
+      await wait(continuityConfig.holdMs)
+      samples.push(sample('mini'))
+      await windowApi.exitMiniMode().catch(() => {})
+      useUiStore.getState().setMiniMode(false)
+      await ensurePlaying(true)
+      await wait(1500)
+      samples.push(sample('restored'))
+      report(samples)
+    }
+    void run()
+  }, [continuityConfig, handleEnterMiniMode, handleToggleFullscreen])
+
   const handleDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement
     if (target.closest('button,input,select,textarea')) return
@@ -863,19 +1034,34 @@ export default function VideoPlayer() {
   }, [isPlaying, volume, handleToggleFullscreen, setIsPlaying, setVolume])
 
   // 进度条拖动
+  // 下载当前播放的媒体（交给 Rust 侧调用 ffmpeg / N_m3u8DL-RE / yt-dlp）
+  const handleDownload = async () => {
+    if (!currentUrl || currentUrl === '__resolving__') return
+    const store = usePlayerStore.getState()
+    const vodName = store.currentVod?.vod_name || 'IPTV'
+    const episode = store.episodes[store.currentEpisodeIndex]?.name
+    const fileName = episode ? `${vodName} ${episode}` : vodName
+    try {
+      await downloadApi.start({
+        url: currentUrl,
+        headers: playHeader || undefined,
+        fileName
+      })
+      // 下载任务由 Rust 侧管理，进度在「下载」页看；这里给一个就地反馈
+      setDownloadNotice('已加入下载，可在「下载」页查看进度')
+      window.setTimeout(() => setDownloadNotice(''), 4000)
+    } catch (error) {
+      console.error('[VideoPlayer] 启动下载失败:', error)
+      setPlaybackPhase('failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const video = videoRef.current
     if (!video || !duration) return
     const rect = e.currentTarget.getBoundingClientRect()
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
     video.currentTime = ratio * duration
-  }
-
-  const formatTime = (s: number) => {
-    if (!s || isNaN(s)) return '00:00'
-    const m = Math.floor(s / 60)
-    const sec = Math.floor(s % 60)
-    return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`
   }
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0
@@ -947,24 +1133,33 @@ export default function VideoPlayer() {
   }
 
   const handleRetryPlayback = () => {
-    window.dispatchEvent(new CustomEvent('player:retry'))
+    usePlayerStore.getState().sendPlayerSignal({
+      type: 'retry',
+      scope: usePlayerStore.getState().currentSiteKey ? 'vod' : 'live'
+    })
   }
 
   const handleNextSource = () => {
-    window.dispatchEvent(new CustomEvent('player:nextSource'))
+    usePlayerStore.getState().sendPlayerSignal({
+      type: 'nextSource',
+      scope: usePlayerStore.getState().currentSiteKey ? 'vod' : 'live'
+    })
   }
 
   return (
     <div
       ref={containerRef}
       className={`bg-black group ${
-        miniTransitionStyle
-          ? ''
-          : isActualFullscreen
-          ? 'fixed inset-0 z-[9999] h-screen w-screen'
-          : 'relative h-full w-full'
+        miniPlayerMode
+          ? // 小窗：同一个播放器实例铺满小窗窗口，盖在 App 的黑色遮罩之上
+            'fixed inset-0 z-[9001] h-screen w-screen'
+          : miniTransitionStyle
+            ? ''
+            : isActualFullscreen
+              ? 'fixed inset-0 z-[9999] h-screen w-screen'
+              : 'relative h-full w-full'
       }`}
-      style={miniTransitionStyle || undefined}
+      style={miniPlayerMode ? undefined : miniTransitionStyle || undefined}
       onMouseMove={resetHideTimer}
       onMouseLeave={() => isPlaying && setShowControls(false)}
       onDoubleClick={handleDoubleClick}
@@ -973,11 +1168,11 @@ export default function VideoPlayer() {
 
       {currentUrl && (
         <div className="pointer-events-none absolute right-3 top-3 z-20 min-w-[132px] rounded-lg border border-white/10 bg-black/55 px-3 py-2 text-[11px] leading-4 text-white/80 shadow-lg backdrop-blur">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center justify-between gap-3" title="当前清晰度的声明码率（来自 HLS 清单；无声明时用分片平均码率）">
             <span className="text-white/45">码率</span>
             <span className="font-mono text-white">{bitrateText}</span>
           </div>
-          <div className="mt-0.5 flex items-center justify-between gap-3">
+          <div className="mt-0.5 flex items-center justify-between gap-3" title="最近分片的实测下载速度（指数平滑）；不是链路带宽估算">
             <span className="text-white/45">速度</span>
             <span className="font-mono text-white">{linkSpeedText}</span>
           </div>
@@ -1050,8 +1245,17 @@ export default function VideoPlayer() {
               <SkipForward className="w-4 h-4" />
             </button>
             <span className="text-xs text-white/70 ml-2">
-              {formatTime(currentTime)} / {formatTime(duration)}
+              {formatClock(currentTime)} / {formatClock(duration)}
             </span>
+            <button
+              onClick={() => void handleDownload()}
+              title="下载当前媒体（m3u8/HLS）"
+              className="ml-2 inline-flex items-center gap-1 rounded-md border border-white/20 px-2 py-0.5 text-[11px] text-white/80 transition-colors hover:border-accent hover:text-accent"
+            >
+              <Download className="w-3 h-3" />
+              下载
+            </button>
+            {downloadNotice && <span className="ml-2 text-[11px] text-accent">{downloadNotice}</span>}
           </div>
 
           <div className="flex items-center gap-3">

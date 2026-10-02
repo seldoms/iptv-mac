@@ -147,9 +147,21 @@ function LiveTree({ tree, onChannelClick, currentChannelName }: LiveTreeProps) {
                               >
                                 <Play className="w-3 h-3 shrink-0" />
                                 <span className="truncate flex-1">{channel.name}</span>
-                                {channel.latency > 0 && (
-                                  <span className="text-[10px] text-text-muted">
-                                    {channel.latency}ms
+                                {channel.latency !== undefined && channel.latency !== -2 && (
+                                  <span
+                                    className={`text-[10px] ${
+                                      channel.latency === -2
+                                        ? 'text-text-muted/70'
+                                        : channel.latency >= 0
+                                          ? 'text-text-muted'
+                                          : 'text-red-400/80'
+                                    }`}
+                                  >
+                                    {channel.latency === -2
+                                      ? '未验证'
+                                      : channel.latency >= 0
+                                        ? `${channel.latency}ms`
+                                        : '不可用'}
                                   </span>
                                 )}
                               </button>

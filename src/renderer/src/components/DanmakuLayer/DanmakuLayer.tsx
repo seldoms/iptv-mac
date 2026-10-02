@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react'
+import { usePlayerStore } from '@/stores/usePlayerStore'
 
 interface Danmaku {
   id: number
@@ -95,14 +96,16 @@ export default function DanmakuLayer({ opacity = 0.8, speed = 2, fontSize = 20 }
     }
   }, [opacity])
 
-  // 监听弹幕事件
+  // 弹幕请求来自 player store（原先监听 `danmaku:add` window 事件）
+  const danmakuRequest = usePlayerStore((state) => state.danmakuRequest)
+  const danmakuToken = danmakuRequest?.token ?? 0
+  const handledTokenRef = useRef(usePlayerStore.getState().danmakuRequest?.token ?? 0)
   useEffect(() => {
-    const handleDanmaku = (e: CustomEvent) => {
-      addDanmaku(e.detail.text, e.detail.color)
-    }
-    window.addEventListener('danmaku:add' as any, handleDanmaku)
-    return () => window.removeEventListener('danmaku:add' as any, handleDanmaku)
-  }, [addDanmaku])
+    if (danmakuToken === handledTokenRef.current) return
+    handledTokenRef.current = danmakuToken
+    if (!danmakuRequest) return
+    addDanmaku(danmakuRequest.text, danmakuRequest.color)
+  }, [danmakuToken, danmakuRequest, addDanmaku])
 
   return (
     <canvas
@@ -113,9 +116,4 @@ export default function DanmakuLayer({ opacity = 0.8, speed = 2, fontSize = 20 }
   )
 }
 
-/**
- * 发送弹幕的辅助函数
- */
-export function sendDanmaku(text: string, color = '#ffffff') {
-  window.dispatchEvent(new CustomEvent('danmaku:add', { detail: { text, color } }))
-}
+// 需要发送弹幕请调用 usePlayerStore.getState().sendDanmaku(text, color)

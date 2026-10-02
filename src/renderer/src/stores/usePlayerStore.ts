@@ -51,6 +51,21 @@ export interface PlaybackDiagnostic {
   nextAction?: string
 }
 
+/** 播放器 → 页面 的信号类型（原先是 window 自定义事件） */
+export type PlayerSignalType = 'playFailed' | 'retry' | 'nextSource' | 'flushHistory'
+
+export interface PlayerSignal {
+  /** 自增序号：消费者据此判断「来了新信号」 */
+  token: number
+  type: PlayerSignalType
+  /** vod=点播页处理，live=直播页处理 */
+  scope: 'vod' | 'live'
+  siteKey?: string
+  vodId?: string
+  reason?: string
+  autoSwitch?: boolean
+}
+
 interface PlayerState {
   isPlaying: boolean
   currentUrl: string
@@ -87,6 +102,14 @@ interface PlayerState {
   sourceSwitchMessage: string
   /** 是否启用自动换源 */
   autoSwitchSource: boolean
+
+  /** 最近的播放器信号（替代 player:retry / player:nextSource / *:playFailed / player:flushHistory 事件） */
+  playerSignal: PlayerSignal | null
+
+  /** 弹幕推送请求（替代 `danmaku:add` window 事件） */
+  danmakuRequest: { token: number; text: string; color: string } | null
+  /** 字幕加载请求（替代 `subtitle:load` window 事件） */
+  subtitleRequest: { token: number; url: string; label: string; language: string } | null
 }
 
 interface PlayerActions {
@@ -127,6 +150,14 @@ interface PlayerActions {
   setSourceSwitchState: (state: 'idle' | 'searching' | 'switching', message?: string) => void
   /** 设置是否启用自动换源 */
   setAutoSwitchSource: (enabled: boolean) => void
+  /** 播放器发信号给页面（显式状态，替代 window 事件） */
+  sendPlayerSignal: (signal: Omit<PlayerSignal, 'token'>) => void
+  /** 页面消费完信号后清空 */
+  clearPlayerSignal: () => void
+  /** 推一条弹幕给弹幕层 */
+  sendDanmaku: (text: string, color?: string) => void
+  /** 让字幕层加载一条字幕 */
+  loadSubtitle: (url: string, label: string, language?: string) => void
   /** 从备选队列取下一个源（弹出第一个） */
   popNextAlternativeSource: () => AlternativeSource | null
   /** 手动切换到指定备选源 */
@@ -165,7 +196,10 @@ const initialState: PlayerState = {
   brokenSources: [],
   sourceSwitchState: 'idle',
   sourceSwitchMessage: '',
-  autoSwitchSource: true
+  autoSwitchSource: true,
+  playerSignal: null,
+  danmakuRequest: null,
+  subtitleRequest: null
 }
 
 function makeSourceKey(siteKey: string, vodId: string): string {
@@ -369,6 +403,21 @@ export const usePlayerStore = create<PlayerState & PlayerActions>()((set, get) =
   }),
 
   setAutoSwitchSource: (enabled) => set({ autoSwitchSource: enabled }),
+
+  sendPlayerSignal: (signal) =>
+    set((state) => ({ playerSignal: { ...signal, token: (state.playerSignal?.token ?? 0) + 1 } })),
+
+  clearPlayerSignal: () => set({ playerSignal: null }),
+
+  sendDanmaku: (text, color = '#ffffff') =>
+    set((state) => ({
+      danmakuRequest: { token: (state.danmakuRequest?.token ?? 0) + 1, text, color }
+    })),
+
+  loadSubtitle: (url, label, language = 'zh') =>
+    set((state) => ({
+      subtitleRequest: { token: (state.subtitleRequest?.token ?? 0) + 1, url, label, language }
+    })),
 
   popNextAlternativeSource: () => {
     const { alternativeSources, brokenSources } = get()

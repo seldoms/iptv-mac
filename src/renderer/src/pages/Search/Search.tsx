@@ -5,6 +5,7 @@ import { useConfigStore, Vod } from '@/stores/useConfigStore'
 import { siteApi, cacheApi } from '@/utils/ipc'
 import VodCard from '@/components/VodCard/VodCard'
 import EmptyState from '@/components/EmptyState/EmptyState'
+import { isSupportedContentSite } from '@/siteSupport'
 
 interface SearchResult {
   siteKey: string
@@ -55,7 +56,7 @@ export default function Search() {
       saveSearchHistory(kw)
 
       // 初始化所有站点的搜索结果
-      const searchSites = sites.filter((s) => s.searchable !== 0)
+      const searchSites = sites.filter((s) => s.searchable !== 0 && isSupportedContentSite(s))
       const initResults: SearchResult[] = searchSites.map((s) => ({
         siteKey: s.key,
         siteName: s.name,
@@ -69,6 +70,7 @@ export default function Search() {
       const promises = searchSites.map(async (site, idx) => {
         try {
           const res = await siteApi.searchContent(site.key, kw, true) as { success: boolean; data?: any; error?: string }
+          if (!res.success) throw new Error(res.error || '搜索失败')
           const list = (res.data?.list || []) as Vod[]
           setResults((prev) =>
             prev.map((r, i) =>
@@ -78,7 +80,7 @@ export default function Search() {
         } catch (e: any) {
           setResults((prev) =>
             prev.map((r, i) =>
-              i === idx ? { ...r, loading: false, error: e.message } : r
+              i === idx ? { ...r, loading: false, error: typeof e === 'string' ? e : e.message || '搜索失败' } : r
             )
           )
         }
@@ -94,7 +96,7 @@ export default function Search() {
     if (e.key === 'Enter') doSearch(keyword)
   }
 
-  const searchableSites = sites.filter((s) => s.searchable !== 0)
+  const searchableSites = sites.filter((s) => s.searchable !== 0 && isSupportedContentSite(s))
 
   if (!currentConfig) {
     return (
@@ -214,7 +216,7 @@ export default function Search() {
                           key={`${v._siteKey}:${v.vod_id}`}
                           vod={v}
                           sourceName={v._siteName}
-                          onClick={(vod) => navigate(`/vod/${v._siteKey}/${vod.vod_id}`)}
+                          onClick={(vod) => navigate(`/vod/${encodeURIComponent(v._siteKey)}/${encodeURIComponent(vod.vod_id)}`)}
                         />
                       ))}
                     </div>

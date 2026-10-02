@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useRef, useState, useEffect  } from 'react'
+import { usePlayerStore } from '@/stores/usePlayerStore'
 
 // 字幕解析缓存 keyed by URL，避免相同 URL 重复解析 SRT
 const subtitleCache = new Map<string, SubtitleCue[]>()
@@ -78,15 +79,16 @@ export default function SubtitleLayer({ currentTime = 0 }: SubtitleLayerProps) {
     setCurrentCue(cue || null)
   }, [currentTime, tracks, activeTrackIndex])
 
-  // 暴露加载方法
+  // 字幕加载请求来自 player store（原先监听 `subtitle:load` window 事件）
+  const subtitleRequest = usePlayerStore((state) => state.subtitleRequest)
+  const subtitleToken = subtitleRequest?.token ?? 0
+  const handledTokenRef = useRef(usePlayerStore.getState().subtitleRequest?.token ?? 0)
   useEffect(() => {
-    const handler = (e: CustomEvent) => {
-      const { url, label, language } = e.detail
-      loadSubtitle(url, label, language)
-    }
-    window.addEventListener('subtitle:load' as any, handler)
-    return () => window.removeEventListener('subtitle:load' as any, handler)
-  }, [])
+    if (subtitleToken === handledTokenRef.current) return
+    handledTokenRef.current = subtitleToken
+    if (!subtitleRequest) return
+    loadSubtitle(subtitleRequest.url, subtitleRequest.label, subtitleRequest.language)
+  }, [subtitleToken, subtitleRequest])
 
   if (!currentCue) return null
 
@@ -104,9 +106,4 @@ export default function SubtitleLayer({ currentTime = 0 }: SubtitleLayerProps) {
   )
 }
 
-/**
- * 加载字幕的辅助函数
- */
-export function loadSubtitleTrack(url: string, label: string, language = 'zh') {
-  window.dispatchEvent(new CustomEvent('subtitle:load', { detail: { url, label, language } }))
-}
+// 需要加载字幕请调用 usePlayerStore.getState().loadSubtitle(url, label, language)

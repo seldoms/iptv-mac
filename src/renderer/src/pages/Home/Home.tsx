@@ -1,23 +1,19 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, ChevronDown, Loader2, ArrowLeft, Clock } from 'lucide-react'
+import { Search, Loader2, ArrowLeft } from 'lucide-react'
 import { useConfigStore } from '@/stores/useConfigStore'
-import { configApi, historyApi } from '@/utils/ipc'
-import VodCard from '@/components/VodCard/VodCard'
-import EmptyState from '@/components/EmptyState/EmptyState'
+import { isSupportedContentSite } from '@/siteSupport'
+import { historyApi } from '@/utils/ipc'
+import ProgressLayout from '@/components/ProgressLayout/ProgressLayout'
+import CategoryTabs from '@/components/CategoryTabs/CategoryTabs'
+import FilterPanel from '@/components/FilterPanel/FilterPanel'
+import HistoryCarousel from '@/components/HistoryCarousel/HistoryCarousel'
+import VideoGrid from '@/components/VideoGrid/VideoGrid'
+import ErrorBanner from '@/components/ErrorBanner/ErrorBanner'
+import SiteDialog from '@/components/SiteDialog/SiteDialog'
+import { useKeyboardNav, useRefreshCooldown } from '@/hooks/useKeyboardNav'
 import type { History as HistoryItem } from '@shared/types'
-
-// ==================== 内置推荐源 ====================
-const DEFAULT_SOURCES: { name: string; url: string; desc: string }[] = [
-  { name: '多多影音', url: 'https://gitlab.com/duomv/dzhipy/-/raw/main/index.json', desc: '435 个点播站点 + 直播' },
-  { name: '心魔在线', url: 'https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json', desc: '151 个点播站点' },
-  { name: '高天流云', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/gaotianliuyun/gao/master/js.json', desc: '298 个点播站点 + 直播' },
-  { name: '宝盒备用', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/guot55/yg/main/pg/bh.json', desc: '77 个点播站点 + 直播' },
-  { name: 'D佬线路', url: 'http://rihou.cc:555/nzk/nzk0722.json', desc: '37 个点播站点 + 20 直播源' },
-  { name: '小盒子单仓', url: 'http://xhztv.top/xhz', desc: '54 个点播站点 + 直播' },
-  { name: '香雅晴线', url: 'https://gh-proxy.com/https://raw.githubusercontent.com/xyq254245/xyqonlinerule/main/XYQTVBox.json', desc: '48 个点播站点 + 直播' },
-  { name: '多多内置', url: 'https://iduo.us.ci/gt/leevi0709/one/main/config.bin', desc: '91 个点播站点 + 10 直播源' },
-]
+import { DEFAULT_SOURCES } from '@/defaultSources'
 
 function formatResumeTime(seconds = 0): string {
   const safeSeconds = Math.max(0, Math.floor(seconds))
@@ -31,40 +27,92 @@ function formatResumeTime(seconds = 0): string {
 export default function Home() {
   const navigate = useNavigate()
   const {
-    currentConfig, sites, currentSiteKey, contentSiteKey, pendingSiteKey, categories, filters, homeVideos,
-    categoryVideos, currentPage, hasMore, isLoading, error,
-    switchSite, fetchCategoryContent, loadConfig
+    currentConfig, sites, siteSpeeds, isStartupReady, currentSiteKey, contentSiteKey, pendingSiteKey, categories, filters, homeVideos,
+    categoryVideos, currentPage, hasMore, isLoading, error, liveConfig,
+    switchSite, fetchCategoryContent, fetchHomeContent, loadConfig
   } = useConfigStore()
 
-      const [activeCategory, setActiveCategory] = useState<string>('')
-      const [selectedFilters, setSelectedFilters] = useState<Record<string, string>>({})
-      const [showFilterPanel, setShowFilterPanel] = useState(false)
-      const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const [showSiteSheet, setShowSiteSheet] = useState(false)
-  const siteSheetBtnRef = useRef<HTMLButtonElement>(null)
-  const siteSheetRef = useRef<HTMLDivElement>(null)
-  const [siteSheetRect, setSiteSheetRect] = useState({ top: 0, left: 0 })
+  // Site Dialog state
+  const [showSiteDialog, setShowSiteDialog] = useState(false)
+
+  // Category / filter state（放 store：从播放页返回时保持原来选中的标签）
+  const activeCategory = useConfigStore((state) => state.activeCategory)
+  const setActiveCategory = useConfigStore((state) => state.setActiveCategory)
+  const selectedFilters = useConfigStore((state) => state.selectedFilters)
+  const setSelectedFilters = useConfigStore((state) => state.setSelectedFilters)
+  const [showFilterPanel, setShowFilterPanel] = useState(false)
+
+  // Scroll state
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const [scrolled, setScrolled] = useState(false)
+
+  // History state
   const [continueItems, setContinueItems] = useState<HistoryItem[]>([])
 
-  // 只显示可直接请求的 HTTP API 类型站点（type 0/1/4）
-  const visibleSites = sites.filter((s) =>
-    (s.type === 0 || s.type === 1 || s.type === 4) &&
-    s.hide !== 1 &&
-    Boolean(s.api?.trim())
+  // Loading state (for default source click)
+  const [loadingSourceUrl, setLoadingSourceUrl] = useState('')
+
+  // Refresh cooldown (FongMi pattern: 3s cooldown)
+  const handleRefresh = useCallback(() => {
+    fetchHomeContent()
+    loadHistory()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSiteKey])
+  const refreshWithCooldown = useRefreshCooldown(handleRefresh)
+
+  const visibleSites = useMemo(() => sites.filter(isSupportedContentSite), [sites])
+
+  // 所有非隐藏站点
+  const allSites = useMemo(() => sites.filter((s) => s.hide !== 1), [sites])
+
+  // 首页站点 tab 保持配置顺序，避免后台测速更新时按钮位置跳动。
+  // 健康状态仍通过右侧延迟标识展示，详细筛选交给站点弹窗处理。
+  const tabSites = useMemo(
+    () => (visibleSites.length > 0 ? visibleSites : allSites),
+    [visibleSites, allSites]
   )
 
-  // 获取当前分类的可用筛选器
+  // Active category filters
   const activeFilters = (filters && activeCategory && filters[activeCategory]) || []
 
-      useEffect(() => {
-        setActiveCategory('')
-        setSelectedFilters({})
-        setShowFilterPanel(false)
-        setShowSiteSheet(false)
-        scrollContainerRef.current?.scrollTo({ top: 0 })
-      }, [currentSiteKey, sites])
+  // Has live sources for func button
+  const hasLiveSources = Boolean(liveConfig?.lives?.length)
 
+  // Display videos
+  const displayVideos = activeCategory && activeCategory !== '首页'
+    ? categoryVideos
+    : homeVideos
+
+  // Page state for ProgressLayout
+  const pageState = !currentConfig
+    ? 'empty' as const
+    : (isLoading && displayVideos.length === 0 && !contentSiteKey)
+      ? 'loading' as const
+      : 'content' as const
+
+  // ── Effects ──
+
+  // 站点切换：收起筛选面板 + 列表回顶。
+  // 分类标签/筛选**不在这里清空**——由 store 按站点记忆恢复（useConfigStore 的订阅）。
+  // 原来依赖 [currentSiteKey, sites]，而后台测速会不断替换 sites 数组，
+  // 于是用户刚选好的标签会被反复冲掉。
+  const prevSiteKeyRef = useRef(currentSiteKey)
   useEffect(() => {
+    if (prevSiteKeyRef.current === currentSiteKey) return
+    prevSiteKeyRef.current = currentSiteKey
+    setShowFilterPanel(false)
+    scrollContainerRef.current?.scrollTo({ top: 0 })
+  }, [currentSiteKey])
+
+  // 当站点无首页推荐视频（homeVideos 为空）但有分类时，自动选中并加载第一个分类的内容
+  useEffect(() => {
+    if (!activeCategory && homeVideos.length === 0 && categories.length > 0) {
+      setActiveCategory(categories[0].type_id)
+    }
+  }, [activeCategory, homeVideos.length, categories])
+
+  // Load history
+  const loadHistory = useCallback(() => {
     if (!currentConfig) {
       setContinueItems([])
       return
@@ -81,339 +129,356 @@ export default function Home() {
       .catch(() => setContinueItems([]))
   }, [currentConfig])
 
-  // 分类切换
+  useEffect(() => {
+    loadHistory()
+  }, [loadHistory])
+
+  // Category content fetching
   useEffect(() => {
     if (activeCategory && activeCategory !== '首页') {
       fetchCategoryContent(activeCategory, 1, selectedFilters)
     }
-  }, [activeCategory, selectedFilters])
+  }, [activeCategory, selectedFilters, fetchCategoryContent])
 
-      const handleSiteSwitch = (key: string) => {
-        setActiveCategory('')
-        setSelectedFilters({})
-        setShowFilterPanel(false)
-        switchSite(key)
-        setShowSiteSheet(false)
-      }
+  // Scroll detection for toolbar
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const handler = () => {
+      setScrolled(el.scrollTop > 10)
+    }
+    el.addEventListener('scroll', handler)
+    return () => el.removeEventListener('scroll', handler)
+  }, [])
 
-      const handleSiteSheetClick = (key: string) => {
-        if (key === currentSiteKey) {
-          const btn = siteSheetBtnRef.current
-          if (btn) {
-            const rect = btn.getBoundingClientRect()
-            setSiteSheetRect({ top: rect.bottom + 4, left: rect.left })
-          }
-          setShowSiteSheet(prev => !prev)
-        } else {
-          handleSiteSwitch(key)
-        }
-      }
+  // ── Handlers ──
 
-      const handleCategoryClick = (tid: string) => {
-        if (tid === activeCategory) return
-        setActiveCategory(tid)
-        setSelectedFilters({})
-        setShowFilterPanel(false)
-        setShowSiteSheet(false)
-      }
-
-      const handleFilterChange = (key: string, value: string) => {
-        setSelectedFilters((prev) => ({ ...prev, [key]: value }))
-      }
-
-  const handleVodClick = (vod: any) => {
-    navigate(`/vod/${contentSiteKey || currentSiteKey}/${vod.vod_id}`)
+  const handleSiteSwitch = (key: string) => {
+    setActiveCategory('')
+    setSelectedFilters({})
+    setShowFilterPanel(false)
+    switchSite(key)
+    setShowSiteDialog(false)
   }
 
-      // 无限滚动
-      const handleScroll = useCallback(() => {
+  const handleCategoryClick = (tid: string) => {
+    if (tid === activeCategory) return
+    setActiveCategory(tid)
+    setSelectedFilters({})
+    setShowFilterPanel(false)
+    setShowSiteDialog(false)
+  }
+
+  const handleFilterChange = (key: string, value: string) => {
+    setSelectedFilters((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const handleDefaultSourceClick = async (url: string) => {
+    if (loadingSourceUrl) return
+    setShowSiteDialog(false)
+    setLoadingSourceUrl(url)
+    try {
+      await loadConfig(url)
+    } finally {
+      setLoadingSourceUrl('')
+    }
+  }
+
+  const handleVodClick = (vod: any) => {
+    navigate(`/vod/${encodeURIComponent(contentSiteKey || currentSiteKey)}/${encodeURIComponent(vod.vod_id)}`)
+  }
+
+  // Infinite scroll
+  const handleScroll = useCallback(() => {
     const el = scrollContainerRef.current
     if (!el || isLoading || !hasMore || !activeCategory || activeCategory === '首页') return
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
       fetchCategoryContent(activeCategory, currentPage + 1, selectedFilters)
     }
-  }, [isLoading, hasMore, activeCategory, currentPage, selectedFilters])
+  }, [isLoading, hasMore, activeCategory, currentPage, selectedFilters, fetchCategoryContent])
 
-  const displayVideos = activeCategory && activeCategory !== '首页'
-  ? (categoryVideos.length > 0 ? categoryVideos : homeVideos)
-  : homeVideos
+  // Keyboard navigation: LEFT/RIGHT to cycle sites (when title focused)
+  const handleSiteCycle = (direction: 'prev' | 'next') => {
+    const sites = tabSites
+    if (sites.length <= 1) return
+    const currentIdx = sites.findIndex((s) => s.key === currentSiteKey)
+    if (currentIdx === -1) return
+    const nextIdx = direction === 'next'
+      ? (currentIdx + 1) % sites.length
+      : (currentIdx - 1 + sites.length) % sites.length
+    handleSiteSwitch(sites[nextIdx].key)
+  }
 
+  useKeyboardNav({
+    onEscape: () => setShowSiteDialog(false),
+    onRefresh: () => refreshWithCooldown(),
+    enabled: Boolean(currentConfig)
+  })
+
+  // ── History handlers ──
+  const handleHistoryClick = (item: HistoryItem) => {
+    navigate(`/vod/${encodeURIComponent(item.siteKey)}/${encodeURIComponent(item.vodId)}`)
+  }
+
+  // ── Clear all history ──
+  const handleClearHistory = () => {
+    setContinueItems([])
+  }
+
+  // ── STARTUP LOADING (解决冷启动时闪烁源选择卡片的问题) ──
+  // 仅在未就绪、无配置且尚无明确错误时展示启动加载动画；如果有错误则展示空配置态下的错误提示
+  if (!isStartupReady && !currentConfig && !error) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center p-8 text-center">
+        <Loader2 className="w-8 h-8 animate-spin text-accent mb-3" />
+        <p className="text-sm text-text-muted">正在载入订阅配置...</p>
+      </div>
+    )
+  }
+
+  // ── NO CONFIG ──
   if (!currentConfig) {
     return (
-      <EmptyState
-        icon={Search}
-        title="还没有配置源"
-        description="先导入一个 TVBox/CatVod 兼容配置，导入成功后这里会显示可浏览的内容。"
-        primaryLabel="去导入配置"
-        onPrimaryClick={() => navigate('/onboarding')}
-      />
+      <div className="h-full overflow-y-auto scrollbar-dark px-8 py-10">
+        <div className="mx-auto flex min-h-full max-w-4xl flex-col justify-center">
+          <div className="mb-8 flex flex-col items-center text-center">
+            <Search className="mb-4 h-12 w-12 text-text-muted" />
+            <h2 className="mb-2 text-lg font-semibold text-text-primary">还没有配置源</h2>
+            <p className="max-w-md text-sm leading-6 text-text-muted">
+              先选一个推荐资源，加载成功后首页会直接显示可浏览内容。
+            </p>
+            {error && !isLoading && (
+              <div
+                role="alert"
+                className="mt-4 max-w-md rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm leading-6 text-red-400"
+              >
+                {error}
+              </div>
+            )}
+            <button
+              onClick={() => navigate('/onboarding')}
+              className="mt-5 rounded-lg bg-accent px-4 py-2 font-medium text-bg-primary transition-colors hover:bg-accent-hover"
+            >
+              手动导入配置
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 nav:grid-cols-6">
+            {DEFAULT_SOURCES.map((source) => {
+              const loadingSource = loadingSourceUrl === source.url
+              return (
+                <button
+                  key={source.url}
+                  onClick={() => handleDefaultSourceClick(source.url)}
+                  disabled={Boolean(loadingSourceUrl)}
+                  className="rounded-lg border border-[#2a2a2a] bg-bg-secondary p-3 text-left transition-all hover:border-accent/40 hover:bg-bg-hover disabled:opacity-60"
+                >
+                  <p className="truncate text-sm font-medium text-text-primary">{source.name}</p>
+                  <p className="mt-1 text-[11px] leading-relaxed text-text-muted">{source.desc}</p>
+                  {loadingSource && (
+                    <span className="mt-2 inline-flex items-center gap-1.5 text-xs text-accent">
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      加载中...
+                    </span>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      </div>
     )
   }
 
-  // 没有可见站点（type=0/1/4 都不可用）
+  // ── NO VISIBLE SITES ──
   if (visibleSites.length === 0) {
     return (
-      <EmptyState
-        icon={Search}
-        title="未找到可用站点"
-        description="当前配置源中没有可用于点播浏览的站点。可以切换配置源，或检查配置内容和网络连接。"
-        primaryLabel="切换配置"
-        onPrimaryClick={() => navigate('/settings')}
-        secondaryLabel="重新加载"
-        onSecondaryClick={() => window.location.reload()}
-      />
+      <div className="h-full flex flex-col items-center justify-center p-8 text-center">
+        <Search className="w-12 h-12 text-text-muted mb-4" />
+        <h2 className="text-lg font-semibold text-text-primary mb-2">未找到可用站点</h2>
+        <p className="text-sm text-text-muted mb-6 max-w-md leading-6">
+          {error || '当前订阅没有兼容的点播站点，请切换订阅。'}
+        </p>
+        <div className="flex gap-3">
+          <button
+            onClick={() => navigate('/settings')}
+            className="px-4 py-2 bg-accent text-bg-primary rounded-lg font-medium hover:bg-accent-hover transition-colors"
+          >
+            切换配置
+          </button>
+          <button
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 border border-[#2a2a2a] text-text-secondary rounded-lg hover:bg-bg-hover transition-colors"
+          >
+            重新加载
+          </button>
+          {hasLiveSources && <button onClick={() => navigate('/live')} className="px-4 py-2 border border-[#2a2a2a] rounded-lg">查看直播</button>}
+        </div>
+      </div>
     )
   }
 
+  // ── NORMAL HOME LAYOUT ──
+  // Reference: FongMi TV HomeActivity.java layout
   return (
     <div className="h-full flex flex-col">
-      {/* 顶部栏 */}
-      <div className="shrink-0 border-b border-[#2a2a2a]">
-        {/* 站点标签 */}
-        <div className="flex items-center px-4 pt-3 gap-1 scrollbar-hidden overflow-x-auto">
+      {/* ===== Toolbar (FongMi: 半透明黑底, 24dp padding) ===== */}
+      <header
+        className={`shrink-0 transition-all duration-200 ${
+          scrolled
+            ? 'opacity-0 pointer-events-none h-0 overflow-hidden py-0'
+            : 'opacity-100 py-1'
+        }`}
+      >
+        <div className="flex items-center px-6 py-2">
+          {/* Back button */}
           <button
             onClick={() => navigate(-1)}
-            className="shrink-0 p-1.5 text-text-muted hover:text-accent transition-colors mr-1"
+            className="shrink-0 p-1.5 text-white/50 hover:text-accent transition-colors mr-1"
             title="返回"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
-          {visibleSites.map((site) => (
+
+          {/* Site title — FongMi: 白24sp, 可点击, ←→切换 */}
+          <h1
+            className="flex-1 text-xl text-white font-medium cursor-pointer hover:text-accent transition-colors truncate"
+            onClick={() => setShowSiteDialog(true)}
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowLeft') { e.preventDefault(); handleSiteCycle('prev') }
+              if (e.key === 'ArrowRight') { e.preventDefault(); handleSiteCycle('next') }
+              if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setShowSiteDialog(true) }
+            }}
+            title="点击切换站点（← → 方向键切换）"
+          >
+            {allSites.find((s) => s.key === currentSiteKey)?.name || '站点'}
+          </h1>
+
+          {/* Clock — FongMi: 白24sp */}
+          <span className="text-base text-white/70 shrink-0 ml-3 font-mono">
+            {new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        </div>
+      </header>
+
+      {/* ===== Site Tab Bar — 可见站点切换入口 ===== */}
+      <div className="shrink-0 flex items-center gap-1.5 px-6 pb-2 overflow-x-auto scrollbar-hidden">
+        {tabSites.map((site) => {
+          const speed = siteSpeeds?.[site.key]
+          return (
             <button
               key={site.key}
               onClick={() => handleSiteSwitch(site.key)}
-              className={`shrink-0 px-3 py-1.5 text-sm rounded-full transition-colors ${
+              className={`shrink-0 flex items-center gap-1.5 px-3 py-1 text-xs rounded-full transition-all duration-200 ${
                 currentSiteKey === site.key
-                  ? 'bg-accent text-bg-primary font-medium'
-                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-hover'
+                  ? 'text-yellow-400 bg-white/10 font-medium shadow-sm'
+                  : 'text-white/60 hover:text-white/80 hover:bg-white/[0.06]'
               }`}
             >
-              {site.name}
-            </button>
-          ))}
-          <div className="flex-1" />
-          <button
-            onClick={() => navigate('/search')}
-            className="shrink-0 p-2 text-text-muted hover:text-accent transition-colors"
-          >
-            <Search className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* 分类标签 */}
-        {categories.length > 0 && (
-          <div className="flex items-center px-4 py-2 gap-1 scrollbar-hidden overflow-x-auto">
-            <div className="relative shrink-0">
-              <button
-                ref={siteSheetBtnRef}
-                onClick={() => { setActiveCategory(''); setShowFilterPanel(false); handleSiteSheetClick(currentSiteKey) }}
-                className={`shrink-0 px-3 py-1 text-xs rounded-md transition-colors ${
-                  !activeCategory
-                    ? 'bg-accent/20 text-accent'
-                    : 'text-text-muted hover:text-text-secondary'
-                }`}
-              >
-                首页
-              </button>
-            </div>
-            {categories.map((cat) => (
-              <button
-                key={cat.type_id}
-                onClick={() => handleCategoryClick(cat.type_id)}
-                className={`shrink-0 px-3 py-1 text-xs rounded-md transition-colors ${
-                  activeCategory === cat.type_id
-                    ? 'bg-accent/20 text-accent'
-                    : 'text-text-muted hover:text-text-secondary'
-                }`}
-              >
-                {cat.type_name}
-              </button>
-            ))}
-            {/* 筛选按钮 */}
-            {activeFilters.length > 0 && activeCategory && (
-              <button
-                onClick={() => setShowFilterPanel(!showFilterPanel)}
-                className={`shrink-0 flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors ${
-                  showFilterPanel ? 'text-accent' : 'text-text-muted hover:text-text-secondary'
-                }`}
-              >
-                筛选 <ChevronDown className={`w-3 h-3 transition-transform ${showFilterPanel ? 'rotate-180' : ''}`} />
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* 筛选面板 */}
-        {showFilterPanel && activeFilters.length > 0 && (
-          <div className="px-4 py-2 border-t border-[#2a2a2a] space-y-2">
-            {activeFilters.map((filter) => (
-              <div key={filter.key} className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs text-text-muted shrink-0 w-12">{filter.name}:</span>
-                {filter.value.map((v) => (
-                  <button
-                    key={v.v}
-                    onClick={() => handleFilterChange(filter.key, v.v)}
-                    className={`px-2 py-0.5 text-xs rounded transition-colors ${
-                      selectedFilters[filter.key] === v.v
-                        ? 'bg-accent/20 text-accent'
-                        : 'text-text-muted hover:text-text-secondary'
-                    }`}
-                  >
-                    {v.n}
-                  </button>
-                ))}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* 错误提示 */}
-      {pendingSiteKey && (
-        <div className="shrink-0 flex items-center justify-center gap-2 px-4 py-2 bg-bg-secondary text-xs text-text-muted">
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
-          正在切换到 {visibleSites.find((site) => site.key === pendingSiteKey)?.name || '新站点'}，当前内容可继续浏览
-        </div>
-      )}
-
-      {error && !isLoading && (
-        <div className="shrink-0 px-4 py-2 bg-red-500/10 text-red-400 text-xs text-center">
-          {error}
-        </div>
-      )}
-
-      {/* 视频网格 */}
-      <div
-        ref={scrollContainerRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto scrollbar-dark p-4"
-      >
-        {!activeCategory && continueItems.length > 0 && (
-          <section className="mb-5">
-            <div className="mb-3 flex items-center gap-2">
-              <Clock className="h-4 w-4 text-accent" />
-              <h2 className="text-sm font-medium text-text-primary">继续观看</h2>
-            </div>
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
-              {continueItems.map((item) => (
-                <button
-                  key={`${item.siteKey}:${item.vodId}`}
-                  onClick={() => navigate(`/vod/${item.siteKey}/${item.vodId}`)}
-                  className="flex min-w-0 items-center gap-3 rounded-lg bg-bg-secondary p-2 text-left transition-colors hover:bg-bg-hover"
-                >
-                  <div className="h-16 w-11 shrink-0 overflow-hidden rounded bg-bg-tertiary">
-                    <img
-                      src={item.vodPic}
-                      alt={item.vodName}
-                      className="h-full w-full object-cover"
-                      onError={(event) => { (event.target as HTMLImageElement).style.display = 'none' }}
-                    />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-text-primary">{item.vodName}</p>
-                    <p className="mt-1 truncate text-xs text-text-muted">{item.episodeName || item.source || '上次观看'}</p>
-                    <div className="mt-2 flex items-center gap-2">
-                      <div className="h-1 flex-1 overflow-hidden rounded-full bg-bg-tertiary">
-                        <div
-                          className="h-full rounded-full bg-accent"
-                          style={{ width: `${Math.max(0, Math.min(100, item.progress || 0))}%` }}
-                        />
-                      </div>
-                      <span className="shrink-0 text-[10px] text-text-muted">
-                        {(item.positionSeconds || 0) > 0 ? formatResumeTime(item.positionSeconds) : `${item.progress || 0}%`}
-                      </span>
-                    </div>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {isLoading && displayVideos.length === 0 && !contentSiteKey ? (
-          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
-            {Array.from({ length: 12 }).map((_, i) => (
-              <VodCard key={i} vod={{ vod_id: '', vod_name: '', vod_pic: '', vod_remarks: '' }} onClick={() => {}} loading />
-            ))}
-          </div>
-        ) : displayVideos.length > 0 ? (
-          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4">
-            {displayVideos.map((vod) => (
-              <VodCard key={vod.vod_id} vod={vod} onClick={handleVodClick} />
-            ))}
-          </div>
-        ) : (
-          <div className="flex items-center justify-center h-64 text-text-muted text-sm">
-            {isLoading ? '加载中...' : '暂无内容，请尝试切换站点或配置源'}
-          </div>
-        )}
-
-        {/* 加载更多 */}
-        {isLoading && displayVideos.length > 0 && (
-          <div className="flex justify-center py-4">
-            <Loader2 className="w-5 h-5 text-accent animate-spin" />
-          </div>
-        )}
-      </div>
-
-      {/* 悬浮源选择卡片 */}
-      {showSiteSheet && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setShowSiteSheet(false)} />
-          <div
-            ref={siteSheetRef}
-            className="fixed z-50 w-[480px] max-h-[460px] overflow-y-auto rounded-xl border border-[#2a2a2a] bg-bg-secondary shadow-2xl p-4"
-            style={{ top: siteSheetRect.top, left: Math.max(16, siteSheetRect.left) }}
-          >
-            <p className="text-xs text-text-muted mb-3 font-medium">当前站点（点击切换）</p>
-            <div className="grid grid-cols-2 gap-2 mb-4">
-              {visibleSites.map((site) => (
-                <button
-                  key={site.key}
-                  onClick={() => handleSiteSwitch(site.key)}
-                  className={`text-left px-3 py-2 text-sm rounded-lg transition-colors ${
-                    currentSiteKey === site.key
-                      ? 'bg-accent/20 text-accent font-medium ring-1 ring-accent/40'
-                      : 'bg-bg-tertiary text-text-secondary hover:text-text-primary hover:bg-bg-hover'
+              <span>{site.name}</span>
+              {speed && speed.ok && speed.latency > 0 && (
+                <span
+                  className={`text-[9px] font-mono px-1 py-0.2 rounded leading-tight ${
+                    speed.latency < 500
+                      ? 'text-emerald-400 bg-emerald-500/15'
+                      : speed.latency < 1500
+                        ? 'text-amber-400 bg-amber-500/15'
+                        : 'text-orange-400 bg-orange-500/15'
                   }`}
                 >
-                  {site.name}
-                  {currentSiteKey === site.key && (
-                    <span className="ml-1.5 text-[10px] text-accent/70">当前</span>
-                  )}
-                </button>
-              ))}
+                  {speed.latency}ms
+                </span>
+              )}
+            </button>
+          )
+        })}
+        <div className="flex-1" />
+        <button
+          onClick={() => navigate('/search')}
+          className="shrink-0 p-1.5 text-white/50 hover:text-accent transition-colors"
+          title="搜索"
+        >
+          <Search className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* ===== Content area with ProgressLayout ===== */}
+      {/* FongMi: ProgressLayout wrapping VerticalGridView */}
+      <ProgressLayout
+        state={pageState}
+        loadingMessage="正在加载首页内容..."
+        emptyTitle="暂无内容"
+        emptyDescription=""
+      >
+        <div
+          ref={scrollContainerRef}
+          onScroll={(e) => {
+            handleScroll()
+            setScrolled(e.currentTarget.scrollTop > 10)
+          }}
+          className="flex-1 overflow-y-auto scrollbar-dark px-6 pb-8"
+        >
+          {/* Row 1 功能按钮整排已移除，为影片网格腾出首页空间 */}
+
+          {/* Row 2: Continue Watching — FongMi: getHistory() + HistoryPresenter */}
+          <HistoryCarousel
+            items={continueItems}
+            onItemClick={handleHistoryClick}
+            onClearAll={handleClearHistory}
+          />
+
+          {/* Row 3: Category tabs — FongMi: adapter_type.xml */}
+          <CategoryTabs
+            categories={categories}
+            activeCategory={activeCategory}
+            onSelect={handleCategoryClick}
+            hasFilters={activeFilters.length > 0}
+            showFilter={showFilterPanel}
+            onToggleFilter={() => setShowFilterPanel(!showFilterPanel)}
+          />
+
+          {/* Filter panel — FongMi: FilterDialog */}
+          {showFilterPanel && (
+            <FilterPanel
+              filters={activeFilters}
+              selectedFilters={selectedFilters}
+              onChange={handleFilterChange}
+            />
+          )}
+
+          {/* Pending site indicator — FongMi: progress indicator */}
+          {pendingSiteKey && (
+            <div className="flex items-center justify-center gap-2 py-2 text-xs text-text-muted">
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+              正在切换到 {visibleSites.find((site) => site.key === pendingSiteKey)?.name || '新站点'}
             </div>
-            <p className="text-xs text-text-muted mb-3 font-medium border-t border-[#2a2a2a] pt-3">推荐配置（点击切换）</p>
-            <div className="grid grid-cols-2 gap-2">
-              {DEFAULT_SOURCES.map((src) => (
-                <button
-                  key={src.url}
-                  onClick={async () => {
-                    setShowSiteSheet(false)
-                    const result = await configApi.load(src.url) as { success: boolean; error?: string }
-                    if (result.success) {
-                      await loadConfig(src.url)
-                    }
-                  }}
-                  className="text-left rounded-lg border border-[#2a2a2a] bg-bg-primary p-2.5 transition-all hover:border-accent/40 hover:bg-bg-hover"
-                >
-                  <p className="text-sm font-medium text-text-primary truncate">{src.name}</p>
-                  <p className="text-[10px] text-text-muted mt-0.5">{src.desc}</p>
-                </button>
-              ))}
-            </div>
-            <p className="text-center mt-3">
-              <button
-                onClick={() => { setShowSiteSheet(false); navigate('/settings') }}
-                className="text-xs text-text-muted hover:text-accent transition-colors"
-              >
-                管理更多配置 →
-              </button>
-            </p>
+          )}
+
+          {/* Row 4: Video Grid — FongMi: addVideo() + VodPresenter */}
+          <div className="pt-1">
+            <VideoGrid
+              videos={displayVideos}
+              isLoading={isLoading}
+              onVodClick={handleVodClick}
+              contentSiteKey={contentSiteKey}
+            />
           </div>
-        </>
+        </div>
+      </ProgressLayout>
+
+      {/* Error banner — FongMi: Notify.show() */}
+      {error && !isLoading && (
+        <ErrorBanner message={error} />
       )}
+
+      {/* ===== SiteDialog — FongMi: SiteDialog.java ===== */}
+      <SiteDialog
+        open={showSiteDialog}
+        onClose={() => setShowSiteDialog(false)}
+        sites={allSites}
+        currentSiteKey={currentSiteKey}
+        onSelectSite={handleSiteSwitch}
+      />
     </div>
   )
 }
