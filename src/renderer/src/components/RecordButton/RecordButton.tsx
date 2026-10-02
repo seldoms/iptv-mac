@@ -40,7 +40,12 @@ export default function RecordButton({ onStart, onStop, compact = false, classNa
       } ${className}`}
     >
       <Circle className={`h-2.5 w-2.5 fill-current ${recording ? 'animate-pulse' : ''}`} />
-      {!compact && (recording ? '停止录制' : '录制')}
+      {compact ? (
+        // 播放器控制栏：宽屏带上「录制/停止」字样，窄屏（含小窗）只留红点不挤占
+        <span className="ml-1 hidden text-[11px] sm:inline">{recording ? '停止' : '录制'}</span>
+      ) : (
+        <span>{recording ? '停止录制' : '录制'}</span>
+      )}
     </button>
   )
 }
