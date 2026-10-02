@@ -3,9 +3,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 /// Match lines starting with a comment that might contain URI="..."
-static URI_IN_COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bURI=(["'])"#).unwrap()
-});
+static URI_IN_COMMENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\bURI=(["'])"#).unwrap());
 
 /// 判断 URL 是否可代理（data:/blob:/skd: 不代理）
 fn is_proxyable_uri(value: &str) -> bool {
@@ -101,7 +100,8 @@ mod tests {
             "/play/hls/demo/index.m3u8",
             "#EXTINF:10,",
             "segment0.ts",
-        ].join("\n");
+        ]
+        .join("\n");
 
         let result = rewrite_hls_playlist(
             &playlist,
@@ -109,39 +109,56 @@ mod tests {
             |url| format!("proxy:{}", url),
         );
 
-        assert!(result.contains(r##"URI="proxy:https://media.example/play/demo/enc.key""##),
-            "Should rewrite key URI. Result:\n{}", result);
-        assert!(result.contains("proxy:https://media.example/play/hls/demo/index.m3u8"),
-            "Should rewrite absolute path. Result:\n{}", result);
-        assert!(result.contains("proxy:https://media.example/play/demo/segment0.ts"),
-            "Should rewrite relative segment. Result:\n{}", result);
+        assert!(
+            result.contains(r##"URI="proxy:https://media.example/play/demo/enc.key""##),
+            "Should rewrite key URI. Result:\n{}",
+            result
+        );
+        assert!(
+            result.contains("proxy:https://media.example/play/hls/demo/index.m3u8"),
+            "Should rewrite absolute path. Result:\n{}",
+            result
+        );
+        assert!(
+            result.contains("proxy:https://media.example/play/demo/segment0.ts"),
+            "Should rewrite relative segment. Result:\n{}",
+            result
+        );
     }
 
     #[test]
     fn leaves_data_uris_unchanged() {
         let playlist = r##"#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,AAAA""##;
-        let result = rewrite_hls_playlist(playlist, "https://example.com/a.m3u8", |url| format!("proxy:{}", url));
+        let result = rewrite_hls_playlist(playlist, "https://example.com/a.m3u8", |url| {
+            format!("proxy:{}", url)
+        });
         assert_eq!(result, playlist);
     }
 
     #[test]
     fn leaves_blob_uris_unchanged() {
         let playlist = r##"#EXT-X-KEY:METHOD=AES-128,URI="blob:https://example.com/uuid""##;
-        let result = rewrite_hls_playlist(playlist, "https://example.com/a.m3u8", |url| format!("proxy:{}", url));
+        let result = rewrite_hls_playlist(playlist, "https://example.com/a.m3u8", |url| {
+            format!("proxy:{}", url)
+        });
         assert_eq!(result, playlist);
     }
 
     #[test]
     fn rewrites_absolute_urls() {
         let playlist = "#EXTM3U\nhttps://cdn.example.com/segments/seg1.ts";
-        let result = rewrite_hls_playlist(playlist, "https://example.com/play.m3u8", |url| format!("/proxy?url={}", urlencoding::encode(url)));
+        let result = rewrite_hls_playlist(playlist, "https://example.com/play.m3u8", |url| {
+            format!("/proxy?url={}", urlencoding::encode(url))
+        });
         assert!(result.contains("/proxy?url=https%3A%2F%2Fcdn.example.com%2Fsegments%2Fseg1.ts"));
     }
 
     #[test]
     fn rewrites_nested_playlists() {
         let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nvariant.m3u8";
-        let result = rewrite_hls_playlist(playlist, "https://example.com/hls/master.m3u8", |url| format!("/proxy?url={}", url));
+        let result = rewrite_hls_playlist(playlist, "https://example.com/hls/master.m3u8", |url| {
+            format!("/proxy?url={}", url)
+        });
         assert!(result.contains("/proxy?url=https://example.com/hls/variant.m3u8"));
     }
 }

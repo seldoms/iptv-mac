@@ -88,9 +88,17 @@ pub async fn json_parse(
         "http" | "https" => {}
         _ => return Err(AppError::invalid_input("不支持的解析协议")),
     }
-    // clear() 清空 parse_url 中已有的 "?url=" 片段，再用 append_pair 设置，
-    // append_pair 自动对 web_url 进行 percent-encoding，防止 URL 注入
-    parsed.query_pairs_mut().clear().append_pair("url", web_url);
+    // 只替换目标 URL，保留解析接口自身的鉴权和其他参数。
+    let params: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "url")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    parsed
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(params)
+        .append_pair("url", web_url);
     let full_url = parsed.to_string();
 
     let mut req = client
@@ -155,7 +163,7 @@ pub async fn json_parse(
     };
 
     // Extract headers
-    let mut result_headers = HashMap::new();
+    let mut result_headers = headers.cloned().unwrap_or_default();
     if let Some(h) = data.get("header").and_then(|v| v.as_object()) {
         for (k, v) in h {
             if let Some(val) = v.as_str() {
@@ -187,6 +195,83 @@ pub async fn json_parse(
         url,
         header,
         from: "json_parse".to_string(),
+    }))
+}
+
+// 静态播放页仅提取媒体元素和明确的 URL 字面量，不执行网页脚本。
+fn extract_page_media(page_url: &str, html: &str) -> Option<String> {
+    let base = url::Url::parse(page_url).ok()?;
+    let resolve = |value: &str| -> Option<String> {
+        let target = base.join(value.trim()).ok()?;
+        if !matches!(target.scheme(), "http" | "https") || !spider::is_video_format(target.as_str())
+        {
+            return None;
+        }
+        Some(target.to_string())
+    };
+    let doc = dom_query::Document::from(html);
+    for node in doc
+        .select("video[src], video source[src], audio[src], audio source[src]")
+        .iter()
+    {
+        if let Some(media) = node.attr("src").and_then(|src| resolve(&src)) {
+            return Some(media);
+        }
+    }
+    static URL_LITERAL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r#"(?:\b(?:const|let|var)\s+url\s*=|["']?(?:url|file|src)["']?\s*:)\s*("(?:[^"\\]|\\.)*")"#).unwrap()
+    });
+    for script in doc.select("script:not([src])").iter() {
+        for captures in URL_LITERAL.captures_iter(&script.text()) {
+            if let Ok(value) = serde_json::from_str::<String>(&captures[1]) {
+                if let Some(media) = resolve(&value) {
+                    return Some(media);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn parse_media_page(
+    page_url: &str,
+    headers: Option<&HashMap<String, String>>,
+) -> Result<Option<ParseResult>, AppError> {
+    let client = crate::network::create_client()?;
+    let mut request = client.get(page_url).timeout(Duration::from_secs(8));
+    if let Some(headers) = headers {
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+    }
+    let mut response = request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| AppError::network_error("播放页面请求失败").with_internal(e.to_string()))?;
+    let final_url = response.url().to_string();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::network_error(e.to_string()))?
+    {
+        if body.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err(AppError::parse_error("播放页面超过 2MB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let Some(url) = extract_page_media(&final_url, &String::from_utf8_lossy(&body)) else {
+        return Ok(None);
+    };
+    let mut header = headers.cloned().unwrap_or_default();
+    if !header.keys().any(|key| key.eq_ignore_ascii_case("referer")) {
+        header.insert("Referer".into(), final_url);
+    }
+    Ok(Some(ParseResult {
+        url,
+        header: Some(header),
+        from: "media_page".into(),
     }))
 }
 
@@ -245,7 +330,8 @@ pub async fn super_parse(
         }));
     }
 
-    if parse_flag == 0 && !spider::need_parse(&result_url, play_url.as_deref()) {
+    if parse_flag == 0 && player_result.is_some() && play_url.as_deref().unwrap_or("").is_empty()
+        && url::Url::parse(&result_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
         return Ok(Some(ParseResult {
             url: result_url,
             header: result_header,
@@ -254,9 +340,14 @@ pub async fn super_parse(
     }
 
     // Check cache
-    let cache_key = format!("{}|{}", result_url, _flag);
+    let cache_key = serde_json::json!([_site_key, result_url, _flag, result_header, parses]).to_string();
     if let Some(cached) = cache_get(&cache_key) {
         return Ok(Some(cached));
+    }
+
+    if let Ok(Some(result)) = parse_media_page(&result_url, result_header.as_ref()).await {
+        cache_set(&cache_key, &result);
+        return Ok(Some(result));
     }
 
     // Level 1: JSON parse
@@ -267,8 +358,8 @@ pub async fn super_parse(
 
             if parse_type == 1 && parse_url.is_some() {
                 let result =
-                    json_parse(parse_url.unwrap(), &result_url, result_header.as_ref()).await?;
-                if let Some(r) = result {
+                    json_parse(parse_url.unwrap(), &result_url, result_header.as_ref()).await;
+                if let Ok(Some(r)) = result {
                     cache_set(&cache_key, &r);
                     return Ok(Some(r));
                 }
@@ -295,6 +386,10 @@ pub async fn super_parse(
             cache_set(&cache_key, &result);
             return Ok(Some(result));
         }
+        if let Ok(Some(result)) = parse_media_page(&full_url, result_header.as_ref()).await {
+            cache_set(&cache_key, &result);
+            return Ok(Some(result));
+        }
     }
 
     Ok(None)
@@ -303,6 +398,69 @@ pub async fn super_parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parser_failover_preserves_auth_and_media_headers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut paths = Vec::new();
+            while paths.len() < 3 && std::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut buffer = [0u8; 8192];
+                let count = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                let path = request.split_whitespace().nth(1).unwrap().to_string();
+                let (status, body) = if path.starts_with("/good?") {
+                    ("200 OK", r#"{"url":"https://example.com/video.mp4"}"#)
+                } else if path.starts_with("/bad?") { ("503 Unavailable", "offline") }
+                else { ("200 OK", "<html>No embedded media</html>") };
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).unwrap();
+                paths.push(path);
+            }
+            paths
+        });
+        let target = format!("{base}/watch?id=123&part=2");
+        let parsers = vec![serde_json::json!({"type":1,"url":format!("{base}/bad?key=keep&url=")}), serde_json::json!({"type":1,"url":format!("{base}/good?key=keep&url=")})];
+        let result = super_parse(&target, "test", "failover", Some(&serde_json::json!({"url":target,"parse":1,"header":{"Referer":"https://source.example"}})), Some(&parsers)).await.unwrap().unwrap();
+        assert_eq!(result.url, "https://example.com/video.mp4");
+        assert_eq!(result.header.unwrap()["Referer"], "https://source.example");
+        let paths = server.join().unwrap();
+        assert_eq!(paths.len(), 3);
+        let request = url::Url::parse(&format!("{base}{}", paths[2])).unwrap();
+        let query: HashMap<_, _> = request.query_pairs().into_owned().collect();
+        assert_eq!(query["key"], "keep");
+        assert_eq!(query["url"], target);
+        assert!(!query.contains_key("part"));
+    }
+
+    #[test]
+    fn extracts_signed_relative_media_from_share_page() {
+        let html = r#"<html><script>const url = "/20260711/demo/index.m3u8?sign=abc&v=1";</script></html>"#;
+        assert_eq!(
+            extract_page_media("https://example.com/share/id", html).as_deref(),
+            Some("https://example.com/20260711/demo/index.m3u8?sign=abc&v=1")
+        );
+    }
+
+    #[test]
+    fn extracts_html_media_but_not_script_or_parser_urls() {
+        let html = r#"<video><source src="/video.mp4?x=1&amp;y=2"></video>"#;
+        assert_eq!(
+            extract_page_media("https://example.com/share", html).as_deref(),
+            Some("https://example.com/video.mp4?x=1&y=2")
+        );
+        assert!(extract_page_media("https://example.com", r#"<script src="/hls.js"></script><script>const url = "https://example.com/parse?url=https://other.com/v.m3u8";</script>"#).is_none());
+    }
 
     #[test]
     fn detects_direct_video() {

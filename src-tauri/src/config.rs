@@ -13,6 +13,8 @@ use crate::path_safety;
 
 /// 配置存储文件名
 const CONFIG_STORE_FILE: &str = "config-store.json";
+const BUILTIN_SOURCES_VERSION: i64 = 1;
+const BUILTIN_SOURCES_JSON: &str = include_str!("../../src/shared/default-sources.json");
 
 /// 配置存储路径（基于 data_dir）
 fn config_store_path(data_dir: &PathBuf) -> PathBuf {
@@ -38,6 +40,14 @@ struct ConfigStoreData {
     configs: Vec<ConfigItem>,
     #[serde(default, alias = "current_url")]
     current_url: String,
+    #[serde(default)]
+    builtin_sources_version: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct BundledSource {
+    name: String,
+    url: String,
 }
 
 /// 配置管理器
@@ -53,6 +63,21 @@ impl ConfigManager {
         let store_path = config_store_path(&data_dir);
         let mut store = Self::load_store(&store_path);
         let mut changed = false;
+        if store.builtin_sources_version < BUILTIN_SOURCES_VERSION {
+            let now = now_secs();
+            for source in bundled_sources() {
+                if store.configs.iter().all(|item| item.url != source.url) {
+                    store.configs.push(ConfigItem {
+                        url: source.url,
+                        name: source.name,
+                        add_time: now,
+                        update_time: now,
+                    });
+                }
+            }
+            store.builtin_sources_version = BUILTIN_SOURCES_VERSION;
+            changed = true;
+        }
         if store.current_url.is_empty() && !store.configs.is_empty() {
             store.current_url = store
                 .configs
@@ -90,6 +115,7 @@ impl ConfigManager {
             .map(|configs| ConfigStoreData {
                 configs,
                 current_url: String::new(),
+                builtin_sources_version: 0,
             })
             .unwrap_or_default()
     }
@@ -110,6 +136,7 @@ impl ConfigManager {
         let store = ConfigStoreData {
             configs: self.items.clone(),
             current_url: self.current_url.clone().unwrap_or_default(),
+            builtin_sources_version: BUILTIN_SOURCES_VERSION,
         };
         Self::save_store_data(&self.store_path, &store)
     }
@@ -180,13 +207,29 @@ impl ConfigManager {
     }
 }
 
+fn bundled_sources() -> Vec<BundledSource> {
+    serde_json::from_str(BUILTIN_SOURCES_JSON).expect("bundled default sources JSON must be valid")
+}
+
+/// 抓配置文本：先用 TVBox 约定 UA（大量接口按 UA 分流），内容不像配置时再用浏览器 UA 兜底。
+async fn fetch_config_text(client: &reqwest::Client, url: &str) -> Result<String, AppError> {
+    let primary = crate::network::http_get_tvbox_config(client, url).await?;
+    if crate::network::looks_like_config_payload(&primary) {
+        return Ok(primary);
+    }
+    match crate::network::http_get(client, url).await {
+        Ok(fallback) if crate::network::looks_like_config_payload(&fallback) => Ok(fallback),
+        _ => Ok(primary),
+    }
+}
+
 pub async fn load_config_from_url(
     url: &str,
     data_dir: Option<&std::path::PathBuf>,
 ) -> Result<Value, AppError> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let client = crate::network::create_client()?;
-        let text = crate::network::http_get(&client, url).await?;
+        let text = fetch_config_text(&client, url).await?;
 
         // 检测多仓配置
         if let Ok(parsed) = crate::network::safe_json_parse(&text) {
@@ -215,21 +258,16 @@ pub async fn load_config_from_url(
     }
 
     let text = if url.starts_with("file://") {
-        let data_dir = data_dir.ok_or_else(|| {
-            AppError::invalid_input("file:// 协议只能在应用目录内使用")
-        })?;
+        let data_dir =
+            data_dir.ok_or_else(|| AppError::invalid_input("file:// 协议只能在应用目录内使用"))?;
         let path_str = url.strip_prefix("file://").unwrap_or(url);
         // 使用 path_safety 的路径规范化函数防止路径遍历
-        let safe_path = path_safety::resolve_safe_path(
-            &data_dir.to_string_lossy(),
-            path_str,
-            false,
-        )
-        .ok_or_else(|| {
-            AppError::invalid_input(format!("不允许访问路径: {}", path_str))
-        })?;
+        let safe_path =
+            path_safety::resolve_safe_path(&data_dir.to_string_lossy(), path_str, false)
+                .ok_or_else(|| AppError::invalid_input(format!("不允许访问路径: {}", path_str)))?;
         fs::read_to_string(&safe_path).map_err(|e| {
-            AppError::not_found(format!("文件不存在: {}", safe_path.display())).with_internal(e.to_string())
+            AppError::not_found(format!("文件不存在: {}", safe_path.display()))
+                .with_internal(e.to_string())
         })?
     } else {
         // 尝试作为本地文件路径
@@ -250,8 +288,20 @@ pub async fn load_config_from_url(
 }
 
 pub fn parse_config_or_live_source(url: &str, text: &str) -> Result<Value, AppError> {
-    if let Ok(config) = safe_json_parse(text) {
+    // TVBox 生态里大量「接口」不是明文 JSON：`[A-Za-z0-9]{8}**` 后的 stego-base64
+    // （饭太硬 `in.bmp` / `.jpg`）与 `2423` 开头的 hex+AES（南风 `XC.json`）。
+    // 先按 FongMi `Decoder.verify` 的等价流程解一层，再做 JSON/直播源判定，
+    // 否则这些订阅一律报「无法识别配置格式」而加不进来。
+    let decoded = crate::decoder::decode(url, text);
+    let text = decoded.as_str();
+    if let Ok(mut config) = safe_json_parse(text) {
         if is_tvbox_config(&config) {
+            // 配置级 DoH：TVBox 配置里的 `doh` 字段生效，后续接口/直播请求都走它
+            match config.get("doh").and_then(Value::as_str) {
+                Some(endpoint) => crate::network::set_doh_endpoint(Some(endpoint.to_string())),
+                None => crate::network::set_doh_endpoint(None),
+            }
+            normalize_config_urls(&mut config, url);
             return Ok(config);
         }
 
@@ -275,6 +325,27 @@ pub fn parse_config_or_live_source(url: &str, text: &str) -> Result<Value, AppEr
     Err(AppError::parse_error(
         "无法识别配置格式，请检查是否为 TVBox JSON、M3U 或 TXT 直播源",
     ))
+}
+
+fn normalize_config_urls(config: &mut Value, base: &str) {
+    for (collection, field) in [("sites", "api"), ("lives", "url"), ("parses", "url")] {
+        if let Some(items) = config.get_mut(collection).and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(value) = item.get(field).and_then(Value::as_str) {
+                    if !value.is_empty() && !value.starts_with("csp_") {
+                        item[field] = Value::String(resolve_relative_url(base, value));
+                    }
+                }
+                if collection == "sites" {
+                    if let Some(ext) = item.get("ext").and_then(Value::as_str) {
+                        if ext.starts_with("./") || ext.starts_with("../") || ext.starts_with('/') {
+                            item["ext"] = Value::String(resolve_relative_url(base, ext));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn is_tvbox_config(value: &Value) -> bool {
@@ -370,14 +441,29 @@ pub async fn load_multi_warehouse_configs(
     value: &Value,
     base_url: &str,
 ) -> Result<Vec<Value>, AppError> {
+    load_warehouse_at_depth(client, value, base_url, 0).await
+}
+
+async fn load_warehouse_at_depth(
+    client: &reqwest::Client,
+    value: &Value,
+    base_url: &str,
+    depth: usize,
+) -> Result<Vec<Value>, AppError> {
+    if depth >= 4 {
+        return Err(AppError::parse_error("订阅嵌套超过 4 层"));
+    }
     let mut configs = Vec::new();
 
     // Case 1: "urls" 数组
     if let Some(urls) = value.get("urls").and_then(Value::as_array) {
         for url_value in urls {
-            if let Some(url) = url_value.as_str() {
+            if let Some(url) = url_value
+                .as_str()
+                .or_else(|| url_value.get("url").and_then(Value::as_str))
+            {
                 let resolved = resolve_relative_url(base_url, url);
-                match load_single_sub_config(client, &resolved).await {
+                match load_single_sub_config(client, &resolved, depth + 1).await {
                     Ok(config) => configs.push(config),
                     Err(e) => eprintln!("[config] 子配置加载失败 [{}]: {}", resolved, e),
                 }
@@ -391,13 +477,13 @@ pub async fn load_multi_warehouse_configs(
         for item in arr {
             if let Some(url) = item.get("url").and_then(Value::as_str) {
                 let resolved = resolve_relative_url(base_url, url);
-                match load_single_sub_config(client, &resolved).await {
+                match load_single_sub_config(client, &resolved, depth + 1).await {
                     Ok(config) => configs.push(config),
                     Err(e) => eprintln!("[config] 子配置加载失败 [{}]: {}", resolved, e),
                 }
             } else if let Some(url_str) = item.as_str() {
                 let resolved = resolve_relative_url(base_url, url_str);
-                match load_single_sub_config(client, &resolved).await {
+                match load_single_sub_config(client, &resolved, depth + 1).await {
                     Ok(config) => configs.push(config),
                     Err(e) => eprintln!("[config] 子配置加载失败 [{}]: {}", resolved, e),
                 }
@@ -441,7 +527,7 @@ async fn load_link3_public_configs(
 
     let mut configs = Vec::new();
     for candidate in extract_link3_candidate_urls(&links) {
-        match load_single_sub_config(client, &candidate).await {
+        match load_single_sub_config(client, &candidate, 0).await {
             Ok(config) => configs.push(config),
             Err(e) => eprintln!("[config] Link3 候选配置加载失败 [{}]: {}", candidate, e),
         }
@@ -572,18 +658,23 @@ fn extract_urls_from_text(text: &str) -> Vec<String> {
         .collect()
 }
 
-async fn load_single_sub_config(client: &reqwest::Client, url: &str) -> Result<Value, AppError> {
+async fn load_single_sub_config(
+    client: &reqwest::Client,
+    url: &str,
+    depth: usize,
+) -> Result<Value, AppError> {
     let text = crate::network::http_get(client, url).await?;
     // 子配置也尝试多仓解析（递归一层）
-    if let Ok(parsed) = crate::network::safe_json_parse(&text) {
+    if let Ok(mut parsed) = crate::network::safe_json_parse(&text) {
         if is_multi_warehouse_config(&parsed) {
-            let subs = Box::pin(load_multi_warehouse_configs(client, &parsed, url)).await?;
+            let subs = Box::pin(load_warehouse_at_depth(client, &parsed, url, depth)).await?;
             if !subs.is_empty() {
                 return Ok(merge_tvbox_configs(subs));
             }
         }
         // 子配置是 TVBox JSON 或直播源
         if is_tvbox_config(&parsed) {
+            normalize_config_urls(&mut parsed, url);
             return Ok(parsed);
         }
         // 包装直播源
@@ -679,28 +770,7 @@ pub fn github_raw_fallback_url(url: &str) -> Option<String> {
 }
 
 pub fn resolve_relative_url(base: &str, candidate: &str) -> String {
-    let candidate = candidate.trim();
-    if candidate.is_empty()
-        || candidate.starts_with("http://")
-        || candidate.starts_with("https://")
-        || candidate.starts_with("file://")
-    {
-        return candidate.to_string();
-    }
-
-    if let Ok(base_url) = url::Url::parse(base) {
-        if let Ok(joined) = base_url.join(candidate) {
-            return joined.to_string();
-        }
-    }
-
-    let base_path = PathBuf::from(base);
-    let parent = if base_path.is_dir() {
-        base_path
-    } else {
-        base_path.parent().map(PathBuf::from).unwrap_or_default()
-    };
-    parent.join(candidate).to_string_lossy().to_string()
+    crate::url_util::resolve(base, candidate)
 }
 
 fn now_secs() -> i64 {
@@ -743,6 +813,9 @@ mod tests {
     fn config_manager_selects_next_config_when_current_is_removed() {
         let dir = test_dir("iptv-config-test-remove-current");
         let mut mgr = ConfigManager::new(dir.clone());
+        for item in mgr.list().to_vec() {
+            mgr.remove(&item.url).unwrap();
+        }
         mgr.add("https://example.com/a.json", "A").unwrap();
         mgr.add("https://example.com/b.json", "B").unwrap();
         mgr.add("https://example.com/c.json", "C").unwrap();
@@ -766,6 +839,9 @@ mod tests {
     fn config_manager_clears_current_when_last_config_is_removed() {
         let dir = test_dir("iptv-config-test-remove-last");
         let mut mgr = ConfigManager::new(dir.clone());
+        for item in mgr.list().to_vec() {
+            mgr.remove(&item.url).unwrap();
+        }
         mgr.add("https://example.com/only.json", "Only").unwrap();
         mgr.set_current_url(Some("https://example.com/only.json".to_string()))
             .unwrap();
@@ -836,18 +912,21 @@ mod tests {
     }
 
     #[test]
-    fn config_manager_starts_empty_without_saved_sources() {
+    fn config_manager_seeds_bundled_sources_without_saved_sources() {
         let dir = test_dir("iptv-config-test-defaults");
         let mgr = ConfigManager::new(dir.clone());
 
-        assert!(mgr.list().is_empty());
-        assert_eq!(mgr.get_current_url(), None);
+        assert_eq!(mgr.list().len(), bundled_sources().len());
+        assert_eq!(
+            mgr.get_current_url(),
+            Some("https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn config_manager_preserves_only_saved_sources() {
+    fn config_manager_migrates_bundled_sources_without_overwriting_saved_state() {
         let dir = test_dir("iptv-config-test-default-merge");
         let path = config_store_path(&dir);
         std::fs::write(
@@ -873,8 +952,27 @@ mod tests {
             mgr.get_current_url(),
             Some("https://example.com/custom.json")
         );
-        assert_eq!(mgr.list().len(), 1);
+        assert_eq!(mgr.list().len(), bundled_sources().len() + 1);
         assert_eq!(mgr.list()[0].name, "Custom");
+        assert!(mgr.list().iter().any(|item| item.name == "心魔在线"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_manager_does_not_restore_a_deleted_bundled_source() {
+        let dir = test_dir("iptv-config-test-deleted-bundled-source");
+        let deleted_url = "https://clun.top/box.json";
+
+        {
+            let mut mgr = ConfigManager::new(dir.clone());
+            mgr.remove(deleted_url).unwrap();
+            assert_eq!(mgr.list().len(), bundled_sources().len() - 1);
+        }
+
+        let reloaded = ConfigManager::new(dir.clone());
+        assert_eq!(reloaded.list().len(), bundled_sources().len() - 1);
+        assert!(!reloaded.list().iter().any(|item| item.url == deleted_url));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -900,6 +998,18 @@ mod tests {
 
         let parent = resolve_relative_url("https://example.com/path/config.json", "../live.txt");
         assert_eq!(parent, "https://example.com/live.txt");
+    }
+
+    #[test]
+    fn normalizes_each_subscription_before_merging() {
+        let text = r#"{"sites":[{"key":"same","name":"Site","type":1,"api":"./api","ext":"./rule.js"}],"lives":[{"name":"Live","url":"./live.m3u"}],"parses":[{"url":"./parse?url="}]}"#;
+        let a = parse_config_or_live_source("https://a.example/dir/config.json", text).unwrap();
+        let b = parse_config_or_live_source("https://b.example/sub/config.json", text).unwrap();
+        let merged = merge_tvbox_configs(vec![a, b]);
+        assert_eq!(merged["sites"][0]["api"], "https://a.example/dir/api");
+        assert_eq!(merged["sites"][1]["api"], "https://b.example/sub/api");
+        assert_eq!(merged["lives"][1]["url"], "https://b.example/sub/live.m3u");
+        assert_eq!(merged["sites"][1]["ext"], "https://b.example/sub/rule.js");
     }
 
     #[test]
