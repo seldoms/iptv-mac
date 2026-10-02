@@ -129,6 +129,17 @@ export default function AlphaPlaybackSmoke({ config }: { config: AlphaPlaybackSm
             {lastResult.ok ? 'PASS' : 'FAIL'} {lastResult.elapsedMs ? `${lastResult.elapsedMs}ms` : ''}
           </div>
         )}
+        {/* 兜底出路：万一测试模式被意外留在设置里，用户也要能一键退出 */}
+        <button
+          onClick={() => {
+            void settingsApi.set('__alphaPlaybackSmoke', { enabled: false }).finally(() => {
+              window.location.reload()
+            })
+          }}
+          className="mt-3 w-full rounded border border-white/30 px-2 py-1 text-white/80 hover:border-accent hover:text-accent"
+        >
+          退出测试模式（回到正常界面）
+        </button>
       </div>
     </div>
   )

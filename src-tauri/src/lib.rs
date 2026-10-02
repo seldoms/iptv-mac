@@ -114,6 +114,28 @@ fn debug_data_dir_override() -> Option<PathBuf> {
     None
 }
 
+/// 清理残留的 smoke 开关。
+///
+/// 这些开关是自动化测试用的（`IPTV_*_SMOKE=1`），但**曾经被写进 settings.json**：
+/// 之后每次启动都会直接进入"播放测试视频"模式，界面全无、用户回不去。
+/// 这里保证：环境变量没开时，磁盘上的开关一律失效。
+fn scrub_stale_smoke_settings(settings: &mut Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (env, key) in [
+        ("IPTV_ALPHA_PLAYBACK_SMOKE", "__alphaPlaybackSmoke"),
+        ("IPTV_BETA_CONTINUE_SMOKE", "__betaContinueSmoke"),
+        ("IPTV_CONTINUITY_SMOKE", "__continuitySmoke"),
+    ] {
+        if std::env::var(env).ok().as_deref() == Some("1") {
+            continue;
+        }
+        if settings.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn inject_alpha_playback_smoke_settings(settings: &mut Map<String, Value>) {
     if std::env::var("IPTV_ALPHA_PLAYBACK_SMOKE").ok().as_deref() != Some("1") {
         return;
@@ -879,6 +901,24 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+
+    #[test]
+    fn scrubs_stale_smoke_settings_when_env_absent() {
+        // 环境变量没开（测试进程默认没开）时，磁盘上的测试开关必须被清掉，
+        // 否则会出现"点开 App 直接播放测试视频、没有界面"（真实发生过的故障）
+        let mut settings = Map::new();
+        settings.insert("__alphaPlaybackSmoke".to_string(), json!({ "enabled": true }));
+        settings.insert("__continuitySmoke".to_string(), json!({ "enabled": true }));
+        settings.insert("theme".to_string(), json!("dark"));
+
+        let changed = scrub_stale_smoke_settings(&mut settings);
+
+        assert!(changed, "有残留开关时应报告已清理");
+        assert!(!settings.contains_key("__alphaPlaybackSmoke"));
+        assert!(!settings.contains_key("__continuitySmoke"));
+        assert_eq!(settings.get("theme").and_then(Value::as_str), Some("dark"), "其它设置不受影响");
+    }
+
     #[test]
     fn load_settings_empty_when_file_missing() {
         let path = PathBuf::from("/nonexistent/settings.json");
@@ -990,9 +1030,20 @@ pub fn run() {
             }
             let local_proxy = local_proxy::start_local_proxy().map_err(std::io::Error::other)?;
             let mut settings = load_settings(&settings_path);
+            // 残留的测试开关必须先清掉，否则会出现"点开就是测试视频、没有界面"
+            let scrubbed = scrub_stale_smoke_settings(&mut settings);
             inject_alpha_playback_smoke_settings(&mut settings);
             inject_beta_continue_smoke_settings(&mut settings);
             inject_continuity_smoke_settings(&mut settings);
+            if scrubbed {
+                // 直接写回文件：脏开关必须在下次启动前就消失
+                let text = serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".to_string());
+                if let Err(error) = fs::write(&settings_path, text) {
+                    eprintln!("[settings] 清理残留测试开关写盘失败: {error}");
+                } else {
+                    eprintln!("[settings] 已清理残留的测试开关（alpha/beta/continuity smoke）");
+                }
+            }
 
             app.manage(AppState {
                 config_load_revision: std::sync::atomic::AtomicU64::new(0),
