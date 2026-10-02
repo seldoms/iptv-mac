@@ -3,8 +3,10 @@ node_modules/
 
 # Build output
 dist/
+out/
 src-tauri/target/
 src-tauri/gen/
+TV/
 
 # Data & Cache
 data/
@@ -17,6 +19,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# 本地 Agent 工具目录（不进仓库）
+.superpowers/
+
 # IDE
 .vscode/
 .idea/
@@ -26,3 +31,6 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# 内置命令行工具（体积大，用 scripts/fetch-ffmpeg.sh 获取）
+src-tauri/binaries/ffmpeg

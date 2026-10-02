@@ -3,6 +3,11 @@ export default {
   content: ['./src/renderer/src/**/*.{js,ts,jsx,tsx,html}'],
   theme: {
     extend: {
+      screens: {
+        // 结构断点：窄于 nav 用底部导航，窄于 wide 时侧栏面板下沉
+        nav: '900px',
+        wide: '1200px'
+      },
       colors: {
         bg: {
           primary: '#0f0f0f',
