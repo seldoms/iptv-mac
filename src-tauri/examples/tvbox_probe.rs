@@ -8,8 +8,18 @@ mod config;
 mod error;
 #[path = "../src/live.rs"]
 mod live;
+#[path = "../src/js_runtime.rs"]
+mod js_runtime;
+#[path = "../src/js_session.rs"]
+mod js_session;
+#[path = "../src/js_spider.rs"]
+mod js_spider;
+#[path = "../src/js_module.rs"]
+mod js_module;
 #[path = "../src/network.rs"]
 mod network;
+#[path = "../src/url_util.rs"]
+mod url_util;
 #[path = "../src/spider.rs"]
 mod spider;
 #[path = "../src/path_safety.rs"]
@@ -69,20 +79,21 @@ async fn main() {
         println!("\n=== {} ===", source_name);
         println!("config: {}", config_url);
 
-        let config_text = match network::http_get(&client, &config_url).await {
-            Ok(text) => text,
-            Err(error) => {
+        let config = match tokio::time::timeout(
+            Duration::from_secs(35),
+            config::load_config_from_url(&config_url, None),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
                 totals.configs_failed += 1;
                 println!("CONFIG FAIL: {}", error);
                 continue;
             }
-        };
-
-        let config = match config::parse_config_or_live_source(&config_url, &config_text) {
-            Ok(value) => value,
-            Err(error) => {
+            Err(_) => {
                 totals.configs_failed += 1;
-                println!("CONFIG DETECT FAIL: {}", error);
+                println!("CONFIG FAIL: timeout after 35s");
                 continue;
             }
         };
@@ -100,9 +111,9 @@ async fn main() {
             .cloned()
             .unwrap_or_default();
         println!("CONFIG OK: sites={} lives={}", sites, lives.len());
-        probe_sites(&site_entries).await;
+        probe_sites(&config_url, &site_entries).await;
 
-        for live_entry in lives {
+        for live_entry in lives.into_iter().take(1) {
             totals.live_entries += 1;
             let live_name = live_entry
                 .get("name")
@@ -152,33 +163,62 @@ async fn main() {
     println!("==============================");
 }
 
-async fn probe_sites(sites: &[Value]) {
+async fn probe_sites(config_url: &str, sites: &[Value]) {
     let mut supported = 0usize;
     let mut unsupported_csp = 0usize;
+    let mut attempted = 0usize;
+    let mut home_ok = false;
 
     for site in sites {
         let site_type = site.get("type").and_then(Value::as_i64).unwrap_or(0);
-        if site_type == 3 {
+        let api = site.get("api").and_then(Value::as_str).unwrap_or_default();
+        let is_js = site_type == 3 && (api.contains(".js") || api.contains(".mjs"));
+        if site_type == 3 && !is_js {
             unsupported_csp += 1;
             continue;
         }
-        if !matches!(site_type, 0 | 1 | 4) {
+        if !matches!(site_type, 0 | 1 | 4) && !is_js {
             continue;
+        }
+        if site.get("hide").and_then(Value::as_i64) == Some(1) || api.trim().is_empty() {
+            continue;
+        }
+        if attempted >= 3 {
+            break;
         }
 
         let key = site.get("key").and_then(Value::as_str).unwrap_or_default();
         let name = site.get("name").and_then(Value::as_str).unwrap_or(key);
-        let Some(api) = site.get("api").and_then(Value::as_str) else {
-            println!("  SITE FAIL [{}]: missing api", name);
-            continue;
-        };
         supported += 1;
+        attempted += 1;
+
+        if is_js {
+            let ext = site.get("ext").and_then(Value::as_str);
+            let result = tokio::time::timeout(Duration::from_secs(20), async {
+                let spider = js_spider::JsSpider::new(api, ext).await?;
+                spider.home_content(false).await
+            })
+            .await;
+            match result {
+                Ok(Ok(home)) => {
+                    let class_count = home.get("class").or_else(|| home.get("types"))
+                        .and_then(Value::as_array).map_or(0, Vec::len);
+                    let list_count = home.get("list").and_then(Value::as_array).map_or(0, Vec::len);
+                    println!("  SITE OK   [{}]: type=3 classes={} list={}", name, class_count, list_count);
+                    home_ok = class_count > 0 || list_count > 0;
+                }
+                Ok(Err(error)) => println!("  SITE FAIL [{}]: type=3 {}", name, error),
+                Err(_) => println!("  SITE FAIL [{}]: type=3 timeout after 20s", name),
+            }
+            if home_ok { break; }
+            continue;
+        }
 
         let site_config = spider::SiteConfig {
             key: key.to_string(),
             name: name.to_string(),
             site_type,
-            api: api.to_string(),
+            api: config::resolve_relative_url(config_url, api),
             ext: site.get("ext").cloned(),
             play_url: site
                 .get("playUrl")
@@ -191,14 +231,15 @@ async fn probe_sites(sites: &[Value]) {
         };
         let spider = spider::HttpSpider::new(site_config);
 
-        match spider.home_content(false).await {
-            Ok(home) => {
+        match tokio::time::timeout(Duration::from_secs(20), spider.home_content(false)).await {
+            Ok(Ok(home)) => {
                 let class_count = home.class.as_ref().map_or(0, Vec::len);
                 let list_count = home.list.as_ref().map_or(0, Vec::len);
                 println!(
                     "  SITE OK   [{}]: type={} classes={} list={}",
                     name, site_type, class_count, list_count
                 );
+                home_ok = class_count > 0 || list_count > 0;
 
                 if let Some(first_vod) = home.list.as_ref().and_then(|list| list.first()) {
                     match spider
@@ -235,13 +276,15 @@ async fn probe_sites(sites: &[Value]) {
                     }
                 }
             }
-            Err(error) => println!("  SITE FAIL [{}]: type={} {}", name, site_type, error),
+            Ok(Err(error)) => println!("  SITE FAIL [{}]: type={} {}", name, site_type, error),
+            Err(_) => println!("  SITE FAIL [{}]: type={} timeout after 20s", name, site_type),
         }
+        if home_ok { break; }
     }
 
     println!(
-        "SITE SUMMARY: supported_http={} unsupported_csp={}",
-        supported, unsupported_csp
+        "SITE SUMMARY: supported={} attempted={} home_ok={} unsupported_csp={}",
+        supported, attempted, home_ok, unsupported_csp
     );
 }
 
