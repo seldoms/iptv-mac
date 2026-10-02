@@ -34,13 +34,16 @@ else
   URL="https://github.com/$REPO/releases/latest/download/$ASSET"
   LABEL="最新正式版"
 fi
+# 允许覆盖（镜像/内网/自测）：IPTV_MAC_ZIP_URL=https://... bash scripts/install-macos.sh
+URL="${IPTV_MAC_ZIP_URL:-$URL}"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "→ 下载（${LABEL}）"
 echo "  $URL"
-if ! curl -fL --retry 3 -m 900 --progress-bar -o "$TMP/app.zip" "$URL"; then
+# -C - 断点续传：这网速下 23MB 经常中断，重来一遍很痛
+if ! curl -fL --retry 5 --retry-all-errors -C - -m 1800 --progress-bar -o "$TMP/app.zip" "$URL"; then
   echo "❌ 下载失败：检查网络，或直接到 https://github.com/$REPO/releases 手动下载。" >&2
   exit 1
 fi
